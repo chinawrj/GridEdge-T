@@ -1,0 +1,756 @@
+version: 4
+allocation_policy: DEEPEST_FIRST_V1
+standard_quantity: 1500
+cases:
+  - id: buy_defer_carry_then_one_grid_reversal
+    description: "-1 递延到 -2 后反弹到 -1，只撤销 -2 边际份额"
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { at: "2026-01-05 09:32:00", direction: BUY, grid_index: -2, exercise_quantity: 0, defer_quantity: 3000 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"]
+      - ["2026-01-05 09:32:00", "9.82", "9.83", "9.59", "9.62"]
+      - ["2026-01-05 09:33:00", "9.62", "9.83", "9.61", "9.82"]
+    expected_orders: 0
+    expected_ambiguous_bars: 0
+    expected_events:
+      RIGHT_TRANCHE_MINTED: 2
+      RIGHT_BALANCE_TRANSFERRED: 1
+      GRID_RIGHT_TRANSFERRED: 1
+      RIGHT_BALANCE_REVOKED: 1
+    forbidden_events: [ORDER_INTENT_CREATED, RIGHT_BALANCE_RESERVED]
+    expected_touches: { -1: 1, -2: 1 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { direction: BUY, grid_index: -2, count: 1, exercise_quantity: 0, defer_quantity: 3000 }
+    expected_order_quantities: {}
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 1, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 0 }
+      - { direction: BUY, birth_grid_index: -2, count: 1, available_quantity: 0, exercised_quantity: 0, revoked_quantity: 1500 }
+
+  - id: buy_partial_deepest_first_then_reversal
+    description: "-2 对两份授权行使一份时先消费 -2 来源；该份已消费后，反弹一格不得误撤销仍属 -1 的递延整份"
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { at: "2026-01-05 09:32:00", direction: BUY, grid_index: -2, exercise_quantity: 1500, defer_quantity: 1500 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"]
+      - ["2026-01-05 09:32:00", "9.82", "9.83", "9.59", "9.62"]
+      - ["2026-01-05 09:33:00", "9.62", "9.83", "9.61", "9.82"]
+    expected_orders: 1
+    expected_ambiguous_bars: 0
+    expected_events:
+      RIGHT_BALANCE_RESERVED: 1
+      RIGHT_BALANCE_REVOKED: 0
+      GRID_RIGHT_TRANSFERRED: 1
+    forbidden_events: [ERROR_RECORDED, RIGHT_BALANCE_REVOKED]
+    expected_touches: { -1: 1, -2: 1 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { direction: BUY, grid_index: -2, count: 1, exercise_quantity: 1500, defer_quantity: 1500 }
+    expected_order_quantities: { "BUY:-2": [1500] }
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 1, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 0 }
+      - { direction: BUY, birth_grid_index: -2, count: 1, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+
+  - id: same_side_intrabar_path_is_ambiguous
+    description: "同一根 K 线同时向 -3 和反弹到 -1，保守模式不改变份额"
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { at: "2026-01-05 09:32:00", direction: BUY, grid_index: -2, exercise_quantity: 0, defer_quantity: 3000 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"]
+      - ["2026-01-05 09:32:00", "9.82", "9.83", "9.59", "9.62"]
+      - ["2026-01-05 09:33:00", "9.62", "9.83", "9.39", "9.60"]
+    expected_orders: 0
+    expected_ambiguous_bars: 1
+    expected_events:
+      AMBIGUOUS_BAR_DETECTED: 1
+      RIGHT_BALANCE_REVOKED: 0
+      RIGHT_TRANCHE_MINTED: 2
+      GRID_RIGHT_TRANSFERRED: 1
+    forbidden_events: [ORDER_INTENT_CREATED, RIGHT_BALANCE_REVOKED]
+    expected_touches: { -1: 1, -2: 1, -3: 1 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { direction: BUY, grid_index: -2, count: 1, exercise_quantity: 0, defer_quantity: 3000 }
+    expected_order_quantities: {}
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 1, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 0 }
+      - { direction: BUY, birth_grid_index: -2, count: 1, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 0 }
+
+  - id: repeated_excursion_uses_new_depth_token
+    description: "-2 份额撤销后再次下跌，生成新 epoch token，旧 token 不复活"
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { at: "2026-01-05 09:32:00", direction: BUY, grid_index: -2, exercise_quantity: 0, defer_quantity: 3000 }
+      - { at: "2026-01-05 09:34:00", direction: BUY, grid_index: -2, exercise_quantity: 0, defer_quantity: 3000 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"]
+      - ["2026-01-05 09:32:00", "9.82", "9.83", "9.59", "9.62"]
+      - ["2026-01-05 09:33:00", "9.62", "9.83", "9.61", "9.82"]
+      - ["2026-01-05 09:34:00", "9.82", "9.83", "9.59", "9.62"]
+    expected_orders: 0
+    expected_ambiguous_bars: 0
+    expected_events:
+      RIGHT_TRANCHE_MINTED: 3
+      RIGHT_BALANCE_TRANSFERRED: 2
+      RIGHT_BALANCE_REVOKED: 1
+      GRID_RIGHT_TRANSFERRED: 2
+    forbidden_events: [ORDER_INTENT_CREATED, RIGHT_BALANCE_RESERVED]
+    expected_touches: { -1: 1, -2: 2 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { direction: BUY, grid_index: -2, count: 2, exercise_quantity: 0, defer_quantity: 6000 }
+    expected_order_quantities: {}
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 1, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 0 }
+      - { direction: BUY, birth_grid_index: -2, count: 2, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 1500 }
+
+  - id: exercised_same_level_does_not_remint_before_cycle_closes
+    description: "-1 已行权形成持仓后，即使反弹撤销零头并再次下探，同一 cycle 也不能重铸完整 -1 授权"
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 1500, defer_quantity: 0 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"]
+      - ["2026-01-05 09:32:00", "9.82", "10.01", "9.81", "10"]
+      - ["2026-01-05 09:33:00", "10", "10.01", "9.79", "9.82"]
+    expected_orders: 1
+    expected_ambiguous_bars: 0
+    expected_events:
+      RIGHT_TRANCHE_MINTED: 1
+      RIGHT_BALANCE_REVOKED: 0
+      GRID_LEVEL_SKIPPED: 1
+    forbidden_events: [RIGHT_BALANCE_REVOKED, ERROR_RECORDED]
+    expected_touches: { -1: 2 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 1, exercise_quantity: 1500, defer_quantity: 0 }
+    expected_order_quantities: { "BUY:-1": [1500] }
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 1, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+
+  - id: sell_direction_mirrors_marginal_reversal
+    description: "先建立 -1/-2 批次；上涨生成 +1/+2 卖权，回落一格只撤销 +2 lot slice"
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 1500, defer_quantity: 0 }
+      - { at: "2026-01-05 09:32:00", direction: BUY, grid_index: -2, exercise_quantity: 1500, defer_quantity: 0 }
+      - { at: "2026-01-06 09:30:00", direction: SELL, grid_index: 1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { at: "2026-01-06 09:30:00", direction: SELL, grid_index: 2, exercise_quantity: 0, defer_quantity: 3000 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"]
+      - ["2026-01-05 09:32:00", "9.82", "9.83", "9.59", "9.62"]
+      - ["2026-01-06 09:30:00", "9.62", "10.41", "9.61", "10.35"]
+      - ["2026-01-06 09:31:00", "10.35", "10.36", "10.15", "10.18"]
+    expected_orders: 2
+    expected_ambiguous_bars: 0
+    expected_events:
+      RIGHT_TRANCHE_MINTED: 4
+      RIGHT_BALANCE_REVOKED: 1
+      GRID_RIGHT_TRANSFERRED: 1
+    forbidden_events: [ERROR_RECORDED]
+    expected_touches: { -1: 1, -2: 1, 1: 1, 2: 1 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 1, exercise_quantity: 1500, defer_quantity: 0 }
+      - { direction: BUY, grid_index: -2, count: 1, exercise_quantity: 1500, defer_quantity: 0 }
+      - { direction: SELL, grid_index: 1, count: 1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { direction: SELL, grid_index: 2, count: 1, exercise_quantity: 0, defer_quantity: 3000 }
+    expected_order_quantities:
+      "BUY:-1": [1500]
+      "BUY:-2": [1500]
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 1, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+      - { direction: BUY, birth_grid_index: -2, count: 1, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+      - { direction: SELL, birth_grid_index: 1, count: 1, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 0 }
+      - { direction: SELL, birth_grid_index: 2, count: 1, available_quantity: 0, exercised_quantity: 0, revoked_quantity: 1500 }
+
+  - id: monotonic_buy_four_levels_full_exercise
+    description: "连续下跌四格，每格固定行权 1 份，股价不改变 1500 股机械单位"
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 1500, defer_quantity: 0 }
+      - { at: "2026-01-05 09:32:00", direction: BUY, grid_index: -2, exercise_quantity: 1500, defer_quantity: 0 }
+      - { at: "2026-01-05 09:33:00", direction: BUY, grid_index: -3, exercise_quantity: 1500, defer_quantity: 0 }
+      - { at: "2026-01-05 09:34:00", direction: BUY, grid_index: -4, exercise_quantity: 1500, defer_quantity: 0 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"]
+      - ["2026-01-05 09:32:00", "9.82", "9.83", "9.59", "9.62"]
+      - ["2026-01-05 09:33:00", "9.62", "9.63", "9.39", "9.42"]
+      - ["2026-01-05 09:34:00", "9.42", "9.43", "9.20", "9.23"]
+    expected_orders: 4
+    expected_ambiguous_bars: 0
+    expected_events:
+      GRID_RIGHT_GRANTED: 4
+      GATE_DECISION_MADE: 4
+      RIGHT_TRANCHE_MINTED: 4
+      RIGHT_BALANCE_RESERVED: 4
+      ORDER_INTENT_CREATED: 4
+    forbidden_events: [RIGHT_BALANCE_TRANSFERRED, RIGHT_BALANCE_REVOKED, GRID_RIGHT_BLOCKED]
+    expected_touches: { -1: 1, -2: 1, -3: 1, -4: 1 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 1, exercise_quantity: 1500, defer_quantity: 0 }
+      - { direction: BUY, grid_index: -2, count: 1, exercise_quantity: 1500, defer_quantity: 0 }
+      - { direction: BUY, grid_index: -3, count: 1, exercise_quantity: 1500, defer_quantity: 0 }
+      - { direction: BUY, grid_index: -4, count: 1, exercise_quantity: 1500, defer_quantity: 0 }
+    expected_order_quantities:
+      "BUY:-1": [1500]
+      "BUY:-2": [1500]
+      "BUY:-3": [1500]
+      "BUY:-4": [1500]
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+      - { direction: BUY, birth_grid_index: -2, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+      - { direction: BUY, birth_grid_index: -3, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+      - { direction: BUY, birth_grid_index: -4, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+
+  - id: four_level_defer_then_three_level_reversal
+    description: "四层全部递延后逐格反弹，只依次撤销 -4/-3/-2 边际份额并保留 -1"
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { at: "2026-01-05 09:32:00", direction: BUY, grid_index: -2, exercise_quantity: 0, defer_quantity: 3000 }
+      - { at: "2026-01-05 09:33:00", direction: BUY, grid_index: -3, exercise_quantity: 0, defer_quantity: 4500 }
+      - { at: "2026-01-05 09:34:00", direction: BUY, grid_index: -4, exercise_quantity: 0, defer_quantity: 6000 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"]
+      - ["2026-01-05 09:32:00", "9.82", "9.83", "9.59", "9.62"]
+      - ["2026-01-05 09:33:00", "9.62", "9.63", "9.39", "9.42"]
+      - ["2026-01-05 09:34:00", "9.42", "9.43", "9.20", "9.23"]
+      - ["2026-01-05 09:35:00", "9.23", "9.42", "9.23", "9.42"]
+      - ["2026-01-05 09:36:00", "9.42", "9.62", "9.42", "9.62"]
+      - ["2026-01-05 09:37:00", "9.62", "9.81", "9.62", "9.81"]
+    expected_orders: 0
+    expected_ambiguous_bars: 0
+    expected_events:
+      GRID_RIGHT_GRANTED: 4
+      GATE_DECISION_MADE: 4
+      RIGHT_TRANCHE_MINTED: 4
+      RIGHT_BALANCE_TRANSFERRED: 3
+      RIGHT_BALANCE_REVOKED: 3
+    forbidden_events: [ORDER_INTENT_CREATED, RIGHT_BALANCE_RESERVED]
+    expected_touches: { -1: 1, -2: 1, -3: 1, -4: 1 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { direction: BUY, grid_index: -2, count: 1, exercise_quantity: 0, defer_quantity: 3000 }
+      - { direction: BUY, grid_index: -3, count: 1, exercise_quantity: 0, defer_quantity: 4500 }
+      - { direction: BUY, grid_index: -4, count: 1, exercise_quantity: 0, defer_quantity: 6000 }
+    expected_order_quantities: {}
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 1, minted_quantity: 1500, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 0 }
+      - { direction: BUY, birth_grid_index: -2, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 0, revoked_quantity: 1500 }
+      - { direction: BUY, birth_grid_index: -3, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 0, revoked_quantity: 1500 }
+      - { direction: BUY, birth_grid_index: -4, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 0, revoked_quantity: 1500 }
+
+  - id: partial_exercise_crosses_tranche_boundary
+    description: "-2 行权两份 3000 股，按 DEEPEST_FIRST_V1 依次消费 -2 与 -1 两个完整 tranche"
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { at: "2026-01-05 09:32:00", direction: BUY, grid_index: -2, exercise_quantity: 3000, defer_quantity: 0 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"]
+      - ["2026-01-05 09:32:00", "9.82", "9.83", "9.59", "9.62"]
+    expected_orders: 1
+    expected_ambiguous_bars: 0
+    expected_events:
+      GRID_RIGHT_GRANTED: 2
+      GATE_DECISION_MADE: 2
+      RIGHT_TRANCHE_MINTED: 2
+      RIGHT_BALANCE_TRANSFERRED: 1
+      RIGHT_BALANCE_RESERVED: 1
+    forbidden_events: [RIGHT_BALANCE_REVOKED, GRID_RIGHT_BLOCKED]
+    expected_touches: { -1: 1, -2: 1 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { direction: BUY, grid_index: -2, count: 1, exercise_quantity: 3000, defer_quantity: 0 }
+    expected_order_quantities: { "BUY:-2": [3000] }
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+      - { direction: BUY, birth_grid_index: -2, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+
+  - id: partially_exercised_same_level_is_locked
+    description: "-1 行权一整份后反弹再下探，同周期不得重新授权或再次买入"
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 1500, defer_quantity: 0 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"]
+      - ["2026-01-05 09:32:00", "9.82", "10.01", "9.81", "10"]
+      - ["2026-01-05 09:33:00", "10", "10.01", "9.79", "9.82"]
+    expected_orders: 1
+    expected_ambiguous_bars: 0
+    expected_events:
+      GRID_LEVEL_TOUCHED: 2
+      GRID_LEVEL_SKIPPED: 1
+      GRID_RIGHT_GRANTED: 1
+      GATE_DECISION_MADE: 1
+      RIGHT_TRANCHE_MINTED: 1
+      RIGHT_BALANCE_REVOKED: 0
+    forbidden_events: [RIGHT_BALANCE_TRANSFERRED, RIGHT_BALANCE_REVOKED, ERROR_RECORDED]
+    expected_touches: { -1: 2 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 1, exercise_quantity: 1500, defer_quantity: 0 }
+    expected_order_quantities: { "BUY:-1": [1500] }
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+
+  - id: three_unexercised_excursions_create_new_epochs
+    description: "同一 -1 深度三次完整未行权 excursion，旧 token 终态不复活且仅最新 token active"
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { at: "2026-01-05 09:33:00", direction: BUY, grid_index: -1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { at: "2026-01-05 09:35:00", direction: BUY, grid_index: -1, exercise_quantity: 0, defer_quantity: 1500 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"]
+      - ["2026-01-05 09:32:00", "9.82", "10.01", "9.81", "10"]
+      - ["2026-01-05 09:33:00", "10", "10.01", "9.79", "9.82"]
+      - ["2026-01-05 09:34:00", "9.82", "10.01", "9.81", "10"]
+      - ["2026-01-05 09:35:00", "10", "10.01", "9.79", "9.82"]
+    expected_orders: 0
+    expected_ambiguous_bars: 0
+    expected_events:
+      GRID_RIGHT_GRANTED: 3
+      GATE_DECISION_MADE: 3
+      RIGHT_TRANCHE_MINTED: 3
+      RIGHT_BALANCE_REVOKED: 2
+    forbidden_events: [ORDER_INTENT_CREATED, RIGHT_BALANCE_RESERVED]
+    expected_touches: { -1: 3 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 3, exercise_quantity: 0, defer_quantity: 4500 }
+    expected_order_quantities: {}
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 3, minted_quantity: 4500, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 3000 }
+
+  - id: deterministic_gap_crosses_three_buy_levels
+    description: "确定性单向 gap 在同一根 bar 中按 -1/-2/-3 顺序授予，合计只铸造 3 份"
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -2, exercise_quantity: 0, defer_quantity: 3000 }
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -3, exercise_quantity: 0, defer_quantity: 4500 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.39", "9.42"]
+    expected_orders: 0
+    expected_ambiguous_bars: 0
+    expected_events:
+      GRID_LEVEL_TOUCHED: 3
+      GRID_RIGHT_GRANTED: 3
+      GATE_DECISION_MADE: 3
+      RIGHT_TRANCHE_MINTED: 3
+      RIGHT_BALANCE_TRANSFERRED: 2
+    forbidden_events: [ORDER_INTENT_CREATED, RIGHT_BALANCE_REVOKED, AMBIGUOUS_BAR_DETECTED]
+    expected_touches: { -1: 1, -2: 1, -3: 1 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { direction: BUY, grid_index: -2, count: 1, exercise_quantity: 0, defer_quantity: 3000 }
+      - { direction: BUY, grid_index: -3, count: 1, exercise_quantity: 0, defer_quantity: 4500 }
+    expected_order_quantities: {}
+    equivalent_to: stepwise_defer_three_levels
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 1, minted_quantity: 1500, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 0 }
+      - { direction: BUY, birth_grid_index: -2, count: 1, minted_quantity: 1500, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 0 }
+      - { direction: BUY, birth_grid_index: -3, count: 1, minted_quantity: 1500, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 0 }
+
+  - id: same_level_noise_without_exit_does_not_reoffer
+    description: "未越过反转/再武装条件的同格噪声不能再次 touch、决策或铸造"
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 0, defer_quantity: 1500 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"]
+      - ["2026-01-05 09:32:00", "9.82", "9.83", "9.79", "9.81"]
+    expected_orders: 0
+    expected_ambiguous_bars: 0
+    expected_events:
+      GRID_LEVEL_TOUCHED: 1
+      GRID_RIGHT_GRANTED: 1
+      GATE_DECISION_MADE: 1
+      RIGHT_TRANCHE_MINTED: 1
+    forbidden_events: [ORDER_INTENT_CREATED, RIGHT_BALANCE_TRANSFERRED, RIGHT_BALANCE_REVOKED]
+    expected_touches: { -1: 1 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 1, exercise_quantity: 0, defer_quantity: 1500 }
+    expected_order_quantities: {}
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 1, minted_quantity: 1500, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 0 }
+
+  - id: complete_two_level_buy_sell_cycle
+    description: "买入两份后次日逐格卖出两份，逐 lot 不亏并且周期只重置一次"
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 1500, defer_quantity: 0 }
+      - { at: "2026-01-05 09:32:00", direction: BUY, grid_index: -2, exercise_quantity: 1500, defer_quantity: 0 }
+      - { at: "2026-01-06 09:30:00", direction: SELL, grid_index: 1, exercise_quantity: 1500, defer_quantity: 0 }
+      - { at: "2026-01-06 09:30:00", direction: SELL, grid_index: 2, exercise_quantity: 1500, defer_quantity: 0 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"]
+      - ["2026-01-05 09:32:00", "9.82", "9.83", "9.59", "9.62"]
+      - ["2026-01-06 09:30:00", "9.62", "10.41", "9.62", "10.41"]
+    expected_orders: 4
+    expected_ambiguous_bars: 0
+    expected_events:
+      GRID_RIGHT_GRANTED: 4
+      GATE_DECISION_MADE: 4
+      RIGHT_TRANCHE_MINTED: 4
+      RIGHT_BALANCE_RESERVED: 4
+      ORDER_INTENT_CREATED: 4
+    forbidden_events: [RIGHT_BALANCE_REVOKED, GRID_RIGHT_BLOCKED, ERROR_RECORDED]
+    expected_touches: { -1: 1, -2: 1, 1: 1, 2: 1 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 1, exercise_quantity: 1500, defer_quantity: 0 }
+      - { direction: BUY, grid_index: -2, count: 1, exercise_quantity: 1500, defer_quantity: 0 }
+      - { direction: SELL, grid_index: 1, count: 1, exercise_quantity: 1500, defer_quantity: 0 }
+      - { direction: SELL, grid_index: 2, count: 1, exercise_quantity: 1500, defer_quantity: 0 }
+    expected_order_quantities:
+      "BUY:-1": [1500]
+      "BUY:-2": [1500]
+      "SELL:1": [1500]
+      "SELL:2": [1500]
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+      - { direction: BUY, birth_grid_index: -2, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+      - { direction: SELL, birth_grid_index: 1, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+      - { direction: SELL, birth_grid_index: 2, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+
+  - id: buy_cash_block_is_not_algorithm_defer
+    description: "算法明确选择买入，但现金风控阻断；阻断份额向深层 carry，绝不能记成算法 Defer"
+    config: { initial_cash: "0" }
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 1500, defer_quantity: 0 }
+      - { at: "2026-01-05 09:32:00", direction: BUY, grid_index: -2, exercise_quantity: 3000, defer_quantity: 0 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"]
+      - ["2026-01-05 09:32:00", "9.82", "9.83", "9.59", "9.62"]
+    expected_orders: 0
+    expected_ambiguous_bars: 0
+    expected_events:
+      GRID_RIGHT_GRANTED: 2
+      GATE_DECISION_MADE: 2
+      GRID_RIGHT_BLOCKED: 2
+      RIGHT_TRANCHE_MINTED: 2
+      RIGHT_BALANCE_TRANSFERRED: 1
+    forbidden_events: [GRID_RIGHT_DEFERRED, ORDER_INTENT_CREATED, RIGHT_BALANCE_RESERVED]
+    expected_touches: { -1: 1, -2: 1 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 1, exercise_quantity: 1500, defer_quantity: 0 }
+      - { direction: BUY, grid_index: -2, count: 1, exercise_quantity: 3000, defer_quantity: 0 }
+    expected_order_quantities: {}
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 1, minted_quantity: 1500, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 0 }
+      - { direction: BUY, birth_grid_index: -2, count: 1, minted_quantity: 1500, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 0 }
+
+  - id: t_plus_one_block_carries_then_executes_next_day
+    description: "同日买入份额在 +1 被 T+1 阻断且不是 Defer；次日 +2 使用同一来源卖出"
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 1500, defer_quantity: 0 }
+      - { at: "2026-01-05 09:32:00", direction: SELL, grid_index: 1, exercise_quantity: 0, defer_quantity: 0 }
+      - { at: "2026-01-06 09:30:00", direction: SELL, grid_index: 2, exercise_quantity: 1500, defer_quantity: 0 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"]
+      - ["2026-01-05 09:32:00", "9.82", "10.21", "9.82", "10.21"]
+      - ["2026-01-06 09:30:00", "10.21", "10.41", "10.21", "10.41"]
+    expected_orders: 2
+    expected_ambiguous_bars: 0
+    expected_events:
+      GRID_RIGHT_GRANTED: 3
+      GATE_DECISION_MADE: 3
+      GRID_RIGHT_BLOCKED: 1
+      RIGHT_TRANCHE_MINTED: 2
+      RIGHT_BALANCE_TRANSFERRED: 1
+      RIGHT_BALANCE_RESERVED: 2
+    forbidden_events: [GRID_RIGHT_DEFERRED, RIGHT_BALANCE_REVOKED, ERROR_RECORDED]
+    expected_touches: { -1: 1, 1: 1, 2: 1 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 1, exercise_quantity: 1500, defer_quantity: 0 }
+      - { direction: SELL, grid_index: 1, count: 1, exercise_quantity: 0, defer_quantity: 0 }
+      - { direction: SELL, grid_index: 2, count: 1, exercise_quantity: 1500, defer_quantity: 0 }
+    expected_order_quantities:
+      "BUY:-1": [1500]
+      "SELL:2": [1500]
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+      - { direction: SELL, birth_grid_index: 1, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+
+  - id: below_break_even_block_carries_until_profitable
+    description: "+1 单份低于逐 lot 保本价时阻断，+2 达到保本后才允许卖出，盈利批次不得补贴"
+    config:
+      commission_rate: "0.02"
+      minimum_commission: "0"
+      sell_tax_rate: "0.001"
+      slippage_rate: "0"
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 1500, defer_quantity: 0 }
+      - { at: "2026-01-06 09:30:00", direction: SELL, grid_index: 1, exercise_quantity: 0, defer_quantity: 0 }
+      - { at: "2026-01-06 09:31:00", direction: SELL, grid_index: 2, exercise_quantity: 1500, defer_quantity: 0 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"]
+      - ["2026-01-06 09:30:00", "9.82", "10.21", "9.82", "10.21"]
+      - ["2026-01-06 09:31:00", "10.21", "10.41", "10.21", "10.41"]
+    expected_orders: 2
+    expected_ambiguous_bars: 0
+    expected_events:
+      GRID_RIGHT_GRANTED: 3
+      GATE_DECISION_MADE: 3
+      GRID_RIGHT_BLOCKED: 1
+      RIGHT_TRANCHE_MINTED: 2
+      RIGHT_BALANCE_TRANSFERRED: 1
+      RIGHT_BALANCE_RESERVED: 2
+    forbidden_events: [GRID_RIGHT_DEFERRED, RIGHT_BALANCE_REVOKED, ERROR_RECORDED]
+    expected_touches: { -1: 1, 1: 1, 2: 1 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 1, exercise_quantity: 1500, defer_quantity: 0 }
+      - { direction: SELL, grid_index: 1, count: 1, exercise_quantity: 0, defer_quantity: 0 }
+      - { direction: SELL, grid_index: 2, count: 1, exercise_quantity: 1500, defer_quantity: 0 }
+    expected_order_quantities:
+      "BUY:-1": [1500]
+      "SELL:2": [1500]
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+      - { direction: SELL, birth_grid_index: 1, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+
+  - id: stepwise_defer_three_levels
+    description: "逐根跨越 -1/-2/-3，作为单根 gap 跨三格的权利拓扑等价基准"
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { at: "2026-01-05 09:32:00", direction: BUY, grid_index: -2, exercise_quantity: 0, defer_quantity: 3000 }
+      - { at: "2026-01-05 09:33:00", direction: BUY, grid_index: -3, exercise_quantity: 0, defer_quantity: 4500 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"]
+      - ["2026-01-05 09:32:00", "9.82", "9.83", "9.59", "9.62"]
+      - ["2026-01-05 09:33:00", "9.62", "9.63", "9.39", "9.42"]
+    expected_orders: 0
+    expected_ambiguous_bars: 0
+    expected_events:
+      GRID_LEVEL_TOUCHED: 3
+      GRID_RIGHT_GRANTED: 3
+      GATE_DECISION_MADE: 3
+      RIGHT_TRANCHE_MINTED: 3
+      RIGHT_BALANCE_TRANSFERRED: 2
+    forbidden_events: [ORDER_INTENT_CREATED, RIGHT_BALANCE_REVOKED, AMBIGUOUS_BAR_DETECTED]
+    expected_touches: { -1: 1, -2: 1, -3: 1 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { direction: BUY, grid_index: -2, count: 1, exercise_quantity: 0, defer_quantity: 3000 }
+      - { direction: BUY, grid_index: -3, count: 1, exercise_quantity: 0, defer_quantity: 4500 }
+    expected_order_quantities: {}
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 1, minted_quantity: 1500, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 0 }
+      - { direction: BUY, birth_grid_index: -2, count: 1, minted_quantity: 1500, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 0 }
+      - { direction: BUY, birth_grid_index: -3, count: 1, minted_quantity: 1500, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 0 }
+
+  - id: partial_consume_rebound_reenter_same_depth_is_locked
+    description: "-2 已消费一整份后反弹再下探 -2，只能 touch+skip，不能新铸造或再下单"
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { at: "2026-01-05 09:32:00", direction: BUY, grid_index: -2, exercise_quantity: 1500, defer_quantity: 1500 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"]
+      - ["2026-01-05 09:32:00", "9.82", "9.83", "9.59", "9.62"]
+      - ["2026-01-05 09:33:00", "9.62", "9.83", "9.62", "9.82"]
+      - ["2026-01-05 09:34:00", "9.82", "9.83", "9.59", "9.62"]
+    expected_orders: 1
+    expected_ambiguous_bars: 0
+    expected_events:
+      GRID_LEVEL_TOUCHED: 3
+      GRID_LEVEL_SKIPPED: 1
+      GRID_RIGHT_GRANTED: 2
+      GATE_DECISION_MADE: 2
+      RIGHT_TRANCHE_MINTED: 2
+      RIGHT_BALANCE_TRANSFERRED: 1
+      RIGHT_BALANCE_REVOKED: 0
+    forbidden_events: [ERROR_RECORDED, RIGHT_BALANCE_REVOKED]
+    expected_touches: { -1: 1, -2: 2 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { direction: BUY, grid_index: -2, count: 1, exercise_quantity: 1500, defer_quantity: 1500 }
+    expected_order_quantities: { "BUY:-2": [1500] }
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 1, minted_quantity: 1500, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 0 }
+      - { direction: BUY, birth_grid_index: -2, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+
+  - id: mid_rebound_reoffer_then_deepen
+    description: "下探 -3、反弹到 -2、再次下探 -3 后继续 -4；旧 -3 token 撤销，新 epoch 才可重现"
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { at: "2026-01-05 09:32:00", direction: BUY, grid_index: -2, exercise_quantity: 0, defer_quantity: 3000 }
+      - { at: "2026-01-05 09:33:00", direction: BUY, grid_index: -3, exercise_quantity: 0, defer_quantity: 4500 }
+      - { at: "2026-01-05 09:35:00", direction: BUY, grid_index: -3, exercise_quantity: 0, defer_quantity: 4500 }
+      - { at: "2026-01-05 09:36:00", direction: BUY, grid_index: -4, exercise_quantity: 0, defer_quantity: 6000 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"]
+      - ["2026-01-05 09:32:00", "9.82", "9.83", "9.59", "9.62"]
+      - ["2026-01-05 09:33:00", "9.62", "9.63", "9.39", "9.42"]
+      - ["2026-01-05 09:34:00", "9.42", "9.62", "9.42", "9.62"]
+      - ["2026-01-05 09:35:00", "9.62", "9.63", "9.39", "9.42"]
+      - ["2026-01-05 09:36:00", "9.42", "9.43", "9.20", "9.23"]
+    expected_orders: 0
+    expected_ambiguous_bars: 0
+    expected_events:
+      GRID_RIGHT_GRANTED: 5
+      GATE_DECISION_MADE: 5
+      RIGHT_TRANCHE_MINTED: 5
+      RIGHT_BALANCE_TRANSFERRED: 4
+      RIGHT_BALANCE_REVOKED: 1
+    forbidden_events: [ORDER_INTENT_CREATED, RIGHT_BALANCE_RESERVED]
+    expected_touches: { -1: 1, -2: 1, -3: 2, -4: 1 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { direction: BUY, grid_index: -2, count: 1, exercise_quantity: 0, defer_quantity: 3000 }
+      - { direction: BUY, grid_index: -3, count: 2, exercise_quantity: 0, defer_quantity: 9000 }
+      - { direction: BUY, grid_index: -4, count: 1, exercise_quantity: 0, defer_quantity: 6000 }
+    expected_order_quantities: {}
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 1, minted_quantity: 1500, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 0 }
+      - { direction: BUY, birth_grid_index: -2, count: 1, minted_quantity: 1500, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 0 }
+      - { direction: BUY, birth_grid_index: -3, count: 2, minted_quantity: 3000, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 1500 }
+      - { direction: BUY, birth_grid_index: -4, count: 1, minted_quantity: 1500, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 0 }
+
+  - id: multi_level_reversal_in_one_bar_matches_stepwise
+    description: "从 -4 一根确定性反弹到 -1，与逐格反弹一样只撤销 -4/-3/-2"
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { at: "2026-01-05 09:32:00", direction: BUY, grid_index: -2, exercise_quantity: 0, defer_quantity: 3000 }
+      - { at: "2026-01-05 09:33:00", direction: BUY, grid_index: -3, exercise_quantity: 0, defer_quantity: 4500 }
+      - { at: "2026-01-05 09:34:00", direction: BUY, grid_index: -4, exercise_quantity: 0, defer_quantity: 6000 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"]
+      - ["2026-01-05 09:32:00", "9.82", "9.83", "9.59", "9.62"]
+      - ["2026-01-05 09:33:00", "9.62", "9.63", "9.39", "9.42"]
+      - ["2026-01-05 09:34:00", "9.42", "9.43", "9.20", "9.23"]
+      - ["2026-01-05 09:35:00", "9.23", "9.81", "9.23", "9.81"]
+    expected_orders: 0
+    expected_ambiguous_bars: 0
+    expected_events:
+      GRID_RIGHT_GRANTED: 4
+      GATE_DECISION_MADE: 4
+      RIGHT_TRANCHE_MINTED: 4
+      RIGHT_BALANCE_TRANSFERRED: 3
+      RIGHT_BALANCE_REVOKED: 3
+    forbidden_events: [ORDER_INTENT_CREATED, RIGHT_BALANCE_RESERVED]
+    expected_touches: { -1: 1, -2: 1, -3: 1, -4: 1 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { direction: BUY, grid_index: -2, count: 1, exercise_quantity: 0, defer_quantity: 3000 }
+      - { direction: BUY, grid_index: -3, count: 1, exercise_quantity: 0, defer_quantity: 4500 }
+      - { direction: BUY, grid_index: -4, count: 1, exercise_quantity: 0, defer_quantity: 6000 }
+    expected_order_quantities: {}
+    equivalent_to: four_level_defer_then_three_level_reversal
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 1, minted_quantity: 1500, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 0 }
+      - { direction: BUY, birth_grid_index: -2, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 0, revoked_quantity: 1500 }
+      - { direction: BUY, birth_grid_index: -3, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 0, revoked_quantity: 1500 }
+      - { direction: BUY, birth_grid_index: -4, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 0, revoked_quantity: 1500 }
+
+  - id: sell_partial_reversal_reoffers_only_remaining_lot_slice
+    description: "+2 卖权行使一整份后回落再上探；已行权层只能 touch+skip，lot-size 残余不得重新包装成算法份额"
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 1500, defer_quantity: 0 }
+      - { at: "2026-01-05 09:32:00", direction: BUY, grid_index: -2, exercise_quantity: 1500, defer_quantity: 0 }
+      - { at: "2026-01-06 09:30:00", direction: SELL, grid_index: 1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { at: "2026-01-06 09:30:00", direction: SELL, grid_index: 2, exercise_quantity: 1500, defer_quantity: 1500 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"]
+      - ["2026-01-05 09:32:00", "9.82", "9.83", "9.59", "9.62"]
+      - ["2026-01-06 09:30:00", "9.62", "10.41", "9.62", "10.41"]
+      - ["2026-01-06 09:31:00", "10.41", "10.41", "10.15", "10.18"]
+      - ["2026-01-06 09:32:00", "10.18", "10.41", "10.18", "10.41"]
+    expected_orders: 3
+    expected_ambiguous_bars: 0
+    expected_events:
+      GRID_RIGHT_GRANTED: 4
+      GRID_LEVEL_SKIPPED: 1
+      GATE_DECISION_MADE: 4
+      RIGHT_TRANCHE_MINTED: 4
+      RIGHT_BALANCE_TRANSFERRED: 1
+      RIGHT_BALANCE_REVOKED: 0
+    forbidden_events: [ERROR_RECORDED, RIGHT_BALANCE_REVOKED]
+    expected_touches: { -1: 1, -2: 1, 1: 1, 2: 2 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 1, exercise_quantity: 1500, defer_quantity: 0 }
+      - { direction: BUY, grid_index: -2, count: 1, exercise_quantity: 1500, defer_quantity: 0 }
+      - { direction: SELL, grid_index: 1, count: 1, exercise_quantity: 0, defer_quantity: 1500 }
+      - { direction: SELL, grid_index: 2, count: 1, exercise_quantity: 1500, defer_quantity: 1500 }
+    expected_order_quantities:
+      "BUY:-1": [1500]
+      "BUY:-2": [1500]
+      "SELL:2": [1500]
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+      - { direction: BUY, birth_grid_index: -2, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+      - { direction: SELL, birth_grid_index: 1, count: 1, minted_quantity: 1500, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 0 }
+      - { direction: SELL, birth_grid_index: 2, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+
+  - id: buy_max_position_block_is_not_algorithm_defer
+    description: "持仓已等于上限时，算法仍选择 Exercise(Q)，平台必须单独记录 MAX_POSITION 阻断且不能伪装成 Defer"
+    config:
+      initial_position: 30000
+      initial_sellable: 30000
+      max_position: 30000
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 1500, defer_quantity: 0 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"]
+    expected_orders: 0
+    expected_ambiguous_bars: 0
+    expected_events:
+      GRID_LEVEL_TOUCHED: 1
+      GRID_RIGHT_GRANTED: 1
+      GATE_DECISION_MADE: 1
+      GRID_RIGHT_BLOCKED: 1
+      RIGHT_TRANCHE_MINTED: 1
+    forbidden_events: [GRID_RIGHT_DEFERRED, ORDER_INTENT_CREATED, RIGHT_BALANCE_RESERVED]
+    expected_touches: { -1: 1 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 1, exercise_quantity: 1500, defer_quantity: 0 }
+    expected_order_quantities: {}
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 1, minted_quantity: 1500, available_quantity: 1500, exercised_quantity: 0, revoked_quantity: 0 }
+
+  - id: sell_intent_respects_base_and_sellable_boundary
+    description: "底仓等于初始持仓且初始可卖为零；隔日只能为新买入的一份形成卖出意图，绝不动用底仓"
+    config:
+      initial_position: 10000
+      initial_sellable: 0
+      min_base_position: 10000
+    decisions:
+      - { at: "2026-01-05 09:31:00", direction: BUY, grid_index: -1, exercise_quantity: 1500, defer_quantity: 0 }
+      - { at: "2026-01-06 09:30:00", direction: SELL, grid_index: 1, exercise_quantity: 1500, defer_quantity: 0 }
+    bars:
+      - ["2026-01-05 09:30:00", "10", "10.01", "9.99", "10"]
+      - ["2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"]
+      - ["2026-01-06 09:30:00", "9.82", "10.21", "9.82", "10.21"]
+    expected_orders: 2
+    expected_ambiguous_bars: 0
+    expected_events:
+      GRID_LEVEL_TOUCHED: 2
+      GRID_RIGHT_GRANTED: 2
+      GATE_DECISION_MADE: 2
+      RIGHT_TRANCHE_MINTED: 2
+      RIGHT_BALANCE_RESERVED: 2
+      ORDER_INTENT_CREATED: 2
+    forbidden_events: [GRID_RIGHT_DEFERRED, GRID_RIGHT_BLOCKED, RIGHT_BALANCE_REVOKED, ERROR_RECORDED]
+    expected_touches: { -1: 1, 1: 1 }
+    expected_rights:
+      - { direction: BUY, grid_index: -1, count: 1, exercise_quantity: 1500, defer_quantity: 0 }
+      - { direction: SELL, grid_index: 1, count: 1, exercise_quantity: 1500, defer_quantity: 0 }
+    expected_order_quantities:
+      "BUY:-1": [1500]
+      "SELL:1": [1500]
+    balances:
+      - { direction: BUY, birth_grid_index: -1, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }
+      - { direction: SELL, birth_grid_index: 1, count: 1, minted_quantity: 1500, available_quantity: 0, exercised_quantity: 1500, revoked_quantity: 0 }

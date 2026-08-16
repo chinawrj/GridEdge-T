@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "modes": {
+    "short": {
+      "run_id": "perf-short",
+      "iterations": 3,
+      "source_config_sha256": "268340b73416db5984aa656430b15cf054884e2ae92338c698999a6ff0d94c26",
+      "canonical_config_sha256": "6f5d8e72ba49540aea45a2527adf49fdc42a61e2aae116fa96b2d2b30a825d71",
+      "data_sha256": "6863f6b4187ce2d9bce3e427785bd923d056f6bfa9659f3687aef98349c6bfdf",
+      "dataset_bars": 21,
+      "symbol": "600000.SH",
+      "first_timestamp": "2026-01-05T09:30:00",
+      "last_timestamp": "2026-01-06T09:40:00",
+      "algorithm": {
+        "algorithm_name": "gate-policy-adapter",
+        "algorithm_version": "1",
+        "artifact_sha256": "62a3c64dd2dd2d37dc25f289e6975f6851a57044555777e113ab2a45e36f2576",
+        "environment_sha256": "e7ed148fef8281e4c0e83d26878e5df2bad8ab0c5bed2b941ee681046a2e4a60",
+        "canonical_arguments": [],
+        "deterministic": true,
+        "supported_contract_versions": [3],
+        "supports_checkpoint": false
+      },
+      "business_result_sha256": "d7e3644ba66965104998770b9ebf795f4cec5838f2f101adf9076423c7da9e1d"
+    },
+    "nightly": {
+      "run_id": "perf-three-year",
+      "iterations": 7,
+      "source_config_sha256": "5eef06e3de3e475105069ad947329a88c42949bd897bb291532f2c3eb2c27a3f",
+      "canonical_config_sha256": "64d38a587043d47fcd05e4cfa8f69a166f2b956c65df8eec77c4d7150e3b6a1f",
+      "data_sha256": "f68e60309c7af91a3805f7144f6b7fec07fab4274bd5eb6102c051151ce19e7b",
+      "dataset_bars": 34944,
+      "symbol": "002256.SZ",
+      "first_timestamp": "2023-08-14T09:35:00",
+      "last_timestamp": "2026-08-14T15:00:00",
+      "algorithm": {
+        "algorithm_name": "gate-policy-adapter",
+        "algorithm_version": "1",
+        "artifact_sha256": "62a3c64dd2dd2d37dc25f289e6975f6851a57044555777e113ab2a45e36f2576",
+        "environment_sha256": "e7ed148fef8281e4c0e83d26878e5df2bad8ab0c5bed2b941ee681046a2e4a60",
+        "canonical_arguments": [],
+        "deterministic": true,
+        "supported_contract_versions": [3],
+        "supports_checkpoint": false
+      },
+      "business_result_sha256": "1b624dd87114ffe3270c66e91ac31a62d6e94ff00f692bd1a34616001a3c082b",
+      "provenance": {
+        "raw": {
+          "path": "data/raw/baostock_002256.SZ_5m_raw_20230814_20260814.csv",
+          "sha256": "83b53b76c2888b481a98d55125e115c2f61d8f7055014d8f633dc02c6a51ba0a"
+        },
+        "quality": {
+          "path": "data/reports/002256.SZ_5m_raw_20230814_20260814.quality.json",
+          "sha256": "feee377541ebe35bdacc22ff17530785bcb550d537f893fb76a666294903fe50"
+        }
+      }
+    }
+  }
+}

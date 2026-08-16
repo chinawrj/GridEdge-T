@@ -1,0 +1,220 @@
+name: GridEdge-T CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  quality-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@v4
+
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.1
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gridedge-ci
+
+      - name: Install Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the pinned Python package manager
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.12.3"
+          enable-cache: true
+          cache-dependency-glob: webapp/uv.lock
+
+      - name: Verify the Python lock matches project metadata
+        run: uv lock --project webapp --check
+
+      - name: Rust format
+        run: cargo fmt --check
+
+      - name: Rust Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Rust tests
+        run: cargo test --locked --all-targets --all-features
+
+      - name: Build the release-facing CLI
+        run: cargo build --locked --bin gridedge
+
+      - name: Build the optimized CLI for the sample performance gate
+        run: cargo build --locked --release --bin gridedge
+
+      - name: Verify performance gate contracts
+        run: python3 -m unittest -q tests/test_perf_gate.py
+
+      - name: Install and test the BFF as a wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          venv="${RUNNER_TEMP}/bff-venv"
+          uv venv --python 3.12 "${venv}"
+          UV_PROJECT_ENVIRONMENT="${venv}" \
+            uv sync --project webapp --frozen --extra test --no-install-project
+          uv build --project webapp --wheel --out-dir "${RUNNER_TEMP}/bff-dist"
+          uv pip install --python "${venv}/bin/python" --no-deps \
+            "${RUNNER_TEMP}"/bff-dist/gridedge_web-*.whl
+          cp -R webapp/tests "${RUNNER_TEMP}/bff-tests"
+          cd "${RUNNER_TEMP}"
+          "${venv}/bin/python" -I - <<'PY'
+          import os
+          from pathlib import Path
+          import gridedge_web
+
+          module = Path(gridedge_web.__file__).resolve()
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          assert workspace not in module.parents, module
+          PY
+          "${venv}/bin/python" -m pytest -q "${RUNNER_TEMP}/bff-tests"
+
+      - name: Cache the pinned Playwright browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: "playwright-${{ runner.os }}-${{ hashFiles('webapp/uv.lock') }}"
+
+      - name: Install Chromium system dependencies
+        run: >-
+          "${RUNNER_TEMP}/bff-venv/bin/python" -m playwright install --with-deps chromium
+
+      - name: Real Chromium dashboard interaction
+        shell: bash
+        run: |
+          set -euo pipefail
+          browser_artifacts="${RUNNER_TEMP}/gridedge-browser-artifacts"
+          mkdir -p "${browser_artifacts}"
+          cd "${RUNNER_TEMP}"
+          GRIDEDGE_BINARY="${GITHUB_WORKSPACE}/target/debug/gridedge" \
+          GRIDEDGE_PLATFORM_EXECUTABLE="${RUNNER_TEMP}/bff-venv/bin/gridedge-platform" \
+          GRIDEDGE_BROWSER_ARTIFACTS="${browser_artifacts}" \
+            "${RUNNER_TEMP}/bff-venv/bin/python" -m pytest -q \
+              "${GITHUB_WORKSPACE}/tests/browser/test_dashboard_playwright.py"
+
+      - name: Upload browser failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gridedge-browser-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gridedge-browser-artifacts
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Short replay performance gate from outside the checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d "${RUNNER_TEMP}/gridedge-perf.XXXXXX")"
+          cd "${work}"
+          python3 "${GITHUB_WORKSPACE}/scripts/perf_gate.py" \
+            --mode short \
+            --binary "${GITHUB_WORKSPACE}/target/release/gridedge" \
+            --config "${GITHUB_WORKSPACE}/configs/default.yaml" \
+            --data "${GITHUB_WORKSPACE}/tests/fixtures/sample.csv" \
+            --output-dir "${RUNNER_TEMP}/gridedge-ci-performance" \
+            --run-id perf-short
+
+      - name: Upload sample performance metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gridedge-pr-performance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/gridedge-ci-performance/metrics.json
+            ${{ runner.temp }}/gridedge-ci-performance/input-identity.json
+            ${{ runner.temp }}/gridedge-ci-performance/database-size.json
+            ${{ runner.temp }}/gridedge-ci-performance/summary.md
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Clean-installed platform starts from an arbitrary directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d "${RUNNER_TEMP}/gridedge-platform.XXXXXX")"
+          python - "${work}/config.yaml" "${work}/platform.db" <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          source = (Path(os.environ["GITHUB_WORKSPACE"]) / "configs/default.yaml").read_text()
+          database = Path(sys.argv[2]).as_posix()
+          expected = 'database: "gridedge.db"'
+          assert source.count(expected) == 1
+          Path(sys.argv[1]).write_text(source.replace(expected, f'database: "{database}"'))
+          PY
+          cd "${work}"
+          log="${work}/platform.log"
+          GRIDEDGE_BINARY="${GITHUB_WORKSPACE}/target/debug/gridedge" \
+          GRIDEDGE_CONFIG="${work}/config.yaml" \
+          GRIDEDGE_DATA="${GITHUB_WORKSPACE}/tests/fixtures/sample.csv" \
+          GRIDEDGE_API_TOKEN=ci-platform-token \
+          GRIDEDGE_CORE_PORT=18790 \
+          GRIDEDGE_WEB_PORT=18787 \
+            "${RUNNER_TEMP}/bff-venv/bin/gridedge-platform" >"${log}" 2>&1 &
+          platform_pid=$!
+          cleanup() {
+            if kill -0 "${platform_pid}" 2>/dev/null; then
+              kill -INT "${platform_pid}" 2>/dev/null || true
+              for _ in $(seq 1 50); do
+                kill -0 "${platform_pid}" 2>/dev/null || break
+                sleep 0.1
+              done
+              kill -TERM "${platform_pid}" 2>/dev/null || true
+            fi
+            wait "${platform_pid}" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          python - <<'PY'
+          import time
+          import urllib.request
+
+          deadline = time.monotonic() + 20
+          endpoints = ["http://127.0.0.1:18790/ready", "http://127.0.0.1:18787/"]
+          pending = set(endpoints)
+          while pending and time.monotonic() < deadline:
+              for endpoint in list(pending):
+                  try:
+                      with urllib.request.urlopen(endpoint, timeout=0.5) as response:
+                          if response.status == 200:
+                              pending.remove(endpoint)
+                  except OSError:
+                      pass
+              if pending:
+                  time.sleep(0.1)
+          assert not pending, f"endpoints did not become ready: {sorted(pending)}"
+          request = urllib.request.Request(
+              "http://127.0.0.1:18790/api/v1/runs",
+              headers={"X-GridEdge-Api-Token": "ci-platform-token"},
+          )
+          with urllib.request.urlopen(request, timeout=2) as response:
+              assert response.status == 200
+          PY
+          kill -INT "${platform_pid}"
+          wait "${platform_pid}" || status=$?
+          status=${status:-0}
+          if [[ "${status}" != 0 && "${status}" != 130 ]]; then
+            cat "${log}"
+            exit "${status}"
+          fi
+          trap - EXIT

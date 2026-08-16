@@ -1,0 +1,13 @@
+# Event model
+
+Every event contains `event_id`, `event_type`, `schema_version`, `run_id`, `cycle_id`, `symbol`, exchange `event_time`, journal `recorded_at`, monotonic `sequence_number`, correlation/causation IDs, stable `idempotency_key`, JSON payload, and `config_version`.
+
+SQLite uniquely constrains `(run_id, idempotency_key)` and `(run_id, sequence_number)`. An exact duplicate is counted but has no business effect. Reusing a key with a different type, cycle, symbol, time or normalized payload is rejected as a conflict. Related event groups are prevalidated and inserted in one `IMMEDIATE` transaction. Database triggers reject update and delete operations.
+
+Schema versions are selected per event type. `MARKET_DATA_RECEIVED` v1 is upcast-compatible with historical ledgers; v2 separates receipt from completion. A committed golden v1 fixture is rebuilt in tests. Unknown future versions fail closed before mutating the projection. Decimal values remain JSON strings.
+
+The durable bar workflow is `MARKET_DATA_RECEIVED → decisions/orders/fills → MARKET_BAR_DECISIONS_COMMITTED → MARKET_BAR_PROCESSED`. Only the processed event advances `last_price` and the replay cursor. Recovery can therefore resume any partially completed bar without dropping or duplicating its work.
+
+Rights use explicit `GRID_RIGHT_*` events for grant, platform residual, algorithm defer, platform block, reserve, partial exercise, exercise, release and expiry. Current `GATE_DECISION_MADE` schema 3 stores the normalized request/context and response, including the exact `C/P/A/E/D` partition, so its SHA-256 input hash can be independently recomputed. Its terminal right disposition adds `B/I/R`: `GRID_RIGHT_BLOCKED` and `GRID_RIGHT_RESERVED` use schema 4 for new writes and recompute BUY approval with one cumulative minimum commission. Their historical schema 3 remains replay-only and retains the former two-minimum approval boundary. Current order intents use schema 6 and must be whole `standard_quantity` units. BUY reservation in schema 6 is worst-case order notional plus one cumulative minimum commission. Historical order-intent schemas 1–5 remain replayable with their exact recorded contract; schema 5 specifically retains the former two-minimum reservation and cannot be silently reinterpreted as schema 6. Decision schema 2 likewise remains replay-only and keeps its original board-lot quantities and legacy context hash. `CONFIG_SNAPSHOTTED` includes a canonical content hash that excludes only the operational database path.
+
+`REPLAY_INITIALIZED` binds a run to dataset ID, SHA-256, bar count and time range. It has no direct accounting effect.

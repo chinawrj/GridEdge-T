@@ -1,0 +1,18 @@
+{
+  "event_id": "c545a06c-1884-5f5f-95f7-01f0f3f93c46",
+  "event_type": "MARKET_DATA_RECEIVED",
+  "schema_version": 1,
+  "run_id": "v1-golden",
+  "cycle_id": "cycle-v1",
+  "symbol": "600000.SH",
+  "event_time": "2026-01-05T09:30:00",
+  "recorded_at": "2026-01-05T09:30:00",
+  "sequence_number": 1,
+  "correlation_id": "market:600000.SH:2026-01-05 09:30:00",
+  "causation_id": null,
+  "idempotency_key": "market:600000.SH:2026-01-05 09:30:00",
+  "payload": {
+    "close": "10.00"
+  },
+  "config_version": "v1"
+}

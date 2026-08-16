@@ -1,0 +1,94 @@
+name: GridEdge-T Nightly and Release Performance
+
+on:
+  push:
+    tags:
+      - "v*"
+  schedule:
+    - cron: "30 18 * * *"
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      enforce_thresholds:
+        description: Fail the job when a three-year threshold is exceeded
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: performance-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  three-year-performance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_TERM_COLOR: always
+      PERF_ENFORCE: ${{ github.event_name == 'release' || startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.enforce_thresholds) }}
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@v4
+
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.1
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gridedge-performance
+
+      - name: Install Python 3.12 for the metrics harness
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build optimized GridEdge-T
+        run: cargo build --locked --release --bin gridedge
+
+      - name: Verify performance gate contracts
+        run: python3 -m unittest -q tests/test_perf_gate.py
+
+      - name: Measure the frozen three-year replay and read paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          arguments=(
+            --mode nightly
+            --binary target/release/gridedge
+            --config configs/zhaoxin_5m_quantity_v10.yaml
+            --data data/processed/002256.SZ_5m_raw_20230814_20260814.csv
+            --output-dir "${RUNNER_TEMP}/gridedge-performance"
+            --run-id perf-three-year
+          )
+          if [[ "${PERF_ENFORCE}" == "true" ]]; then
+            arguments+=(--enforce)
+          fi
+          python3 scripts/perf_gate.py "${arguments[@]}"
+
+      - name: Publish performance summary
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f "${RUNNER_TEMP}/gridedge-performance/summary.md" ]]; then
+            cat "${RUNNER_TEMP}/gridedge-performance/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "Performance harness failed before producing a summary." >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload timing and database-size metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gridedge-performance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/gridedge-performance/metrics.json
+            ${{ runner.temp }}/gridedge-performance/input-identity.json
+            ${{ runner.temp }}/gridedge-performance/database-size.json
+            ${{ runner.temp }}/gridedge-performance/summary.md
+          if-no-files-found: warn
+          retention-days: 30

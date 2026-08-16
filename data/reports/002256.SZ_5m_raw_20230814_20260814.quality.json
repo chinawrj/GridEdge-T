@@ -1,0 +1,30 @@
+{
+  "source": "BaoStock",
+  "source_endpoint": "public-api.baostock.com:10030",
+  "symbol": "002256.SZ",
+  "requested_start": "2023-08-14",
+  "requested_end": "2026-08-14",
+  "frequency_minutes": 5,
+  "adjustment": "none",
+  "rows": 34944,
+  "trading_days": 728,
+  "full_trading_days": 728,
+  "partial_trading_days": [],
+  "first_timestamp": "2023-08-14T09:35:00",
+  "last_timestamp": "2026-08-14T15:00:00",
+  "duplicate_timestamps": 0,
+  "invalid_ohlc_rows": 0,
+  "negative_volume_rows": 0,
+  "off_session_rows": 0,
+  "zero_volume_rows": 0,
+  "missing_expected_bars_on_observed_days": 0,
+  "processed_sha256": "f68e60309c7af91a3805f7144f6b7fec07fab4274bd5eb6102c051151ce19e7b",
+  "raw_file": "data/raw/baostock_002256.SZ_5m_raw_20230814_20260814.csv",
+  "processed_file": "data/processed/002256.SZ_5m_raw_20230814_20260814.csv",
+  "generated_at_utc": "2026-08-14T14:56:29.590424+00:00",
+  "notes": [
+    "Observed-day completeness does not classify whole-day stock suspensions as missing data.",
+    "Unadjusted bars are intended for execution replay; forward-adjusted bars are better suited to return-based research.",
+    "Source data is for research use; verify vendor terms before redistribution."
+  ]
+}

@@ -1,0 +1,103 @@
+case_schema: gridedge.case-coverage/v1
+required_case_ids:
+  - buy_defer_carry_then_one_grid_reversal
+  - buy_partial_deepest_first_then_reversal
+  - same_side_intrabar_path_is_ambiguous
+  - repeated_excursion_uses_new_depth_token
+  - exercised_same_level_does_not_remint_before_cycle_closes
+  - sell_direction_mirrors_marginal_reversal
+  - monotonic_buy_four_levels_full_exercise
+  - four_level_defer_then_three_level_reversal
+  - partial_exercise_crosses_tranche_boundary
+  - partially_exercised_same_level_is_locked
+  - three_unexercised_excursions_create_new_epochs
+  - deterministic_gap_crosses_three_buy_levels
+  - same_level_noise_without_exit_does_not_reoffer
+  - complete_two_level_buy_sell_cycle
+  - buy_cash_block_is_not_algorithm_defer
+  - t_plus_one_block_carries_then_executes_next_day
+  - below_break_even_block_carries_until_profitable
+  - stepwise_defer_three_levels
+  - partial_consume_rebound_reenter_same_depth_is_locked
+  - mid_rebound_reoffer_then_deepen
+  - multi_level_reversal_in_one_bar_matches_stepwise
+  - sell_partial_reversal_reoffers_only_remaining_lot_slice
+  - buy_max_position_block_is_not_algorithm_defer
+  - sell_intent_respects_base_and_sellable_boundary
+
+dimensions:
+  direction:
+    BUY:
+      - monotonic_buy_four_levels_full_exercise
+      - mid_rebound_reoffer_then_deepen
+    SELL:
+      - sell_direction_mirrors_marginal_reversal
+      - sell_partial_reversal_reoffers_only_remaining_lot_slice
+  path:
+    MONOTONIC:
+      - monotonic_buy_four_levels_full_exercise
+      - stepwise_defer_three_levels
+    REVERSAL:
+      - four_level_defer_then_three_level_reversal
+      - multi_level_reversal_in_one_bar_matches_stepwise
+    RE_EXCURSION:
+      - repeated_excursion_uses_new_depth_token
+      - three_unexercised_excursions_create_new_epochs
+      - mid_rebound_reoffer_then_deepen
+    GAP:
+      - deterministic_gap_crosses_three_buy_levels
+    AMBIGUOUS:
+      - same_side_intrabar_path_is_ambiguous
+    SAME_LEVEL_RETOUCH:
+      - same_level_noise_without_exit_does_not_reoffer
+      - exercised_same_level_does_not_remint_before_cycle_closes
+      - partial_consume_rebound_reenter_same_depth_is_locked
+  decision:
+    FULL_EXERCISE:
+      - monotonic_buy_four_levels_full_exercise
+      - complete_two_level_buy_sell_cycle
+      - partial_exercise_crosses_tranche_boundary
+      - partially_exercised_same_level_is_locked
+    PARTIAL_EXERCISE:
+      - buy_partial_deepest_first_then_reversal
+      - sell_partial_reversal_reoffers_only_remaining_lot_slice
+    FULL_DEFER:
+      - four_level_defer_then_three_level_reversal
+      - three_unexercised_excursions_create_new_epochs
+    PLATFORM_BLOCKED_NOT_DEFER:
+      - buy_cash_block_is_not_algorithm_defer
+      - buy_max_position_block_is_not_algorithm_defer
+      - t_plus_one_block_carries_then_executes_next_day
+      - below_break_even_block_carries_until_profitable
+  blocker:
+    CASH:
+      - buy_cash_block_is_not_algorithm_defer
+    T_PLUS_ONE:
+      - t_plus_one_block_carries_then_executes_next_day
+    NO_PROFIT:
+      - below_break_even_block_carries_until_profitable
+    MAX_POSITION:
+      - buy_max_position_block_is_not_algorithm_defer
+    BASE_AND_SELLABLE_BOUNDARY:
+      - sell_intent_respects_base_and_sellable_boundary
+  equivalence:
+    GAP_EQUALS_SPLIT_BARS:
+      - deterministic_gap_crosses_three_buy_levels
+      - stepwise_defer_three_levels
+    MULTI_REVERSAL_EQUALS_SPLIT_BARS:
+      - multi_level_reversal_in_one_bar_matches_stepwise
+      - four_level_defer_then_three_level_reversal
+
+automatic_expansions:
+  - RESTART_BEFORE_EACH_BAR
+  - DUPLICATE_EACH_BAR
+  - EXACT_OPPORTUNITY_TRACE
+  - EXACT_RIGHT_SET
+  - EXACT_TRANCHE_SET
+  - EXACT_ORDER_INTENT_SET
+  - TRANCHE_CONSERVATION_AFTER_EACH_BAR
+  - GROSS_EQUALS_AUTHORIZATION_PLUS_PLATFORM_RESIDUAL
+  - EXERCISE_PLUS_DEFER_EQUALS_AUTHORIZATION
+  - INTENT_EQUALS_EXERCISE_MINUS_PLATFORM_BLOCK
+  - REMAINING_EQUALS_DEFER_PLUS_PLATFORM_BLOCK
+  - CURRENT_ACTIVE_QUANTITIES_ARE_WHOLE_ALGORITHM_UNITS

@@ -1,0 +1,91 @@
+case_schema: gridedge.no-loss/v1
+cases:
+  - id: NL01_exact_break_even_allowed
+    description: "最低佣金边界恰好为零时允许"
+    original_quantity: 100
+    remaining_quantity: 100
+    allocated_cost: "1000"
+    quantity: 100
+    limit_price: "10.05"
+    commission_rate: "0"
+    minimum_commission: "5"
+    sell_tax_rate: "0"
+    slippage_rate: "0"
+    allowed: true
+  - id: NL02_one_cent_below_break_even_blocked
+    description: "低一个价格 tick 必须阻断"
+    original_quantity: 100
+    remaining_quantity: 100
+    allocated_cost: "1000"
+    quantity: 100
+    limit_price: "10.04"
+    commission_rate: "0"
+    minimum_commission: "5"
+    sell_tax_rate: "0"
+    slippage_rate: "0"
+    allowed: false
+
+  - id: NL03_buy_commission_is_part_of_cost
+    description: "名义买价盈利但计入买佣后仍亏"
+    original_quantity: 100
+    remaining_quantity: 100
+    allocated_cost: "1005"
+    quantity: 100
+    limit_price: "10.05"
+    commission_rate: "0"
+    minimum_commission: "5"
+    sell_tax_rate: "0"
+    slippage_rate: "0"
+    allowed: false
+
+  - id: NL04_sell_tax_can_block
+    description: "印花税单独造成亏损时阻断"
+    original_quantity: 100
+    remaining_quantity: 100
+    allocated_cost: "1000"
+    quantity: 100
+    limit_price: "10.01"
+    commission_rate: "0"
+    minimum_commission: "0"
+    sell_tax_rate: "0.001"
+    slippage_rate: "0"
+    allowed: false
+
+  - id: NL05_adverse_slippage_is_included
+    description: "网格价看似保本但最坏滑点后亏损"
+    original_quantity: 100
+    remaining_quantity: 100
+    allocated_cost: "1005"
+    quantity: 100
+    limit_price: "10.12"
+    commission_rate: "0.0003"
+    minimum_commission: "5"
+    sell_tax_rate: "0.001"
+    slippage_rate: "0.0001"
+    allowed: false
+
+  - id: NL06_next_safe_tick_is_allowed
+    description: "覆盖最坏滑点和向上费用取整后的下一安全 tick"
+    original_quantity: 100
+    remaining_quantity: 100
+    allocated_cost: "1005"
+    quantity: 100
+    limit_price: "10.13"
+    commission_rate: "0.0003"
+    minimum_commission: "5"
+    sell_tax_rate: "0.001"
+    slippage_rate: "0.0001"
+    allowed: true
+
+  - id: NL07_partial_slice_rechecks_minimum_commission
+    description: "部分份额独立承担最低佣金后恰好保本"
+    original_quantity: 100
+    remaining_quantity: 100
+    allocated_cost: "1005"
+    quantity: 50
+    limit_price: "10.15"
+    commission_rate: "0"
+    minimum_commission: "5"
+    sell_tax_rate: "0"
+    slippage_rate: "0"
+    allowed: true

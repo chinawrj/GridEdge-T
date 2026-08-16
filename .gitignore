@@ -1,0 +1,13 @@
+/target/
+.venv/
+webapp/.venv/
+build/
+dist/
+*.egg-info/
+__pycache__/
+.pytest_cache/
+*.db
+*.db-shm
+*.db-wal
+*.web.lock
+.DS_Store

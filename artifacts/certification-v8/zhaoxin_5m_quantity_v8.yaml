@@ -1,0 +1,34 @@
+symbol: "002256.SZ"
+anchor_price: "2.59"
+grid_ratio: "0.02"
+trade_levels: 4
+boundary_levels: 5
+standard_budget: "0"
+standard_quantity: 6000
+initial_cash: "300000.00"
+initial_position: 20000
+initial_sellable: 20000
+max_position: 100000
+min_base_position: 5000
+lot_size: 100
+price_scale: 2
+hysteresis_ratio: "0.20"
+commission_rate: "0.0003"
+minimum_commission: "5.00"
+sell_tax_rate: "0.001"
+slippage_rate: "0.0001"
+gate:
+  kind: always_execute
+  probability: "1"
+  alpha: "1"
+  failure_mode: safe
+  timeout_ms: 100
+paper:
+  reject_probability_bps: 0
+  partial_fill_bps: 5000
+  latency_ms: 0
+  seed: 2256
+  hold_open_probability_bps: 0
+ambiguity_policy: conservative
+database: "artifacts/certification-v8/gridedge-quantity-v8.db"
+config_version: "zhaoxin-5m-quantity-v8"

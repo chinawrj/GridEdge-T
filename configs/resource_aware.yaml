@@ -8,7 +8,8 @@ standard_quantity: 1500
 initial_cash: "200000.00"
 initial_position: 10000
 initial_sellable: 10000
-max_position: 30000
+# Numeric safety envelope only; the strategy has no business position cap.
+max_position: 1000000000000
 min_base_position: 5000
 lot_size: 100
 price_scale: 2
@@ -24,8 +25,11 @@ gate:
   failure_mode: safe
   timeout_ms: 100
   capital_inventory:
-    minimum_free_cash: "20000.00"
-    target_position: 20000
+    # Spend down to the exact cash needed for one complete quantity plus fees.
+    minimum_free_cash: "0.00"
+    # Equal to the numeric safety envelope, so cash—not a target position—
+    # limits normal BUY decisions.
+    target_position: 1000000000000
 paper:
   reject_probability_bps: 0
   partial_fill_bps: 0

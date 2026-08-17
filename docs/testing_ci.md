@@ -178,6 +178,16 @@ denominator，不能从 Decimal alpha 反推股数。
 回归还要独立重算上述事实、拒绝联合伪造，并证明当前或未来 bar 变化不影响本次决策，连续运行与
 逐bar恢复生成逐字相同的 v4 request/response。
 
+整份 BUY 机械容量必须有独立的 coordinator 回归：当更深层已部署数量达到或超过浅层 mechanical
+cap，浅层 `capacity` 必须 fail-closed 为 0，且不能返回虚构的 carry/tranche ID；服务据此记录的
+`BUY_NO_AVAILABLE_CAPACITY` 不能生成 right/tranche/order。该边界与下面“同 birth 已被消费”的
+优先语义必须分开验证。
+
+同族 birth-depth 门禁必须单独覆盖：浅层 birth tranche 先 Defer，随后 transfer 到更深 right 并在那里
+实际 consumed；即使原浅层 right 的 `exercised_quantity=0`，rearm 后重触该 birth depth 也必须记录
+`GRID_LEVEL_SKIPPED(reason=RIGHT_ALREADY_EXERCISED_AT_LEVEL)`。测试须断言零新 mint/right/order、
+该 birth tranche 的 owner 已变化但 consumed 保持 Q，以及 hot/cold rights/tranches/orders/lots/账户一致。
+
 收益门禁使用费用取整敏感的精确反例同时验证盯市和逐 lot 保守退出。Core 必须证明估值与
 保本证明共用同一 sell-slice economics，并覆盖每 lot 最低佣金、T+1/冻结仍估值，以及无 mark、
 未知成本、缺失冻结策略时的明确不可用。HTTP 必须返回命名清晰的 Decimal 文本字段和策略版本，

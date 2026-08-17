@@ -161,6 +161,23 @@ schema 4 处置与 schema 6 intent，任何试图新写 schema 3 的请求必须
 结果不变。另以同一规范 BUY intent/fill 对照 Ledger 和 Paper：恰好 Q headroom 成功，少一股时
 不得 panic/回绕，journal sequence、StrategyState、paper account 和 paper report 必须逐项零变化。
 
+Decision v4 的纯算法门禁固定 `RESOURCE_AWARE_WHOLE_Q_V1`：20 根 warmup、`.35/.40/.25`
+市场分、`.60` 硬门槛、资金库存不入市场分、`rho=M/(M+4)`、`pace<=.50` 和单机会最多 2 份。
+至少覆盖：高现金但 `m=.59` 仍全 Defer；深度为1但 trend/location 为0时 `m=.35`；19根即使
+强信号仍 warmup；`X=Q,m=.60,M>=1` 行权1份；`A=Q,M=0` 得 `B0=Q,X=0,D=0`；强信号
+`X/Q=2/4/20` 分别只行权 `1/2/2` 份。所有 case 必须验证
+`A=B0+X`、`X=E+D`、`E=I+B1`、`R=D+B0+B1`，并锁 rational alpha numerator/
+denominator，不能从 Decimal alpha 反推股数。
+
+兼容门禁必须保留一份 Decision v3 context hash golden，并证明 v4 新字段不进入 v3 hash；v3
+携带资金库存证据与 v4 缺少该证据都必须拒绝。v4 hash 必须绑定可用现金、仓位、20根已处理行情
+身份、市场特征、`A/X/B0`、pace 和整数目标，任一字段变化都改变 hash。BUY 还必须用未完成订单的
+剩余数量锁定 `pending_buy_quantity` 与 `position_exposure=position.total+pending`；达到 target/max
+后续机会必须得到 `M=0/B0=A`，联合篡改 exposure/headroom/resource 也必须由 Ledger 原子拒绝。
+后续 service/Ledger
+回归还要独立重算上述事实、拒绝联合伪造，并证明当前或未来 bar 变化不影响本次决策，连续运行与
+逐bar恢复生成逐字相同的 v4 request/response。
+
 收益门禁使用费用取整敏感的精确反例同时验证盯市和逐 lot 保守退出。Core 必须证明估值与
 保本证明共用同一 sell-slice economics，并覆盖每 lot 最低佣金、T+1/冻结仍估值，以及无 mark、
 未知成本、缺失冻结策略时的明确不可用。HTTP 必须返回命名清晰的 Decimal 文本字段和策略版本，

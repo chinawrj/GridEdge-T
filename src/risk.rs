@@ -34,6 +34,35 @@ pub fn estimated_buy_reservation(
     .ok_or(RiskError::NumericRange)
 }
 
+pub fn affordable_buy_units(
+    config: &Config,
+    limit_price: Decimal,
+    spendable_cash: Decimal,
+    maximum_units: i64,
+) -> Result<i64, RiskError> {
+    if spendable_cash < Decimal::ZERO || maximum_units < 0 || config.standard_quantity <= 0 {
+        return Err(RiskError::NumericRange);
+    }
+    let mut low = 0_i64;
+    let mut high = maximum_units;
+    while low < high {
+        let span = high.checked_sub(low).ok_or(RiskError::NumericRange)?;
+        let mid = low
+            .checked_add(span / 2)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(RiskError::NumericRange)?;
+        let quantity = mid
+            .checked_mul(config.standard_quantity)
+            .ok_or(RiskError::NumericRange)?;
+        if estimated_buy_reservation(config, limit_price, quantity)? <= spendable_cash {
+            low = mid;
+        } else {
+            high = mid.checked_sub(1).ok_or(RiskError::NumericRange)?;
+        }
+    }
+    Ok(low)
+}
+
 /// Recompute the maximum whole-standard-quantity slice that the platform can
 /// actually approve from an algorithm exercise. This is shared by the service
 /// and the ledger writer so `B` cannot be invented independently of risk,

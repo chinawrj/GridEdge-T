@@ -58,11 +58,22 @@ def _opportunity(index: int, resolution: str) -> dict[str, Any]:
         "gross_available_quantity": 1500 if granted else None,
         "platform_residual_quantity": 0 if granted else None,
         "algorithm_authorized_quantity": 1500 if granted else None,
+        "algorithm_offered_quantity": 1500 if granted else None,
+        "predecision_blocked_quantity": 0 if granted else None,
         "exercise_quantity": 1500 if granted else None,
         "defer_quantity": 0 if granted else None,
         "platform_blocked_quantity": 0 if granted else None,
+        "postdecision_blocked_quantity": 0 if granted else None,
         "order_intent_quantity": 1500 if granted else None,
         "remaining_decision_quantity": 0 if granted else None,
+        "market_score": None,
+        "market_signal_passed": None,
+        "cash_affordable_units": None,
+        "sellable_inventory_units": None,
+        "resource_units": None,
+        "target_units": None,
+        "pending_buy_quantity": None,
+        "position_exposure_quantity": None,
     }
 
 
@@ -156,9 +167,12 @@ def test_opportunity_dtos_are_strict_and_resolution_complete() -> None:
         "gross_available_quantity": 0,
         "platform_residual_quantity": 0,
         "algorithm_authorized_quantity": 0,
+        "algorithm_offered_quantity": 0,
+        "predecision_blocked_quantity": 0,
         "exercise_quantity": 0,
         "defer_quantity": 0,
         "platform_blocked_quantity": 0,
+        "postdecision_blocked_quantity": 0,
         "order_intent_quantity": 0,
         "remaining_decision_quantity": 0,
     }
@@ -180,9 +194,12 @@ def test_opportunity_dtos_are_strict_and_resolution_complete() -> None:
         "gross_available_quantity": None,
         "platform_residual_quantity": None,
         "algorithm_authorized_quantity": None,
+        "algorithm_offered_quantity": None,
+        "predecision_blocked_quantity": None,
         "exercise_quantity": 1200,
         "defer_quantity": 1800,
         "platform_blocked_quantity": None,
+        "postdecision_blocked_quantity": None,
         "order_intent_quantity": 1200,
         "remaining_decision_quantity": None,
     }
@@ -316,6 +333,62 @@ def test_opportunity_dtos_are_strict_and_resolution_complete() -> None:
             )
     with pytest.raises(ValidationError):
         counts_model.model_validate({"touched": 12, "granted": 8, "skipped": 3})
+
+
+def test_resource_aware_v4_opportunity_preserves_both_platform_block_stages() -> None:
+    record_model = _model("OpportunityRecord")
+    payload = {
+        **_opportunity(8, "GRANTED"),
+        "semantics": "CURRENT_V4",
+        "decision_contract_version": 4,
+        "gross_available_quantity": 4500,
+        "platform_residual_quantity": 0,
+        "algorithm_authorized_quantity": 4500,
+        "algorithm_offered_quantity": 3000,
+        "predecision_blocked_quantity": 1500,
+        "exercise_quantity": 1500,
+        "defer_quantity": 1500,
+        "postdecision_blocked_quantity": 0,
+        "platform_blocked_quantity": 1500,
+        "order_intent_quantity": 1500,
+        "remaining_decision_quantity": 3000,
+        "market_score": "0.60",
+        "market_signal_passed": True,
+        "cash_affordable_units": 2,
+        "sellable_inventory_units": 0,
+        "resource_units": 2,
+        "target_units": 1,
+        "pending_buy_quantity": 0,
+        "position_exposure_quantity": 10000,
+    }
+    record = record_model.model_validate(payload)
+    assert record.decision_contract_version == 4
+    assert record.algorithm_authorized_quantity == 4500
+    assert record.algorithm_offered_quantity == 3000
+    assert record.predecision_blocked_quantity == 1500
+    assert record.exercise_quantity == 1500
+    assert record.defer_quantity == 1500
+    assert record.postdecision_blocked_quantity == 0
+    assert record.order_intent_quantity == 1500
+    assert record.remaining_decision_quantity == 3000
+
+    after_algorithm_block = record_model.model_validate(
+        {
+            **payload,
+            "gross_available_quantity": 3000,
+            "algorithm_authorized_quantity": 3000,
+            "algorithm_offered_quantity": 3000,
+            "predecision_blocked_quantity": 0,
+            "exercise_quantity": 3000,
+            "defer_quantity": 0,
+            "postdecision_blocked_quantity": 1500,
+            "platform_blocked_quantity": 1500,
+            "order_intent_quantity": 1500,
+            "remaining_decision_quantity": 1500,
+        }
+    )
+    assert after_algorithm_block.postdecision_blocked_quantity == 1500
+    assert after_algorithm_block.predecision_blocked_quantity == 0
 
 
 def test_client_fetches_every_opportunity_page_at_one_frozen_prefix() -> None:
@@ -463,3 +536,16 @@ def test_dashboard_uses_complete_opportunity_history_and_exposes_auditable_total
             contract in source
         ), f"dashboard opportunity contract is missing: {contract}"
     assert "snapshot.sequence - 80" not in source
+
+
+def test_dashboard_keeps_v4_resource_blocking_distinct_from_algorithm_defer() -> None:
+    source = inspect.getsource(dashboard_app)
+    for contract in [
+        "algorithm_offered_quantity",
+        "predecision_blocked_quantity",
+        "postdecision_blocked_quantity",
+        "资金/库存前置阻断",
+        "算法递延",
+        "风控后置阻断",
+    ]:
+        assert contract in source, f"dashboard v4 audit contract is missing: {contract}"

@@ -72,6 +72,21 @@ def _right_capacity_text(right: dict[str, Any], standard_quantity: int) -> str:
         )
         residual = _share_quantity(right.get("decision_platform_residual_quantity"))
         notes.append(f"授权 {authorized // standard_quantity:,} 份")
+        if contract >= 4:
+            offered = _share_quantity(
+                right.get("decision_algorithm_offered_quantity")
+            )
+            pre_blocked = _share_quantity(
+                right.get("decision_pre_blocked_quantity")
+            )
+            post_blocked = _share_quantity(
+                right.get("decision_post_blocked_quantity")
+            )
+            notes.append(f"资源后可选 {offered // standard_quantity:,} 份")
+            if pre_blocked:
+                notes.append(f"资源阻断 {pre_blocked // standard_quantity:,} 份")
+            if post_blocked:
+                notes.append(f"审批阻断 {post_blocked // standard_quantity:,} 份")
         if residual:
             notes.append(f"残余 {residual:,} 股")
         notes.append(f"总计 {gross:,} 股")
@@ -116,6 +131,24 @@ def _echarts_time(value: Any) -> str:
 
 def _opportunity_audit_note(record: OpportunityRecord) -> str:
     notes = [value for value in [record.reason, record.terminal_reason] if value]
+    if record.semantics == "CURRENT_V4":
+        signal = "通过" if record.market_signal_passed else "未通过"
+        notes.append(f"市场门槛{signal} / 评分 {record.market_score}")
+        notes.append(
+            f"资源 {record.resource_units} 份 / 目标 {record.target_units} 份"
+        )
+        if record.predecision_blocked_quantity:
+            notes.append(
+                f"资金/库存前置阻断 {record.predecision_blocked_quantity} 股"
+            )
+        if record.defer_quantity:
+            notes.append(f"算法递延 {record.defer_quantity} 股")
+        if record.postdecision_blocked_quantity:
+            notes.append(f"风控后置阻断 {record.postdecision_blocked_quantity} 股")
+        if record.pending_buy_quantity:
+            notes.append(
+                f"待成交买入 {record.pending_buy_quantity} 股；敞口 {record.position_exposure_quantity} 股"
+            )
     capacity = record.pre_trade_capacity
     if capacity is not None:
         for label, quantity, lot_ids in [

@@ -6,11 +6,12 @@
 
 use crate::{
     data::MarketBar,
-    decision::GridRight,
+    decision::{DecisionRequest, DecisionResponse, GridRight, DECISION_CONTRACT_VERSION},
     domain::{Direction, GridLevelState, GridLevelStatus, Order, OrderStatus, StrategyState},
     event::{current_event_schema, EventEnvelope, EventType},
     journal::{AppendOutcome, SqliteStore},
     risk::{canonical_approval, canonical_approved_quantity},
+    service::validate_funds_inventory_evidence,
 };
 use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
@@ -214,6 +215,75 @@ impl<'a> LedgerWriter<'a> {
             return Err(anyhow!(
                 "durable market stages must be committed after their prior workflow batch"
             ));
+        }
+        for (decision_index, (decision, decision_exists)) in
+            events.iter().zip(&existing).enumerate()
+        {
+            if *decision_exists
+                || decision.event_type != EventType::GateDecisionMade
+                || decision.schema_version < 4
+            {
+                continue;
+            }
+            let request: DecisionRequest = serde_json::from_value(
+                decision
+                    .payload
+                    .get("request")
+                    .cloned()
+                    .context("gate decision lacks request")?,
+            )?;
+            if request.contract_version != DECISION_CONTRACT_VERSION {
+                continue;
+            }
+            let algorithm_succeeded = decision
+                .payload
+                .get("algorithm_succeeded")
+                .and_then(serde_json::Value::as_bool)
+                .context("v4 gate decision lacks exact algorithm success status")?;
+            if algorithm_succeeded {
+                continue;
+            }
+            let response: DecisionResponse = serde_json::from_value(
+                decision
+                    .payload
+                    .get("response")
+                    .cloned()
+                    .context("v4 gate decision lacks response")?,
+            )?;
+            let failure_reason = response
+                .decision
+                .reason_codes
+                .iter()
+                .find(|reason| reason.as_str() != "RESOURCE_FAIL_CLOSED")
+                .context("v4 fail-closed decision lacks its failure reason")?;
+            let matching_errors = events[..decision_index]
+                .iter()
+                .zip(&existing[..decision_index])
+                .filter(|(candidate, candidate_exists)| {
+                    !**candidate_exists
+                        && candidate.event_type == EventType::ErrorRecorded
+                        && candidate.run_id == decision.run_id
+                        && candidate.cycle_id == decision.cycle_id
+                        && candidate.symbol == decision.symbol
+                        && candidate.event_time == decision.event_time
+                        && candidate.correlation_id == decision.correlation_id
+                        && candidate
+                            .payload
+                            .get("component")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("gate")
+                        && candidate
+                            .payload
+                            .get("reason_code")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(failure_reason.as_str())
+                })
+                .count();
+            if matching_errors != 1 {
+                return Err(anyhow!(
+                    "v4 fail-closed decision requires exactly one matching prior gate error"
+                ));
+            }
         }
         for (touch, touch_exists) in events.iter().zip(&existing) {
             if *touch_exists || touch.event_type != EventType::GridLevelTouched {
@@ -609,6 +679,38 @@ impl<'a> LedgerWriter<'a> {
         state: &StrategyState,
         event: &EventEnvelope,
     ) -> Result<()> {
+        if event.event_type == EventType::GateDecisionMade {
+            let request: DecisionRequest = serde_json::from_value(
+                event
+                    .payload
+                    .get("request")
+                    .cloned()
+                    .context("gate decision lacks request")?,
+            )?;
+            if request.contract_version == DECISION_CONTRACT_VERSION {
+                let right = state
+                    .grid_rights
+                    .get(&request.right.right_id)
+                    .context("v4 decision right is absent from the projected prefix")?;
+                let config = state
+                    .audited_config
+                    .as_ref()
+                    .context("v4 decision lacks audited configuration")?;
+                if serde_json::to_value(right)? != serde_json::to_value(&request.right)? {
+                    return Err(anyhow!(
+                        "v4 decision request right differs from the projected grant"
+                    ));
+                }
+                validate_funds_inventory_evidence(
+                    config,
+                    state,
+                    self.store,
+                    right,
+                    &request.context,
+                )?;
+            }
+            return Ok(());
+        }
         if event.event_type == EventType::RightBalanceReserved {
             if event
                 .payload

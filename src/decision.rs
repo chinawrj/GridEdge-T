@@ -1,6 +1,7 @@
 use crate::{
+    config::Config,
     domain::Direction,
-    gate::{GateContext, GateDecision, GatePolicy},
+    gate::{context_hash_v4, GateContext, GateDecision, GatePolicy},
 };
 use anyhow::{bail, Context, Result};
 use chrono::NaiveDateTime;
@@ -19,7 +20,19 @@ use std::{
 use uuid::Uuid;
 
 pub const LEGACY_DECISION_CONTRACT_VERSION: u32 = 2;
-pub const DECISION_CONTRACT_VERSION: u32 = 3;
+pub const WHOLE_UNIT_DECISION_CONTRACT_VERSION: u32 = 3;
+pub const DECISION_CONTRACT_VERSION: u32 = 4;
+
+pub fn supported_contract_versions_are_canonical(versions: &[u32]) -> bool {
+    !versions.is_empty()
+        && versions.iter().all(|version| {
+            matches!(
+                *version,
+                WHOLE_UNIT_DECISION_CONTRACT_VERSION | DECISION_CONTRACT_VERSION
+            )
+        })
+        && versions.windows(2).all(|pair| pair[0] < pair[1])
+}
 
 pub fn whole_unit_partition(quantity: i64, standard_quantity: i64) -> Result<(i64, i64)> {
     if quantity < 0 || standard_quantity <= 0 {
@@ -443,12 +456,22 @@ pub struct GridRight {
     pub decision_platform_residual_quantity: i64,
     #[serde(default)]
     pub decision_algorithm_authorized_quantity: i64,
+    /// Quantity offered to the v4 algorithm after pre-decision resource caps.
+    #[serde(default)]
+    pub decision_algorithm_offered_quantity: i64,
+    /// Whole-Q quantity removed before the algorithm by funds/inventory caps.
+    #[serde(default)]
+    pub decision_pre_blocked_quantity: i64,
     #[serde(default)]
     pub decided_exercise_quantity: i64,
     #[serde(default)]
     pub decided_defer_quantity: i64,
     #[serde(default)]
     pub decision_platform_blocked_quantity: i64,
+    /// Portion of `decision_platform_blocked_quantity` rejected after the
+    /// algorithm selected E. The remainder is the v4 pre-decision block.
+    #[serde(default)]
+    pub decision_post_blocked_quantity: i64,
     #[serde(default)]
     pub decision_intent_quantity: i64,
     #[serde(default)]
@@ -504,9 +527,12 @@ impl GridRight {
             decision_gross_available_quantity: 0,
             decision_platform_residual_quantity: 0,
             decision_algorithm_authorized_quantity: 0,
+            decision_algorithm_offered_quantity: 0,
+            decision_pre_blocked_quantity: 0,
             decided_exercise_quantity: 0,
             decided_defer_quantity: 0,
             decision_platform_blocked_quantity: 0,
+            decision_post_blocked_quantity: 0,
             decision_intent_quantity: 0,
             decision_remaining_quantity: 0,
             decision_is_algorithm: false,
@@ -546,6 +572,14 @@ pub struct DecisionRequest {
 
 impl DecisionRequest {
     pub fn new(right: GridRight, context: GateContext) -> Self {
+        Self::new_with_contract(right, context, WHOLE_UNIT_DECISION_CONTRACT_VERSION)
+    }
+
+    pub fn new_with_contract(
+        right: GridRight,
+        context: GateContext,
+        contract_version: u32,
+    ) -> Self {
         let digest = Sha256::digest(right.right_id.as_bytes());
         let deterministic_seed = u64::from_be_bytes(
             digest[..8]
@@ -553,7 +587,7 @@ impl DecisionRequest {
                 .expect("SHA-256 always contains eight bytes"),
         );
         Self {
-            contract_version: DECISION_CONTRACT_VERSION,
+            contract_version,
             request_id: format!("decision:{}", right.right_id),
             right,
             context,
@@ -564,7 +598,9 @@ impl DecisionRequest {
     pub fn validate(&self) -> Result<()> {
         if !matches!(
             self.contract_version,
-            LEGACY_DECISION_CONTRACT_VERSION | DECISION_CONTRACT_VERSION
+            LEGACY_DECISION_CONTRACT_VERSION
+                | WHOLE_UNIT_DECISION_CONTRACT_VERSION
+                | DECISION_CONTRACT_VERSION
         ) {
             bail!("unsupported decision contract version")
         }
@@ -591,15 +627,42 @@ impl DecisionRequest {
             if self.context.available_quantity != gross_available_quantity {
                 bail!("legacy decision context does not match granted capacity")
             }
+            if self.context.funds_inventory.is_some() {
+                bail!("legacy decision context cannot carry v4 resource evidence")
+            }
         } else {
             let (authorized, residual) =
                 whole_unit_partition(gross_available_quantity, self.context.standard_quantity)?;
             if self.context.gross_available_quantity != gross_available_quantity
                 || self.context.platform_residual_quantity != residual
                 || self.context.algorithm_authorized_quantity != authorized
-                || self.context.available_quantity != authorized
             {
                 bail!("decision context does not use the canonical whole-unit partition")
+            }
+            if self.contract_version == WHOLE_UNIT_DECISION_CONTRACT_VERSION {
+                if self.context.available_quantity != authorized
+                    || self.context.funds_inventory.is_some()
+                {
+                    bail!("decision contract v3 cannot reinterpret resource-aware fields")
+                }
+            } else {
+                let resource = self
+                    .context
+                    .funds_inventory
+                    .as_ref()
+                    .context("decision contract v4 requires funds/inventory evidence")?;
+                resource.validate_canonical(&self.context)?;
+                let authorized_units = authorized / self.context.standard_quantity;
+                let offered_units = resource.resource_units.min(authorized_units);
+                if resource.schema_version != crate::gate::FUNDS_INVENTORY_CONTEXT_VERSION
+                    || resource.mechanical_authorized_units != authorized_units
+                    || resource.resource_units < 0
+                    || resource.predecision_blocked_units != authorized_units - offered_units
+                    || self.context.available_quantity
+                        != offered_units * self.context.standard_quantity
+                {
+                    bail!("decision contract v4 resource partition is not canonical")
+                }
             }
         }
         Ok(())
@@ -617,11 +680,21 @@ pub struct DecisionResponse {
 
 impl DecisionResponse {
     pub fn validate_for(&self, request: &DecisionRequest) -> Result<()> {
+        self.validate_for_algorithm_status(request, true)
+    }
+
+    pub fn validate_for_algorithm_status(
+        &self,
+        request: &DecisionRequest,
+        algorithm_succeeded: bool,
+    ) -> Result<()> {
         request.validate()?;
         if self.contract_version != request.contract_version
             || !matches!(
                 self.contract_version,
-                LEGACY_DECISION_CONTRACT_VERSION | DECISION_CONTRACT_VERSION
+                LEGACY_DECISION_CONTRACT_VERSION
+                    | WHOLE_UNIT_DECISION_CONTRACT_VERSION
+                    | DECISION_CONTRACT_VERSION
             )
             || self.request_id != request.request_id
             || self.right_id != request.right.right_id
@@ -630,7 +703,7 @@ impl DecisionResponse {
         }
         let available = request.context.available_quantity;
         let (exercise_quantity, defer_quantity) = self.outcome.quantities();
-        let alignment = if request.contract_version == DECISION_CONTRACT_VERSION {
+        let alignment = if request.contract_version >= WHOLE_UNIT_DECISION_CONTRACT_VERSION {
             request.context.standard_quantity
         } else {
             request.context.lot_size
@@ -655,7 +728,37 @@ impl DecisionResponse {
         if request.contract_version == LEGACY_DECISION_CONTRACT_VERSION {
             self.decision.validate_for_legacy_v2(&request.context)
         } else {
-            self.decision.validate_for(&request.context)?;
+            if request.contract_version == DECISION_CONTRACT_VERSION {
+                if algorithm_succeeded {
+                    let target_quantity = request
+                        .context
+                        .funds_inventory
+                        .as_ref()
+                        .context("decision contract v4 requires funds/inventory evidence")?
+                        .target_units
+                        .checked_mul(request.context.standard_quantity)
+                        .context("v4 target quantity overflow")?;
+                    if exercise_quantity != target_quantity {
+                        bail!("v4 typed exercise quantity differs from its canonical target")
+                    }
+                } else if exercise_quantity != 0
+                    || defer_quantity != available
+                    || self.decision.alpha_numerator != Some(0)
+                    || self.decision.action != "SKIP"
+                    || self.decision.model_name != "resource-aware-whole-q-failsafe"
+                    || !self
+                        .decision
+                        .reason_codes
+                        .iter()
+                        .any(|reason| reason == "RESOURCE_FAIL_CLOSED")
+                {
+                    bail!("v4 failed algorithm response is not canonical fail-closed output")
+                }
+                self.decision
+                    .validate_for_v4(&request.context, exercise_quantity)?;
+            } else {
+                self.decision.validate_for(&request.context)?;
+            }
             let expected_action = if exercise_quantity > 0 {
                 "EXECUTE"
             } else {
@@ -674,7 +777,7 @@ pub trait QuantDecisionAlgorithm: Send + Sync {
         AlgorithmManifest {
             algorithm_name: "in-process-experimental".to_owned(),
             algorithm_version: "1".to_owned(),
-            supported_contract_versions: vec![DECISION_CONTRACT_VERSION],
+            supported_contract_versions: vec![WHOLE_UNIT_DECISION_CONTRACT_VERSION],
             deterministic: true,
             supports_checkpoint: false,
             artifact_sha256: builtin_artifact_sha256("in-process-experimental-v1"),
@@ -688,6 +791,181 @@ pub trait QuantDecisionAlgorithm: Send + Sync {
 
     fn checkpoint(&self) -> Result<Option<AlgorithmCheckpoint>> {
         Ok(None)
+    }
+}
+
+pub struct ResourceAwareWholeQAlgorithm;
+
+impl ResourceAwareWholeQAlgorithm {
+    pub fn safe_response(request: &DecisionRequest, reason: &str) -> Result<DecisionResponse> {
+        request.validate()?;
+        if request.contract_version != DECISION_CONTRACT_VERSION {
+            bail!("resource-aware safe response requires decision contract v4")
+        }
+        let offered_units = request.context.available_quantity / request.context.standard_quantity;
+        let response = DecisionResponse {
+            contract_version: DECISION_CONTRACT_VERSION,
+            request_id: request.request_id.clone(),
+            right_id: request.right.right_id.clone(),
+            outcome: RightDecision::Defer {
+                defer_quantity: request.context.available_quantity,
+            },
+            decision: GateDecision {
+                probability: request
+                    .context
+                    .funds_inventory
+                    .as_ref()
+                    .context("resource-aware safe response lacks v4 evidence")?
+                    .market_score,
+                alpha: Decimal::ZERO,
+                alpha_numerator: Some(0),
+                alpha_denominator: Some(offered_units),
+                action: "SKIP".to_owned(),
+                reason_codes: vec![reason.to_owned(), "RESOURCE_FAIL_CLOSED".to_owned()],
+                model_name: "resource-aware-whole-q-failsafe".to_owned(),
+                model_version: "1".to_owned(),
+                input_snapshot_hash: context_hash_v4(&request.context)?,
+                decided_at: request.context.current_time,
+            },
+        };
+        response.validate_for_algorithm_status(request, false)?;
+        Ok(response)
+    }
+
+    fn target_units(request: &DecisionRequest) -> Result<i64> {
+        let context = &request.context;
+        let resource = context
+            .funds_inventory
+            .as_ref()
+            .context("resource-aware algorithm requires v4 evidence")?;
+        let offered_units = context.available_quantity / context.standard_quantity;
+        let expected_pass = resource.history_bars >= resource.long_window
+            && resource.market_score >= resource.market_threshold
+            && (resource.trend_strength > Decimal::ZERO
+                || resource.location_strength > Decimal::ZERO);
+        if resource.market_signal_passed != expected_pass {
+            bail!("resource-aware market gate evidence is inconsistent")
+        }
+        let target = if !expected_pass || offered_units == 0 {
+            0
+        } else {
+            let scaled = Decimal::from(offered_units)
+                .checked_mul(resource.pace)
+                .context("resource-aware target pace overflow")?
+                .floor()
+                .to_string()
+                .parse::<i64>()
+                .context("resource-aware target units are not representable")?;
+            offered_units.min(2).min(scaled.max(1))
+        };
+        if resource.target_units != target {
+            bail!("resource-aware target quantity is not canonical")
+        }
+        Ok(target)
+    }
+}
+
+impl QuantDecisionAlgorithm for ResourceAwareWholeQAlgorithm {
+    fn manifest(&self) -> AlgorithmManifest {
+        AlgorithmManifest {
+            algorithm_name: "resource-aware-whole-q".to_owned(),
+            algorithm_version: "1".to_owned(),
+            supported_contract_versions: vec![DECISION_CONTRACT_VERSION],
+            deterministic: true,
+            supports_checkpoint: false,
+            artifact_sha256: builtin_artifact_sha256("resource-aware-whole-q-v1"),
+            canonical_arguments: Vec::new(),
+            environment_sha256: builtin_artifact_sha256("in-process:no-environment"),
+            platform_sha256: current_platform_sha256(),
+        }
+    }
+
+    fn decide(&self, request: &DecisionRequest) -> Result<DecisionResponse> {
+        request.validate()?;
+        if request.contract_version != DECISION_CONTRACT_VERSION {
+            bail!("resource-aware algorithm requires decision contract v4")
+        }
+        let resource = request
+            .context
+            .funds_inventory
+            .as_ref()
+            .context("resource-aware algorithm requires v4 evidence")?;
+        let target_units = Self::target_units(request)?;
+        let offered_units = request.context.available_quantity / request.context.standard_quantity;
+        let exercise_quantity = target_units
+            .checked_mul(request.context.standard_quantity)
+            .context("resource-aware exercise quantity overflow")?;
+        let defer_quantity = request
+            .context
+            .available_quantity
+            .checked_sub(exercise_quantity)
+            .context("resource-aware defer quantity underflow")?;
+        let alpha = if offered_units == 0 {
+            Decimal::ZERO
+        } else {
+            Decimal::from(target_units)
+                .checked_div(Decimal::from(offered_units))
+                .context("resource-aware alpha is not representable")?
+        };
+        let mut reasons = Vec::new();
+        if resource.history_bars < resource.long_window {
+            reasons.push("RESOURCE_SIGNAL_WARMUP".to_owned());
+        } else if !resource.market_signal_passed {
+            reasons.push("RESOURCE_MARKET_THRESHOLD_NOT_MET".to_owned());
+        } else {
+            reasons.push("RESOURCE_MARKET_SIGNAL_PASSED".to_owned());
+        }
+        if resource.predecision_blocked_units > 0 {
+            reasons.push("RESOURCE_CAP_APPLIED".to_owned());
+        }
+        if target_units > 0 {
+            reasons.push("RESOURCE_TARGET_EXERCISE".to_owned());
+        } else {
+            reasons.push("RESOURCE_TARGET_SKIP".to_owned());
+        }
+        let decision = GateDecision {
+            probability: resource.market_score,
+            alpha,
+            alpha_numerator: Some(target_units),
+            alpha_denominator: Some(offered_units),
+            action: if exercise_quantity > 0 {
+                "EXECUTE".to_owned()
+            } else {
+                "SKIP".to_owned()
+            },
+            reason_codes: reasons,
+            model_name: "resource-aware-whole-q".to_owned(),
+            model_version: "1".to_owned(),
+            input_snapshot_hash: context_hash_v4(&request.context)?,
+            decided_at: request.context.current_time,
+        };
+        let outcome = if exercise_quantity > 0 {
+            RightDecision::Exercise {
+                exercise_quantity,
+                defer_quantity,
+            }
+        } else {
+            RightDecision::Defer { defer_quantity }
+        };
+        let response = DecisionResponse {
+            contract_version: request.contract_version,
+            request_id: request.request_id.clone(),
+            right_id: request.right.right_id.clone(),
+            outcome,
+            decision,
+        };
+        response.validate_for(request)?;
+        Ok(response)
+    }
+}
+
+pub fn algorithm_from_config(config: &Config) -> Result<Box<dyn QuantDecisionAlgorithm>> {
+    if config.gate.kind == "resource_aware" {
+        Ok(Box::new(ResourceAwareWholeQAlgorithm))
+    } else {
+        Ok(Box::new(GateAlgorithmAdapter::new(
+            crate::gate::from_config(config)?,
+        )))
     }
 }
 
@@ -746,9 +1024,7 @@ impl ProcessAlgorithm {
             serde_json::from_slice(&raw).map_err(|error| anyhow::anyhow!(error))?;
         if manifest.algorithm_name.trim().is_empty()
             || manifest.algorithm_version.trim().is_empty()
-            || !manifest
-                .supported_contract_versions
-                .contains(&DECISION_CONTRACT_VERSION)
+            || !supported_contract_versions_are_canonical(&manifest.supported_contract_versions)
             || !manifest.deterministic
         {
             bail!("process algorithm returned an incompatible manifest")
@@ -969,7 +1245,7 @@ impl QuantDecisionAlgorithm for GateAlgorithmAdapter {
         AlgorithmManifest {
             algorithm_name: "gate-policy-adapter".to_owned(),
             algorithm_version: "1".to_owned(),
-            supported_contract_versions: vec![DECISION_CONTRACT_VERSION],
+            supported_contract_versions: vec![WHOLE_UNIT_DECISION_CONTRACT_VERSION],
             deterministic: true,
             supports_checkpoint: false,
             artifact_sha256: builtin_artifact_sha256("gate-policy-adapter-v1"),
@@ -982,7 +1258,7 @@ impl QuantDecisionAlgorithm for GateAlgorithmAdapter {
     fn decide(&self, request: &DecisionRequest) -> Result<DecisionResponse> {
         request.validate()?;
         let response = DecisionResponse {
-            contract_version: DECISION_CONTRACT_VERSION,
+            contract_version: request.contract_version,
             request_id: request.request_id.clone(),
             right_id: request.right.right_id.clone(),
             decision: self.policy.evaluate(&request.context)?,

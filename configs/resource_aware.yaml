@@ -1,0 +1,37 @@
+symbol: "600000.SH"
+anchor_price: "10.00"
+grid_ratio: "0.02"
+trade_levels: 4
+boundary_levels: 5
+standard_budget: "0"
+standard_quantity: 1500
+initial_cash: "200000.00"
+initial_position: 10000
+initial_sellable: 10000
+max_position: 30000
+min_base_position: 5000
+lot_size: 100
+price_scale: 2
+hysteresis_ratio: "0.20"
+commission_rate: "0.0003"
+minimum_commission: "5.00"
+sell_tax_rate: "0.001"
+slippage_rate: "0.0001"
+gate:
+  kind: resource_aware
+  probability: "1"
+  alpha: "1"
+  failure_mode: safe
+  timeout_ms: 100
+  capital_inventory:
+    minimum_free_cash: "20000.00"
+    target_position: 20000
+paper:
+  reject_probability_bps: 0
+  partial_fill_bps: 0
+  latency_ms: 0
+  seed: 42
+  hold_open_probability_bps: 0
+ambiguity_policy: conservative
+database: "gridedge-resource-aware.db"
+config_version: "v1-resource-aware"

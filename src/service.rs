@@ -3,7 +3,8 @@ use crate::{
     data::{MarketBar, MarketDataFeed},
     decision::{
         whole_unit_partition, DecisionRequest, GateAlgorithmAdapter, GridRight, GridRightStatus,
-        QuantDecisionAlgorithm, RightTranche,
+        QuantDecisionAlgorithm, ResourceAwareWholeQAlgorithm, RightTranche,
+        DECISION_CONTRACT_VERSION, WHOLE_UNIT_DECISION_CONTRACT_VERSION,
     },
     domain::{
         Direction, Fill, LotQuantityAllocation, Order, OrderIntent, OrderStatus, ProfitGuardPolicy,
@@ -11,7 +12,10 @@ use crate::{
     },
     event::{EventEnvelope, EventType},
     execution::{ExecutionGateway, ExecutionReport, PaperExecutionGateway},
-    gate::{AlwaysExecuteGate, FixedGate, GateContext, GatePolicy},
+    gate::{
+        AlwaysExecuteGate, FixedGate, FundsInventoryContextV1, GateContext, GatePolicy,
+        FUNDS_INVENTORY_CONTEXT_VERSION,
+    },
     grid::{crossed_levels, maybe_rearm, GridSpec, TouchClassification},
     journal::{AppendOutcome, EventReader, SqliteStore, StateReader},
     ledger::LedgerWriter,
@@ -21,8 +25,8 @@ use crate::{
     },
     rights::{sell_tranches_to_mint, RightsGateCoordinator},
     risk::{
-        canonical_approval, canonical_approved_quantity, estimated_buy_reservation,
-        DefaultRiskChecker, RiskChecker,
+        affordable_buy_units, canonical_approval, canonical_approved_quantity,
+        estimated_buy_reservation, DefaultRiskChecker, RiskChecker,
     },
 };
 use anyhow::{anyhow, Context, Result};
@@ -41,6 +45,7 @@ pub struct GridAutomationService {
     pub state: StrategyState,
     pub store: SqliteStore,
     algorithm: Arc<dyn QuantDecisionAlgorithm>,
+    active_decision_contract: u32,
     gateway: PaperExecutionGateway,
     last_sequence: i64,
     recent_closes: Vec<Decimal>,
@@ -112,6 +117,22 @@ impl GridAutomationService {
         Self::start_new_with_algorithm_and_replay(config, store, algorithm, run_id, None)
     }
 
+    pub fn start_new_replay_with_algorithm(
+        config: Config,
+        store: SqliteStore,
+        algorithm: Box<dyn QuantDecisionAlgorithm>,
+        run_id: Option<String>,
+        descriptor: &ReplayDescriptor,
+    ) -> Result<Self> {
+        Self::start_new_with_algorithm_and_replay(
+            config,
+            store,
+            algorithm,
+            run_id,
+            Some(descriptor),
+        )
+    }
+
     fn start_new_with_algorithm_and_replay(
         config: Config,
         mut store: SqliteStore,
@@ -127,6 +148,7 @@ impl GridAutomationService {
         }
         store.migrate()?;
         let manifest = validate_algorithm_manifest(algorithm.as_ref())?;
+        let active_decision_contract = active_decision_contract(&config, &manifest)?;
         let run_id = run_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let cycle_id =
             Uuid::new_v5(&Uuid::NAMESPACE_OID, format!("{run_id}:cycle:1").as_bytes()).to_string();
@@ -214,6 +236,7 @@ impl GridAutomationService {
             state,
             store,
             algorithm: Arc::from(algorithm),
+            active_decision_contract,
             gateway,
             last_sequence,
             recent_closes: Vec::new(),
@@ -244,6 +267,7 @@ impl GridAutomationService {
         config.validate()?;
         store.migrate()?;
         let manifest = validate_algorithm_manifest(algorithm.as_ref())?;
+        let active_decision_contract = active_decision_contract(&config, &manifest)?;
         let stored_config_payload = store
             .first_payload_by_type(&run_id, EventType::ConfigSnapshotted)?
             .context("run has no configuration snapshot")?;
@@ -344,6 +368,7 @@ impl GridAutomationService {
             state,
             store,
             algorithm: Arc::from(algorithm),
+            active_decision_contract,
             gateway,
             last_sequence,
             recent_closes,
@@ -971,23 +996,27 @@ impl GridAutomationService {
             bar.timestamp,
             capacity,
         );
-        let context = self.gate_context(&right);
-        let request = DecisionRequest::new(right.clone(), context);
+        let decision_contract_version = self.active_decision_contract;
+        let context = self.gate_context(&right, decision_contract_version)?;
+        let request =
+            DecisionRequest::new_with_contract(right.clone(), context, decision_contract_version);
+        let correlation = format!("touch:{}:{}:{index}", self.state.cycle_id, bar.timestamp);
         let residual_only = request.context.algorithm_authorized_quantity == 0
             && request.context.platform_residual_quantity > 0;
-        let evaluated = if residual_only {
-            GateAlgorithmAdapter::new(Box::new(FixedGate {
-                probability: Decimal::ZERO,
-                alpha: Decimal::ZERO,
-            }))
-            .decide(&request)
-        } else {
-            self.evaluate_algorithm(request.clone())
-                .and_then(|response| {
-                    response.validate_for(&request)?;
-                    Ok(response)
-                })
-        };
+        let evaluated =
+            if residual_only && request.contract_version == WHOLE_UNIT_DECISION_CONTRACT_VERSION {
+                GateAlgorithmAdapter::new(Box::new(FixedGate {
+                    probability: Decimal::ZERO,
+                    alpha: Decimal::ZERO,
+                }))
+                .decide(&request)
+            } else {
+                self.evaluate_algorithm(request.clone())
+                    .and_then(|response| {
+                        response.validate_for(&request)?;
+                        Ok(response)
+                    })
+            };
         let (response, algorithm_failure, algorithm_error_event) = match evaluated {
             Ok(response) => (response, None, None),
             Err(error) => {
@@ -1002,7 +1031,7 @@ impl GridAutomationService {
                 let error_event = self.event(
                     EventType::ErrorRecorded,
                     bar.timestamp,
-                    "gate-failure",
+                    &correlation,
                     format!(
                         "gate-failure:{}:{}:{index}",
                         self.state.cycle_id, bar.timestamp
@@ -1020,22 +1049,24 @@ impl GridAutomationService {
                         }
                     }),
                 );
-                let response = match mode.as_str() {
-                    "always_execute" => {
-                        GateAlgorithmAdapter::new(Box::new(AlwaysExecuteGate)).decide(&request)?
+                let response = if request.contract_version == DECISION_CONTRACT_VERSION {
+                    ResourceAwareWholeQAlgorithm::safe_response(&request, reason)?
+                } else {
+                    match mode.as_str() {
+                        "always_execute" => GateAlgorithmAdapter::new(Box::new(AlwaysExecuteGate))
+                            .decide(&request)?,
+                        "safe" | "skip" => GateAlgorithmAdapter::new(Box::new(FixedGate {
+                            probability: Decimal::ZERO,
+                            alpha: Decimal::ZERO,
+                        }))
+                        .decide(&request)?,
+                        _ => unreachable!("validated config"),
                     }
-                    "safe" | "skip" => GateAlgorithmAdapter::new(Box::new(FixedGate {
-                        probability: Decimal::ZERO,
-                        alpha: Decimal::ZERO,
-                    }))
-                    .decide(&request)?,
-                    _ => unreachable!("validated config"),
                 };
                 (response, Some(reason.to_owned()), Some(error_event))
             }
         };
         let (exercise_quantity, _defer_quantity) = response.outcome.quantities();
-        let correlation = format!("touch:{}:{}:{index}", self.state.cycle_id, bar.timestamp);
         let mut events = vec![self.event(
             EventType::GridLevelTouched,
             bar.timestamp,
@@ -1145,7 +1176,9 @@ impl GridAutomationService {
             json!({
                 "request": &request,
                 "response": &response,
-                "algorithm_succeeded": algorithm_failure.is_none() && !residual_only
+                "algorithm_succeeded": algorithm_failure.is_none()
+                    && !(residual_only
+                        && request.contract_version == WHOLE_UNIT_DECISION_CONTRACT_VERSION)
             }),
         ));
         if direction == Direction::Buy {
@@ -1176,7 +1209,7 @@ impl GridAutomationService {
         }
         if let Some(reason) = algorithm_failure.as_deref() {
             if self.config.gate.failure_mode != "always_execute" {
-                self.push_blocked_events(&mut events, &right, &request, &response, bar, reason);
+                self.push_blocked_events(&mut events, &right, &request, &response, bar, reason)?;
                 return self.record_batch(&mut events);
             }
         }
@@ -1194,14 +1227,26 @@ impl GridAutomationService {
             } else {
                 "SELL_BLOCKED_BELOW_BREAK_EVEN"
             };
-            self.push_blocked_events(&mut events, &right, &request, &response, bar, reason);
+            self.push_blocked_events(&mut events, &right, &request, &response, bar, reason)?;
             return self.record_batch(&mut events);
         }
         if exercise_quantity == 0 {
             if request.context.algorithm_authorized_quantity == 0
                 && request.context.platform_residual_quantity > 0
             {
-                self.push_residual_event(&mut events, &right, &request, &response, bar);
+                self.push_residual_event(&mut events, &right, &request, &response, bar)?;
+            } else if request.contract_version == DECISION_CONTRACT_VERSION
+                && request.context.available_quantity == 0
+                && request.context.algorithm_authorized_quantity > 0
+            {
+                self.push_blocked_events(
+                    &mut events,
+                    &right,
+                    &request,
+                    &response,
+                    bar,
+                    "PREDECISION_RESOURCE_CAP",
+                )?;
             } else {
                 self.push_deferred_events(
                     &mut events,
@@ -1210,7 +1255,7 @@ impl GridAutomationService {
                     &response,
                     bar,
                     "ALGORITHM_DEFERRED_ALL_QUANTITY",
-                );
+                )?;
             }
             return self.record_batch(&mut events);
         }
@@ -1312,7 +1357,7 @@ impl GridAutomationService {
         let intent = match intent_result {
             Ok(intent) => intent,
             Err(reason) => {
-                self.push_blocked_events(&mut events, &right, &request, &response, bar, &reason);
+                self.push_blocked_events(&mut events, &right, &request, &response, bar, &reason)?;
                 self.record_batch(&mut events)?;
                 return Ok(());
             }
@@ -1356,8 +1401,14 @@ impl GridAutomationService {
                 "reserved_budget": (intent.limit_price * Decimal::from(intent.quantity)).to_string()
             })
         } else {
-            let (exercise_quantity, defer_quantity) = response.outcome.quantities();
-            let platform_blocked_quantity = exercise_quantity - intent.quantity;
+            let (
+                offered_quantity,
+                predecision_blocked_quantity,
+                postdecision_blocked_quantity,
+                platform_blocked_quantity,
+                order_intent_quantity,
+                remaining_decision_quantity,
+            ) = Self::terminal_partition(&request, &response, intent.quantity)?;
             json!({
                 "right_id": right.right_id,
                 "decision_id": response.request_id,
@@ -1365,9 +1416,12 @@ impl GridAutomationService {
                 "gross_available_quantity": request.context.gross_available_quantity,
                 "platform_residual_quantity": request.context.platform_residual_quantity,
                 "algorithm_authorized_quantity": request.context.algorithm_authorized_quantity,
+                "algorithm_offered_quantity": offered_quantity,
+                "predecision_blocked_quantity": predecision_blocked_quantity,
+                "postdecision_blocked_quantity": postdecision_blocked_quantity,
                 "platform_blocked_quantity": platform_blocked_quantity,
-                "order_intent_quantity": intent.quantity,
-                "remaining_decision_quantity": defer_quantity + platform_blocked_quantity
+                "order_intent_quantity": order_intent_quantity,
+                "remaining_decision_quantity": remaining_decision_quantity
             })
         };
         let reservation_allocations = self.tranche_allocations(
@@ -2268,7 +2322,9 @@ impl GridAutomationService {
         response: &crate::decision::DecisionResponse,
         bar: &MarketBar,
         reason: &str,
-    ) {
+    ) -> Result<()> {
+        let (offered, pre_blocked, post_blocked, blocked, intent, remaining) =
+            Self::terminal_partition(request, response, 0)?;
         let correlation = format!(
             "touch:{}:{}:{}",
             self.state.cycle_id, bar.timestamp, right.grid_index
@@ -2285,9 +2341,12 @@ impl GridAutomationService {
                 "gross_available_quantity": request.context.gross_available_quantity,
                 "platform_residual_quantity": request.context.platform_residual_quantity,
                 "algorithm_authorized_quantity": request.context.algorithm_authorized_quantity,
-                "platform_blocked_quantity": 0,
-                "order_intent_quantity": 0,
-                "remaining_decision_quantity": response.outcome.quantities().1,
+                "algorithm_offered_quantity": offered,
+                "predecision_blocked_quantity": pre_blocked,
+                "postdecision_blocked_quantity": post_blocked,
+                "platform_blocked_quantity": blocked,
+                "order_intent_quantity": intent,
+                "remaining_decision_quantity": remaining,
                 "remaining_budget": right.capacity.available_budget.to_string(),
                 "remaining_quantity": if right.direction == Direction::Buy {
                     right.capacity.available_quantity
@@ -2296,6 +2355,7 @@ impl GridAutomationService {
                 }
             }),
         ));
+        Ok(())
     }
 
     fn push_residual_event(
@@ -2305,7 +2365,9 @@ impl GridAutomationService {
         request: &DecisionRequest,
         response: &crate::decision::DecisionResponse,
         bar: &MarketBar,
-    ) {
+    ) -> Result<()> {
+        let (offered, pre_blocked, post_blocked, blocked, intent, remaining) =
+            Self::terminal_partition(request, response, 0)?;
         let correlation = format!(
             "touch:{}:{}:{}",
             self.state.cycle_id, bar.timestamp, right.grid_index
@@ -2321,14 +2383,18 @@ impl GridAutomationService {
                 "reason": "PLATFORM_RESIDUAL_BELOW_STANDARD_QUANTITY",
                 "gross_available_quantity": request.context.gross_available_quantity,
                 "platform_residual_quantity": request.context.platform_residual_quantity,
-                "algorithm_authorized_quantity": 0,
-                "platform_blocked_quantity": 0,
-                "order_intent_quantity": 0,
-                "remaining_decision_quantity": 0,
+                "algorithm_authorized_quantity": request.context.algorithm_authorized_quantity,
+                "algorithm_offered_quantity": offered,
+                "predecision_blocked_quantity": pre_blocked,
+                "postdecision_blocked_quantity": post_blocked,
+                "platform_blocked_quantity": blocked,
+                "order_intent_quantity": intent,
+                "remaining_decision_quantity": remaining,
                 "remaining_budget": right.capacity.available_budget.to_string(),
                 "remaining_quantity": request.context.gross_available_quantity
             }),
         ));
+        Ok(())
     }
 
     fn push_blocked_events(
@@ -2339,12 +2405,13 @@ impl GridAutomationService {
         response: &crate::decision::DecisionResponse,
         bar: &MarketBar,
         reason: &str,
-    ) {
+    ) -> Result<()> {
         let correlation = format!(
             "touch:{}:{}:{}",
             self.state.cycle_id, bar.timestamp, right.grid_index
         );
-        let (exercise_quantity, defer_quantity) = response.outcome.quantities();
+        let (offered, pre_blocked, post_blocked, blocked, intent, remaining) =
+            Self::terminal_partition(request, response, 0)?;
         events.push(self.event(
             EventType::GridRightBlocked,
             bar.timestamp,
@@ -2357,9 +2424,12 @@ impl GridAutomationService {
                 "gross_available_quantity": request.context.gross_available_quantity,
                 "platform_residual_quantity": request.context.platform_residual_quantity,
                 "algorithm_authorized_quantity": request.context.algorithm_authorized_quantity,
-                "platform_blocked_quantity": exercise_quantity,
-                "order_intent_quantity": 0,
-                "remaining_decision_quantity": defer_quantity + exercise_quantity,
+                "algorithm_offered_quantity": offered,
+                "predecision_blocked_quantity": pre_blocked,
+                "postdecision_blocked_quantity": post_blocked,
+                "platform_blocked_quantity": blocked,
+                "order_intent_quantity": intent,
+                "remaining_decision_quantity": remaining,
                 "remaining_budget": right.capacity.available_budget.to_string(),
                 "remaining_quantity": if right.direction == Direction::Buy {
                     right.capacity.available_quantity
@@ -2368,15 +2438,56 @@ impl GridAutomationService {
                 }
             }),
         ));
+        Ok(())
     }
 
-    fn gate_context(&self, right: &GridRight) -> GateContext {
+    fn terminal_partition(
+        request: &DecisionRequest,
+        response: &crate::decision::DecisionResponse,
+        intent_quantity: i64,
+    ) -> Result<(i64, i64, i64, i64, i64, i64)> {
+        let (exercise, defer) = response.outcome.quantities();
+        let offered = request.context.available_quantity;
+        let pre_blocked = if request.contract_version == DECISION_CONTRACT_VERSION {
+            request
+                .context
+                .algorithm_authorized_quantity
+                .checked_sub(offered)
+                .context("v4 pre-decision resource partition underflow")?
+        } else {
+            0
+        };
+        let post_blocked = exercise
+            .checked_sub(intent_quantity)
+            .context("post-decision platform partition underflow")?;
+        let blocked = pre_blocked
+            .checked_add(post_blocked)
+            .context("total platform block overflow")?;
+        let remaining = defer
+            .checked_add(blocked)
+            .context("remaining decision quantity overflow")?;
+        Ok((
+            offered,
+            pre_blocked,
+            post_blocked,
+            blocked,
+            intent_quantity,
+            remaining,
+        ))
+    }
+
+    fn gate_context(&self, right: &GridRight, contract_version: u32) -> Result<GateContext> {
         let recent_return = self
             .recent_closes
             .first()
             .filter(|price| !price.is_zero())
             .zip(self.recent_closes.last())
-            .map(|(first, last)| (*last - *first) / *first)
+            .map(|(first, last)| {
+                last.checked_sub(*first)
+                    .and_then(|change| change.checked_div(*first))
+                    .context("NUMERIC_RANGE_VIOLATION: recent return overflow")
+            })
+            .transpose()?
             .unwrap_or(Decimal::ZERO);
         let volatility = self
             .recent_closes
@@ -2384,7 +2495,12 @@ impl GridAutomationService {
             .min()
             .zip(self.recent_closes.iter().max())
             .zip(self.recent_closes.first().filter(|price| !price.is_zero()))
-            .map(|((low, high), first)| (*high - *low) / *first)
+            .map(|((low, high), first)| {
+                high.checked_sub(*low)
+                    .and_then(|range| range.checked_div(*first))
+                    .context("NUMERIC_RANGE_VIOLATION: recent volatility overflow")
+            })
+            .transpose()?
             .unwrap_or(Decimal::ZERO);
         let gross_available_quantity =
             if right.direction == Direction::Buy && right.capacity.available_quantity > 0 {
@@ -2395,7 +2511,27 @@ impl GridAutomationService {
         let (algorithm_authorized_quantity, platform_residual_quantity) =
             whole_unit_partition(gross_available_quantity, self.config.standard_quantity)
                 .expect("validated configuration has a positive standard quantity");
-        GateContext {
+        let funds_inventory = if contract_version == DECISION_CONTRACT_VERSION {
+            Some(self.funds_inventory_context(
+                right,
+                algorithm_authorized_quantity,
+                recent_return,
+                volatility,
+            )?)
+        } else {
+            None
+        };
+        let available_quantity =
+            funds_inventory
+                .as_ref()
+                .map_or(Ok(algorithm_authorized_quantity), |resource| {
+                    resource
+                        .resource_units
+                        .min(resource.mechanical_authorized_units)
+                        .checked_mul(self.config.standard_quantity)
+                        .context("NUMERIC_RANGE_VIOLATION: offered resource quantity overflow")
+                })?;
+        Ok(GateContext {
             right_id: right.right_id.clone(),
             symbol: self.state.symbol.clone(),
             direction: right.direction,
@@ -2404,7 +2540,7 @@ impl GridAutomationService {
             current_price: right.grid_price,
             current_time: right.granted_at,
             available_budget: right.capacity.available_budget,
-            available_quantity: algorithm_authorized_quantity,
+            available_quantity,
             gross_available_quantity,
             platform_residual_quantity,
             algorithm_authorized_quantity,
@@ -2425,7 +2561,343 @@ impl GridAutomationService {
             }
             .to_owned(),
             cycle_id: self.state.cycle_id.clone(),
+            funds_inventory,
+        })
+    }
+
+    fn funds_inventory_context(
+        &self,
+        right: &GridRight,
+        algorithm_authorized_quantity: i64,
+        _legacy_recent_return: Decimal,
+        _legacy_volatility: Decimal,
+    ) -> Result<FundsInventoryContextV1> {
+        const SHORT_WINDOW: usize = 5;
+        const LONG_WINDOW: usize = 20;
+        let settings = self
+            .config
+            .gate
+            .capital_inventory
+            .as_ref()
+            .context("decision contract v4 requires capital_inventory settings")?;
+        let history = self
+            .store
+            .recent_processed_market_bars(&self.state.run_id, LONG_WINDOW)?;
+        let history_bars = u32::try_from(history.len()).context("history length overflow")?;
+        let feature_head_sequence = history.last().map_or(0, |(sequence, _, _)| *sequence);
+        let feature_bar_ids = history
+            .iter()
+            .map(|(_, event_id, _)| event_id.clone())
+            .collect::<Vec<_>>();
+        let feature_bars_sha256 = hex::encode(sha2::Sha256::digest(serde_json::to_vec(
+            &history
+                .iter()
+                .map(|(sequence, event_id, bar)| (sequence, event_id, bar))
+                .collect::<Vec<_>>(),
+        )?));
+        let closes = history
+            .iter()
+            .map(|(_, _, bar)| bar.close)
+            .collect::<Vec<_>>();
+        let recent_return_5 = if closes.len() >= SHORT_WINDOW {
+            let window = &closes[closes.len() - SHORT_WINDOW..];
+            window[window.len() - 1]
+                .checked_div(window[0])
+                .and_then(|ratio| ratio.checked_sub(Decimal::ONE))
+                .context("NUMERIC_RANGE_VIOLATION: five-bar return overflow")?
+        } else {
+            Decimal::ZERO
+        };
+        let (vwap_deviation_20, range_scale_20) = if history.len() == LONG_WINDOW {
+            let mut weighted_close = Decimal::ZERO;
+            let mut total_volume = 0_i64;
+            let mut close_sum = Decimal::ZERO;
+            for (_, _, bar) in &history {
+                weighted_close = weighted_close
+                    .checked_add(
+                        bar.close
+                            .checked_mul(Decimal::from(bar.volume))
+                            .context("NUMERIC_RANGE_VIOLATION: VWAP product overflow")?,
+                    )
+                    .context("NUMERIC_RANGE_VIOLATION: VWAP sum overflow")?;
+                total_volume = total_volume
+                    .checked_add(bar.volume)
+                    .context("NUMERIC_RANGE_VIOLATION: VWAP volume overflow")?;
+                close_sum = close_sum
+                    .checked_add(bar.close)
+                    .context("NUMERIC_RANGE_VIOLATION: close sum overflow")?;
+            }
+            let vwap = if total_volume > 0 {
+                weighted_close
+                    .checked_div(Decimal::from(total_volume))
+                    .context("NUMERIC_RANGE_VIOLATION: VWAP division overflow")?
+            } else {
+                close_sum
+                    .checked_div(Decimal::from(LONG_WINDOW as i64))
+                    .context("NUMERIC_RANGE_VIOLATION: close mean overflow")?
+            };
+            let last = *closes.last().context("missing long-window close")?;
+            let deviation = last
+                .checked_div(vwap)
+                .and_then(|ratio| ratio.checked_sub(Decimal::ONE))
+                .context("NUMERIC_RANGE_VIOLATION: VWAP deviation overflow")?;
+            let low = *closes.iter().min().context("missing minimum close")?;
+            let high = *closes.iter().max().context("missing maximum close")?;
+            let scale = high
+                .checked_sub(low)
+                .and_then(|range| range.checked_div(closes[0]))
+                .context("NUMERIC_RANGE_VIOLATION: range scale overflow")?
+                .max(Config::decimal("0.005"));
+            (deviation, scale)
+        } else {
+            (Decimal::ZERO, Config::decimal("0.005"))
+        };
+        let depth = Decimal::from(
+            right
+                .grid_index
+                .checked_abs()
+                .context("invalid grid index")?,
+        )
+        .checked_div(Decimal::from(self.config.trade_levels))
+        .context("NUMERIC_RANGE_VIOLATION: grid depth overflow")?;
+        let signed_trend = match right.direction {
+            Direction::Buy => Decimal::ZERO
+                .checked_sub(recent_return_5)
+                .context("NUMERIC_RANGE_VIOLATION: BUY trend overflow")?,
+            Direction::Sell => recent_return_5,
+        };
+        let signed_location = match right.direction {
+            Direction::Buy => Decimal::ZERO
+                .checked_sub(vwap_deviation_20)
+                .context("NUMERIC_RANGE_VIOLATION: BUY location overflow")?,
+            Direction::Sell => vwap_deviation_20,
+        };
+        let trend_strength = signed_trend
+            .checked_div(range_scale_20)
+            .context("NUMERIC_RANGE_VIOLATION: trend strength overflow")?
+            .clamp(Decimal::ZERO, Decimal::ONE);
+        let location_strength = signed_location
+            .checked_div(range_scale_20)
+            .context("NUMERIC_RANGE_VIOLATION: location strength overflow")?
+            .clamp(Decimal::ZERO, Decimal::ONE);
+        let weight_depth = Config::decimal("0.35");
+        let weight_trend = Config::decimal("0.40");
+        let weight_location = Config::decimal("0.25");
+        let market_threshold = Config::decimal("0.60");
+        let market_score = depth
+            .checked_mul(weight_depth)
+            .and_then(|value| {
+                trend_strength
+                    .checked_mul(weight_trend)
+                    .and_then(|trend| value.checked_add(trend))
+            })
+            .and_then(|value| {
+                location_strength
+                    .checked_mul(weight_location)
+                    .and_then(|location| value.checked_add(location))
+            })
+            .context("NUMERIC_RANGE_VIOLATION: market score overflow")?;
+        let market_signal_passed = history.len() == LONG_WINDOW
+            && market_score >= market_threshold
+            && (trend_strength > Decimal::ZERO || location_strength > Decimal::ZERO);
+
+        let mechanical_authorized_units =
+            algorithm_authorized_quantity / self.config.standard_quantity;
+        let free_cash = self
+            .state
+            .cash
+            .available
+            .checked_sub(self.state.cash.frozen)
+            .context("NUMERIC_RANGE_VIOLATION: free cash underflow")?;
+        if free_cash < Decimal::ZERO {
+            anyhow::bail!("cash account has negative spendable balance")
         }
+        let spendable_cash = free_cash
+            .checked_sub(settings.minimum_free_cash)
+            .unwrap_or(Decimal::ZERO)
+            .max(Decimal::ZERO);
+        let pending_buy_quantity = self
+            .state
+            .orders
+            .values()
+            .filter(|order| {
+                order.intent.direction == Direction::Buy
+                    && !matches!(
+                        order.status,
+                        OrderStatus::Filled | OrderStatus::Rejected | OrderStatus::Cancelled
+                    )
+            })
+            .try_fold(0_i64, |sum, order| {
+                let remaining = order
+                    .intent
+                    .quantity
+                    .checked_sub(order.filled_quantity)
+                    .context("NUMERIC_RANGE_VIOLATION: pending BUY quantity underflow")?;
+                sum.checked_add(remaining)
+                    .context("NUMERIC_RANGE_VIOLATION: pending BUY quantity overflow")
+            })?;
+        let position_exposure_quantity = self
+            .state
+            .position
+            .total
+            .checked_add(pending_buy_quantity)
+            .context("NUMERIC_RANGE_VIOLATION: position exposure overflow")?;
+        let position_headroom = self
+            .config
+            .max_position
+            .checked_sub(position_exposure_quantity)
+            .context("NUMERIC_RANGE_VIOLATION: position headroom underflow")?;
+        let target_headroom = settings
+            .target_position
+            .checked_sub(position_exposure_quantity)
+            .context("NUMERIC_RANGE_VIOLATION: target position headroom underflow")?
+            .max(0);
+        let position_headroom_units = position_headroom.max(0) / self.config.standard_quantity;
+        let target_headroom_units = target_headroom / self.config.standard_quantity;
+        let account_sellable = self
+            .state
+            .position
+            .sellable
+            .checked_sub(self.state.position.frozen_sell)
+            .context("NUMERIC_RANGE_VIOLATION: sellable inventory underflow")?;
+        let base_headroom = self
+            .state
+            .position
+            .total
+            .checked_sub(self.config.min_base_position)
+            .context("NUMERIC_RANGE_VIOLATION: base position underflow")?;
+        let sellable_inventory_units =
+            account_sellable.min(base_headroom).max(0) / self.config.standard_quantity;
+        let buy_resource_ceiling = position_headroom_units.min(target_headroom_units).max(0);
+        let cash_affordable_units = if right.direction == Direction::Buy {
+            affordable_buy_units(
+                &self.config,
+                right.grid_price,
+                spendable_cash,
+                buy_resource_ceiling,
+            )?
+        } else {
+            0
+        };
+        let resource_units = match right.direction {
+            Direction::Buy => cash_affordable_units
+                .min(position_headroom_units)
+                .min(target_headroom_units),
+            Direction::Sell => {
+                let canonical = canonical_approval(
+                    &self.config,
+                    &self.state,
+                    right,
+                    algorithm_authorized_quantity,
+                )?;
+                mechanical_authorized_units
+                    .min(sellable_inventory_units)
+                    .min(canonical.quantity / self.config.standard_quantity)
+            }
+        };
+        let offered_units = mechanical_authorized_units.min(resource_units);
+        let predecision_blocked_units = mechanical_authorized_units
+            .checked_sub(offered_units)
+            .context("NUMERIC_RANGE_VIOLATION: resource partition underflow")?;
+        let resource_ratio = Decimal::from(resource_units)
+            .checked_div(Decimal::from(
+                resource_units
+                    .checked_add(4)
+                    .context("resource ratio denominator overflow")?,
+            ))
+            .context("NUMERIC_RANGE_VIOLATION: resource ratio overflow")?;
+        let resource_multiplier = Config::decimal("0.50")
+            .checked_add(
+                Config::decimal("0.50")
+                    .checked_mul(resource_ratio)
+                    .context("NUMERIC_RANGE_VIOLATION: resource multiplier overflow")?,
+            )
+            .context("NUMERIC_RANGE_VIOLATION: resource multiplier overflow")?;
+        let pace = if market_signal_passed {
+            market_score
+                .checked_mul(resource_multiplier)
+                .context("NUMERIC_RANGE_VIOLATION: resource pace overflow")?
+                .min(Config::decimal("0.50"))
+        } else {
+            Decimal::ZERO
+        };
+        let target_units = if !market_signal_passed || offered_units == 0 {
+            0
+        } else {
+            let scaled = Decimal::from(offered_units)
+                .checked_mul(pace)
+                .context("NUMERIC_RANGE_VIOLATION: resource target pace overflow")?
+                .floor()
+                .to_string()
+                .parse::<i64>()
+                .context("resource-aware target units are not representable")?;
+            offered_units.min(2).min(scaled.max(1))
+        };
+        let adverse_buy_price = if right.direction == Direction::Buy {
+            Some(
+                right
+                    .grid_price
+                    .checked_mul(
+                        Decimal::ONE
+                            .checked_add(self.config.slippage_rate)
+                            .context("BUY slippage factor overflow")?,
+                    )
+                    .context("BUY adverse price overflow")?
+                    .round_dp_with_strategy(
+                        self.config.price_scale,
+                        rust_decimal::RoundingStrategy::ToPositiveInfinity,
+                    ),
+            )
+        } else {
+            None
+        };
+        Ok(FundsInventoryContextV1 {
+            schema_version: FUNDS_INVENTORY_CONTEXT_VERSION,
+            feature_head_sequence,
+            feature_bar_ids,
+            feature_bars_sha256,
+            history_bars,
+            short_window: SHORT_WINDOW as u32,
+            long_window: LONG_WINDOW as u32,
+            trade_levels: self.config.trade_levels,
+            weight_depth,
+            weight_trend,
+            weight_location,
+            market_threshold,
+            depth,
+            recent_return_5,
+            vwap_deviation_20,
+            range_scale_20,
+            trend_strength,
+            location_strength,
+            market_score,
+            market_signal_passed,
+            cash_available: self.state.cash.available,
+            cash_frozen: self.state.cash.frozen,
+            minimum_free_cash: settings.minimum_free_cash,
+            spendable_cash,
+            adverse_buy_price,
+            cash_affordable_units,
+            position_total: self.state.position.total,
+            pending_buy_quantity,
+            position_exposure_quantity,
+            position_sellable: self.state.position.sellable,
+            position_today_bought: self.state.position.today_bought,
+            position_frozen_sell: self.state.position.frozen_sell,
+            max_position: self.config.max_position,
+            min_base_position: self.config.min_base_position,
+            target_position: settings.target_position,
+            position_headroom_units,
+            target_headroom_units,
+            sellable_inventory_units,
+            mechanical_authorized_units,
+            resource_units,
+            predecision_blocked_units,
+            resource_ratio,
+            resource_multiplier,
+            pace,
+            target_units,
+        })
     }
 
     fn order_for_intent(&self, intent: &OrderIntent) -> Result<Order> {
@@ -2795,9 +3267,9 @@ fn validate_algorithm_manifest(
     let manifest = algorithm.manifest();
     if manifest.algorithm_name.trim().is_empty()
         || manifest.algorithm_version.trim().is_empty()
-        || !manifest
-            .supported_contract_versions
-            .contains(&crate::decision::DECISION_CONTRACT_VERSION)
+        || !crate::decision::supported_contract_versions_are_canonical(
+            &manifest.supported_contract_versions,
+        )
         || !manifest.deterministic
         || manifest.artifact_sha256.len() != 64
         || manifest.environment_sha256.len() != 64
@@ -2809,4 +3281,243 @@ fn validate_algorithm_manifest(
         ));
     }
     Ok(manifest)
+}
+
+fn active_decision_contract(
+    config: &Config,
+    manifest: &crate::decision::AlgorithmManifest,
+) -> Result<u32> {
+    let expected = if config.gate.kind == "resource_aware" {
+        DECISION_CONTRACT_VERSION
+    } else {
+        WHOLE_UNIT_DECISION_CONTRACT_VERSION
+    };
+    if !manifest.supported_contract_versions.contains(&expected) {
+        return Err(anyhow!(
+            "algorithm does not support decision contract {expected} required by gate kind {}",
+            config.gate.kind
+        ));
+    }
+    Ok(expected)
+}
+
+/// Re-derive authoritative v4 evidence from the append-only prefix before a
+/// decision enters the ledger.
+pub(crate) fn validate_funds_inventory_evidence(
+    config: &Config,
+    state: &StrategyState,
+    store: &SqliteStore,
+    right: &GridRight,
+    context: &GateContext,
+) -> Result<()> {
+    const SHORT_WINDOW: usize = 5;
+    const LONG_WINDOW: usize = 20;
+    let evidence = context
+        .funds_inventory
+        .as_ref()
+        .context("v4 decision lacks funds/inventory evidence")?;
+    evidence.validate_canonical(context)?;
+    let settings = config
+        .gate
+        .capital_inventory
+        .as_ref()
+        .context("audited v4 configuration lacks capital_inventory")?;
+    let history = store.recent_processed_market_bars(&state.run_id, LONG_WINDOW)?;
+    let ids = history
+        .iter()
+        .map(|(_, event_id, _)| event_id.clone())
+        .collect::<Vec<_>>();
+    let history_sha = hex::encode(sha2::Sha256::digest(serde_json::to_vec(
+        &history
+            .iter()
+            .map(|(sequence, event_id, bar)| (sequence, event_id, bar))
+            .collect::<Vec<_>>(),
+    )?));
+    let closes = history
+        .iter()
+        .map(|(_, _, bar)| bar.close)
+        .collect::<Vec<_>>();
+    let recent_return_5 = if closes.len() >= SHORT_WINDOW {
+        let window = &closes[closes.len() - SHORT_WINDOW..];
+        window[window.len() - 1]
+            .checked_div(window[0])
+            .and_then(|ratio| ratio.checked_sub(Decimal::ONE))
+            .context("NUMERIC_RANGE_VIOLATION: audited five-bar return overflow")?
+    } else {
+        Decimal::ZERO
+    };
+    let (vwap_deviation_20, range_scale_20) = if history.len() == LONG_WINDOW {
+        let mut weighted_close = Decimal::ZERO;
+        let mut total_volume = 0_i64;
+        let mut close_sum = Decimal::ZERO;
+        for (_, _, bar) in &history {
+            weighted_close = weighted_close
+                .checked_add(
+                    bar.close
+                        .checked_mul(Decimal::from(bar.volume))
+                        .context("NUMERIC_RANGE_VIOLATION: audited VWAP product overflow")?,
+                )
+                .context("NUMERIC_RANGE_VIOLATION: audited VWAP sum overflow")?;
+            total_volume = total_volume
+                .checked_add(bar.volume)
+                .context("NUMERIC_RANGE_VIOLATION: audited VWAP volume overflow")?;
+            close_sum = close_sum
+                .checked_add(bar.close)
+                .context("NUMERIC_RANGE_VIOLATION: audited close sum overflow")?;
+        }
+        let vwap = if total_volume > 0 {
+            weighted_close
+                .checked_div(Decimal::from(total_volume))
+                .context("NUMERIC_RANGE_VIOLATION: audited VWAP division overflow")?
+        } else {
+            close_sum
+                .checked_div(Decimal::from(LONG_WINDOW as i64))
+                .context("NUMERIC_RANGE_VIOLATION: audited close mean overflow")?
+        };
+        let last = *closes.last().context("audited long window is empty")?;
+        let deviation = last
+            .checked_div(vwap)
+            .and_then(|ratio| ratio.checked_sub(Decimal::ONE))
+            .context("NUMERIC_RANGE_VIOLATION: audited VWAP deviation overflow")?;
+        let low = *closes
+            .iter()
+            .min()
+            .context("audited minimum close is missing")?;
+        let high = *closes
+            .iter()
+            .max()
+            .context("audited maximum close is missing")?;
+        let scale = high
+            .checked_sub(low)
+            .and_then(|range| range.checked_div(closes[0]))
+            .context("NUMERIC_RANGE_VIOLATION: audited range scale overflow")?
+            .max(Config::decimal("0.005"));
+        (deviation, scale)
+    } else {
+        (Decimal::ZERO, Config::decimal("0.005"))
+    };
+    let feature_head = history.last().map_or(0, |(sequence, _, _)| *sequence);
+    let free_cash = state
+        .cash
+        .available
+        .checked_sub(state.cash.frozen)
+        .context("NUMERIC_RANGE_VIOLATION: audited free cash underflow")?;
+    if free_cash < Decimal::ZERO {
+        anyhow::bail!("audited cash account has negative spendable balance")
+    }
+    let spendable = free_cash
+        .checked_sub(settings.minimum_free_cash)
+        .unwrap_or(Decimal::ZERO)
+        .max(Decimal::ZERO);
+    let pending_buy_quantity = state
+        .orders
+        .values()
+        .filter(|order| {
+            order.intent.direction == Direction::Buy
+                && !matches!(
+                    order.status,
+                    OrderStatus::Filled | OrderStatus::Rejected | OrderStatus::Cancelled
+                )
+        })
+        .try_fold(0_i64, |sum, order| {
+            let remaining = order
+                .intent
+                .quantity
+                .checked_sub(order.filled_quantity)
+                .context("NUMERIC_RANGE_VIOLATION: audited pending BUY underflow")?;
+            sum.checked_add(remaining)
+                .context("NUMERIC_RANGE_VIOLATION: audited pending BUY overflow")
+        })?;
+    let position_exposure = state
+        .position
+        .total
+        .checked_add(pending_buy_quantity)
+        .context("NUMERIC_RANGE_VIOLATION: audited position exposure overflow")?;
+    let position_headroom = config
+        .max_position
+        .checked_sub(position_exposure)
+        .context("NUMERIC_RANGE_VIOLATION: audited position headroom overflow")?
+        .max(0)
+        / config.standard_quantity;
+    let target_headroom = settings
+        .target_position
+        .checked_sub(position_exposure)
+        .context("NUMERIC_RANGE_VIOLATION: audited target headroom overflow")?
+        .max(0)
+        / config.standard_quantity;
+    let sellable = state
+        .position
+        .sellable
+        .checked_sub(state.position.frozen_sell)
+        .context("NUMERIC_RANGE_VIOLATION: audited sellable inventory underflow")?;
+    let base = state
+        .position
+        .total
+        .checked_sub(config.min_base_position)
+        .context("NUMERIC_RANGE_VIOLATION: audited base inventory underflow")?;
+    let sellable_units = sellable.min(base).max(0) / config.standard_quantity;
+    let buy_ceiling = position_headroom.min(target_headroom);
+    let cash_units = if right.direction == Direction::Buy {
+        affordable_buy_units(config, right.grid_price, spendable, buy_ceiling)?
+    } else {
+        0
+    };
+    let mechanical_units = context.algorithm_authorized_quantity / config.standard_quantity;
+    let expected_resource_units = match right.direction {
+        Direction::Buy => cash_units.min(position_headroom).min(target_headroom),
+        Direction::Sell => {
+            let approval =
+                canonical_approval(config, state, right, context.algorithm_authorized_quantity)?;
+            sellable_units.min(approval.quantity / config.standard_quantity)
+        }
+    };
+    let expected_adverse_price = if right.direction == Direction::Buy {
+        Some(
+            right
+                .grid_price
+                .checked_mul(
+                    Decimal::ONE
+                        .checked_add(config.slippage_rate)
+                        .context("audited BUY slippage factor overflow")?,
+                )
+                .context("audited BUY adverse price overflow")?
+                .round_dp_with_strategy(
+                    config.price_scale,
+                    rust_decimal::RoundingStrategy::ToPositiveInfinity,
+                ),
+        )
+    } else {
+        None
+    };
+    if evidence.history_bars != history.len() as u32
+        || evidence.feature_head_sequence != feature_head
+        || evidence.feature_bar_ids != ids
+        || evidence.feature_bars_sha256 != history_sha
+        || evidence.recent_return_5 != recent_return_5
+        || evidence.vwap_deviation_20 != vwap_deviation_20
+        || evidence.range_scale_20 != range_scale_20
+        || evidence.cash_available != state.cash.available
+        || evidence.cash_frozen != state.cash.frozen
+        || evidence.minimum_free_cash != settings.minimum_free_cash
+        || evidence.spendable_cash != spendable
+        || evidence.adverse_buy_price != expected_adverse_price
+        || evidence.cash_affordable_units != cash_units
+        || evidence.position_total != state.position.total
+        || evidence.pending_buy_quantity != pending_buy_quantity
+        || evidence.position_exposure_quantity != position_exposure
+        || evidence.position_sellable != state.position.sellable
+        || evidence.position_today_bought != state.position.today_bought
+        || evidence.position_frozen_sell != state.position.frozen_sell
+        || evidence.max_position != config.max_position
+        || evidence.min_base_position != config.min_base_position
+        || evidence.target_position != settings.target_position
+        || evidence.position_headroom_units != position_headroom
+        || evidence.target_headroom_units != target_headroom
+        || evidence.sellable_inventory_units != sellable_units
+        || evidence.mechanical_authorized_units != mechanical_units
+        || evidence.resource_units != expected_resource_units
+    {
+        anyhow::bail!("v4 funds/inventory evidence differs from the durable prefix")
+    }
+    Ok(())
 }

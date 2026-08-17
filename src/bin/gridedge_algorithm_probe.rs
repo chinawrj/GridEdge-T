@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use gridedge_t::{
     decision::{
         AlgorithmManifest, DecisionRequest, DecisionResponse, RightDecision,
-        DECISION_CONTRACT_VERSION,
+        WHOLE_UNIT_DECISION_CONTRACT_VERSION,
     },
     gate::{context_hash, GateDecision},
 };
@@ -50,7 +50,7 @@ fn main() -> Result<()> {
         Some("--gridedge-manifest-v1") => write_json(&AlgorithmManifest {
             algorithm_name: "rust-reference-process-algorithm".to_owned(),
             algorithm_version: "1".to_owned(),
-            supported_contract_versions: vec![DECISION_CONTRACT_VERSION],
+            supported_contract_versions: vec![WHOLE_UNIT_DECISION_CONTRACT_VERSION],
             deterministic: true,
             supports_checkpoint: arguments
                 .iter()
@@ -120,6 +120,8 @@ fn main() -> Result<()> {
             let decision = GateDecision {
                 probability: Decimal::ONE,
                 alpha: Decimal::ONE,
+                alpha_numerator: None,
+                alpha_denominator: None,
                 action: "EXECUTE".to_owned(),
                 reason_codes: vec!["REFERENCE_PROCESS".to_owned()],
                 model_name: "rust-reference-process-algorithm".to_owned(),
@@ -129,7 +131,7 @@ fn main() -> Result<()> {
             };
             let exercise_quantity = request.context.available_quantity;
             write_json(&DecisionResponse {
-                contract_version: DECISION_CONTRACT_VERSION,
+                contract_version: WHOLE_UNIT_DECISION_CONTRACT_VERSION,
                 request_id: request.request_id,
                 right_id: request.right.right_id,
                 outcome: RightDecision::Exercise {

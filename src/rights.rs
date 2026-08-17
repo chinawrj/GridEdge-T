@@ -82,6 +82,12 @@ impl<'a> RightsGateCoordinator<'a> {
                 } else {
                     right.exercised_budget > Decimal::ZERO
                 }
+        }) || self.state.right_tranches.values().any(|tranche| {
+            tranche.cycle_id == self.state.cycle_id
+                && tranche.direction == Direction::Buy
+                && tranche.unit == crate::decision::RightTrancheUnit::Quantity
+                && tranche.birth_grid_index == index
+                && (tranche.reserved_quantity > 0 || tranche.consumed_quantity > 0)
         })
     }
 
@@ -260,9 +266,12 @@ impl<'a> RightsGateCoordinator<'a> {
                         tranche.cycle_id == self.state.cycle_id
                             && tranche.direction == Direction::Buy
                             && tranche.available_quantity > 0
+                            && sources
+                                .iter()
+                                .any(|source| source.right_id == tranche.owner_right_id)
                     })
                     .collect();
-                let carried_in_quantity: i64 = active_tranches
+                let candidate_carried_in_quantity: i64 = active_tranches
                     .iter()
                     .try_fold(0_i64, |total, tranche| {
                         total.checked_add(tranche.available_quantity)
@@ -271,7 +280,7 @@ impl<'a> RightsGateCoordinator<'a> {
                 let has_buy_tranche_history = self.state.right_tranches.values().any(|tranche| {
                     tranche.cycle_id == self.state.cycle_id && tranche.direction == Direction::Buy
                 });
-                let available_quantity = if !has_buy_tranche_history
+                let candidate_available_quantity = if !has_buy_tranche_history
                     && self.state.grid_rights.values().any(|right| {
                         right.cycle_id == self.state.cycle_id && right.direction == Direction::Buy
                     }) {
@@ -280,21 +289,44 @@ impl<'a> RightsGateCoordinator<'a> {
                         .context("available BUY quantity underflow")?
                         .max(0)
                 } else {
-                    carried_in_quantity
+                    candidate_carried_in_quantity
                         .checked_add(self.config.standard_quantity)
                         .context("available BUY quantity overflow")?
                 };
-                let mut tranche_ids: Vec<_> = active_tranches
-                    .iter()
-                    .map(|tranche| tranche.tranche_id.clone())
-                    .collect();
-                tranche_ids.push(RightTranche::id_for(
-                    &self.state.cycle_id,
-                    excursion_epoch,
-                    Direction::Buy,
-                    index,
-                    None,
-                ));
+                let remaining_mechanical_capacity = if deployed_quantity >= mechanical_quantity_cap
+                {
+                    0
+                } else {
+                    mechanical_quantity_cap - deployed_quantity
+                };
+                let capacity_is_available =
+                    candidate_available_quantity <= remaining_mechanical_capacity;
+                let available_quantity = if capacity_is_available {
+                    candidate_available_quantity
+                } else {
+                    0
+                };
+                let carried_in_quantity = if capacity_is_available {
+                    candidate_carried_in_quantity
+                } else {
+                    0
+                };
+                let tranche_ids = if capacity_is_available {
+                    let mut tranche_ids: Vec<_> = active_tranches
+                        .iter()
+                        .map(|tranche| tranche.tranche_id.clone())
+                        .collect();
+                    tranche_ids.push(RightTranche::id_for(
+                        &self.state.cycle_id,
+                        excursion_epoch,
+                        Direction::Buy,
+                        index,
+                        None,
+                    ));
+                    tranche_ids
+                } else {
+                    Vec::new()
+                };
                 return Ok(GridRightCapacity {
                     mechanical_budget_cap: Decimal::ZERO,
                     deployed_budget: Decimal::ZERO,

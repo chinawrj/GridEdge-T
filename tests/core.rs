@@ -2990,6 +2990,333 @@ fn ledger_rejects_nonstandard_buy_mints_and_unsourced_sell_mints() {
 }
 
 #[test]
+fn shallow_buy_reentry_has_no_capacity_after_deeper_whole_units_are_deployed() {
+    let temp = TempDir::new().unwrap();
+    let config = config_in(&temp);
+    let mut state = StrategyState::new(
+        "shallow-buy-reentry".into(),
+        "cycle".into(),
+        config.symbol.clone(),
+        config.anchor_price,
+        config.initial_cash,
+        config.initial_position,
+        config.initial_sellable,
+    );
+    let capacity = |index: i32| GridRightCapacity {
+        mechanical_budget_cap: Decimal::ZERO,
+        deployed_budget: Decimal::ZERO,
+        available_budget: Decimal::ZERO,
+        mechanical_quantity_cap: i64::from(index.abs()) * config.standard_quantity,
+        deployed_quantity: 0,
+        available_quantity: config.standard_quantity,
+        eligible_quantity: 0,
+        eligible_lot_ids: vec![],
+        accumulated_grid_indices: (1..=index.abs()).map(|depth| -depth).collect(),
+        t_plus_one_blocked_quantity: 0,
+        t_plus_one_blocked_lot_ids: vec![],
+        risk_blocked_quantity: 0,
+        risk_blocked_lot_ids: vec![],
+        no_profit_blocked_quantity: 0,
+        no_profit_blocked_lot_ids: vec![],
+        source_right_ids: vec![],
+        carried_in_budget: Decimal::ZERO,
+        carried_in_quantity: 0,
+        tranche_ids: vec![],
+    };
+    for (offset, index) in [-4, -3].into_iter().enumerate() {
+        let time = dt(&format!("2026-01-06 09:3{}:00", offset));
+        let mut right = GridRight::granted(
+            &state.run_id,
+            &state.cycle_id,
+            &state.symbol,
+            Direction::Buy,
+            index,
+            GridSpec::from(&config).price(index).unwrap(),
+            time,
+            capacity(index),
+        );
+        right.status = GridRightStatus::Exercised;
+        right.exercised_quantity = config.standard_quantity;
+        state.grid_rights.insert(right.right_id.clone(), right);
+    }
+    let mut consumed = RightTranche::minted_buy_quantity(
+        &state.cycle_id,
+        "consumed-deeper-unit",
+        "historical-owner",
+        -4,
+        config.standard_quantity,
+    );
+    consumed.available_quantity = 0;
+    consumed.consumed_quantity = config.standard_quantity;
+    state
+        .right_tranches
+        .insert(consumed.tranche_id.clone(), consumed);
+
+    let time = dt("2026-01-06 09:40:00");
+    let right_id = GridRight::id_for(&state.run_id, &state.cycle_id, -1, time);
+    let shallow = RightsGateCoordinator::new(&config, &state)
+        .capacity(-1, Direction::Buy, time.date(), &right_id)
+        .unwrap();
+
+    assert_eq!(shallow.mechanical_quantity_cap, config.standard_quantity);
+    assert_eq!(shallow.deployed_quantity, config.standard_quantity * 2);
+    assert_eq!(shallow.available_quantity, 0);
+    assert_eq!(shallow.carried_in_quantity, 0);
+    assert!(shallow.tranche_ids.is_empty());
+}
+
+#[test]
+fn service_skips_consumed_shallow_birth_after_deep_whole_quantity_is_deployed_and_rebuilds() {
+    let temp = TempDir::new().unwrap();
+    let config = config_in(&temp);
+    let run_id = "deployed-deep-shallow-reentry";
+    let gate = || {
+        Box::new(SequenceGate {
+            call: AtomicUsize::new(0),
+        }) as Box<dyn GatePolicy>
+    };
+    let mut service = GridAutomationService::start_new(
+        config.clone(),
+        SqliteStore::open(&config.database).unwrap(),
+        gate(),
+        Some(run_id.into()),
+    )
+    .unwrap();
+    for market in [
+        bar("2026-01-05 09:30:00", "10", "10.01", "9.99", "10"),
+        bar("2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"),
+        bar("2026-01-05 09:32:00", "9.82", "9.83", "9.59", "9.62"),
+        bar("2026-01-05 09:33:00", "9.62", "9.63", "9.40", "9.43"),
+    ] {
+        service.on_bar(&market).unwrap();
+    }
+    assert_eq!(service.state.orders.len(), 1);
+    let deep_order = service.state.orders.values().next().unwrap();
+    assert_eq!(deep_order.intent.grid_index, -3);
+    assert_eq!(deep_order.intent.quantity, 3 * config.standard_quantity);
+    assert_eq!(deep_order.status, OrderStatus::Filled);
+    service.state.validate_invariants().unwrap();
+
+    for market in [
+        bar("2026-01-05 09:34:00", "9.43", "9.63", "9.42", "9.62"),
+        bar("2026-01-05 09:35:00", "9.62", "9.83", "9.61", "9.82"),
+        bar("2026-01-05 09:36:00", "9.82", "10.01", "9.81", "10"),
+    ] {
+        service.on_bar(&market).unwrap();
+    }
+    let rights_before_reentry = service.state.grid_rights.len();
+    let orders_before_reentry = service.state.orders.len();
+    let reentry = bar("2026-01-05 09:37:00", "10", "10.01", "9.79", "9.82");
+    service.on_bar(&reentry).unwrap();
+
+    assert_eq!(service.state.grid_rights.len(), rights_before_reentry);
+    assert_eq!(service.state.orders.len(), orders_before_reentry);
+    service.state.validate_invariants().unwrap();
+    let hot_events = service.store.load_after(run_id, 0).unwrap();
+    let reentry_events = hot_events
+        .iter()
+        .filter(|event| event.event_time == reentry.timestamp)
+        .collect::<Vec<_>>();
+    assert!(reentry_events.iter().any(|event| {
+        event.event_type == EventType::GridLevelTouched && event.payload["grid_index"] == -1
+    }));
+    assert!(reentry_events.iter().any(|event| {
+        event.event_type == EventType::GridLevelSkipped
+            && event.payload["grid_index"] == -1
+            && event.payload["reason"] == "RIGHT_ALREADY_EXERCISED_AT_LEVEL"
+    }));
+    assert!(!reentry_events.iter().any(|event| {
+        matches!(
+            event.event_type,
+            EventType::GridRightGranted | EventType::OrderIntentCreated
+        )
+    }));
+
+    let hot_rights = serde_json::to_value(&service.state.grid_rights).unwrap();
+    let hot_orders = serde_json::to_value(&service.state.orders).unwrap();
+    let hot_lots = serde_json::to_value(&service.state.lots).unwrap();
+    let hot_cash = service.state.cash.clone();
+    let hot_position = service.state.position.clone();
+    drop(service);
+    let recovered = GridAutomationService::recover(
+        config,
+        SqliteStore::open(temp.path().join("test.db")).unwrap(),
+        gate(),
+        run_id.into(),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&recovered.state.grid_rights).unwrap(),
+        hot_rights
+    );
+    assert_eq!(
+        serde_json::to_value(&recovered.state.orders).unwrap(),
+        hot_orders
+    );
+    assert_eq!(
+        serde_json::to_value(&recovered.state.lots).unwrap(),
+        hot_lots
+    );
+    assert_eq!(recovered.state.cash, hot_cash);
+    assert_eq!(recovered.state.position, hot_position);
+    recovered.state.validate_invariants().unwrap();
+    assert_eq!(
+        recovered
+            .store
+            .load_after(run_id, 0)
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                event.event_type == EventType::GridLevelSkipped
+                    && event.payload["grid_index"] == -1
+                    && event.payload["reason"] == "RIGHT_ALREADY_EXERCISED_AT_LEVEL"
+            })
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn consumed_birth_tranche_blocks_same_depth_reentry_after_deeper_execution_and_rebuilds() {
+    let temp = TempDir::new().unwrap();
+    let config = config_in(&temp);
+    let run_id = "consumed-birth-depth-reentry";
+    let gate = || {
+        Box::new(SequenceGate {
+            call: AtomicUsize::new(0),
+        }) as Box<dyn GatePolicy>
+    };
+    let mut service = GridAutomationService::start_new(
+        config.clone(),
+        SqliteStore::open(&config.database).unwrap(),
+        gate(),
+        Some(run_id.into()),
+    )
+    .unwrap();
+    for market in [
+        bar("2026-01-05 09:30:00", "10", "10.01", "9.99", "10"),
+        bar("2026-01-05 09:31:00", "10", "10.01", "9.79", "9.82"),
+        bar("2026-01-05 09:32:00", "9.82", "9.83", "9.59", "9.62"),
+        bar("2026-01-05 09:33:00", "9.62", "9.63", "9.40", "9.43"),
+    ] {
+        service.on_bar(&market).unwrap();
+    }
+    let birth_right = service
+        .state
+        .grid_rights
+        .values()
+        .find(|right| right.grid_index == -2)
+        .unwrap();
+    assert_eq!(birth_right.status, GridRightStatus::Transferred);
+    assert_eq!(birth_right.exercised_quantity, 0);
+    let birth_tranche = service
+        .state
+        .right_tranches
+        .values()
+        .find(|tranche| tranche.birth_grid_index == -2)
+        .unwrap();
+    assert_ne!(birth_tranche.owner_right_id, birth_right.right_id);
+    assert_eq!(birth_tranche.available_quantity, 0);
+    assert_eq!(birth_tranche.reserved_quantity, 0);
+    assert_eq!(birth_tranche.consumed_quantity, config.standard_quantity);
+
+    service
+        .on_bar(&bar("2026-01-05 09:34:00", "9.43", "9.63", "9.42", "9.62"))
+        .unwrap();
+    service
+        .on_bar(&bar("2026-01-05 09:35:00", "9.62", "9.83", "9.61", "9.82"))
+        .unwrap();
+    let rights_before_reentry = service.state.grid_rights.len();
+    let tranches_before_reentry = service.state.right_tranches.len();
+    let orders_before_reentry = service.state.orders.len();
+    let reentry = bar("2026-01-05 09:36:00", "9.82", "9.83", "9.58", "9.59");
+    service.on_bar(&reentry).unwrap();
+
+    assert_eq!(service.state.grid_rights.len(), rights_before_reentry);
+    assert_eq!(service.state.right_tranches.len(), tranches_before_reentry);
+    assert_eq!(service.state.orders.len(), orders_before_reentry);
+    service.state.validate_invariants().unwrap();
+    let reentry_events = service
+        .store
+        .load_after(run_id, 0)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.event_time == reentry.timestamp)
+        .collect::<Vec<_>>();
+    assert!(
+        reentry_events.iter().any(|event| {
+            event.event_type == EventType::GridLevelTouched && event.payload["grid_index"] == -2
+        }),
+        "re-entry events: {:?}",
+        reentry_events
+            .iter()
+            .map(|event| (&event.event_type, &event.payload))
+            .collect::<Vec<_>>()
+    );
+    assert!(reentry_events.iter().any(|event| {
+        event.event_type == EventType::GridLevelSkipped
+            && event.payload["grid_index"] == -2
+            && event.payload["reason"] == "RIGHT_ALREADY_EXERCISED_AT_LEVEL"
+    }));
+    assert!(!reentry_events.iter().any(|event| {
+        matches!(
+            event.event_type,
+            EventType::GridRightGranted
+                | EventType::RightTrancheMinted
+                | EventType::OrderIntentCreated
+        )
+    }));
+
+    let hot_rights = serde_json::to_value(&service.state.grid_rights).unwrap();
+    let hot_tranches = serde_json::to_value(&service.state.right_tranches).unwrap();
+    let hot_orders = serde_json::to_value(&service.state.orders).unwrap();
+    let hot_lots = serde_json::to_value(&service.state.lots).unwrap();
+    let hot_cash = service.state.cash.clone();
+    let hot_position = service.state.position.clone();
+    drop(service);
+    let recovered = GridAutomationService::recover(
+        config,
+        SqliteStore::open(temp.path().join("test.db")).unwrap(),
+        gate(),
+        run_id.into(),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&recovered.state.grid_rights).unwrap(),
+        hot_rights
+    );
+    assert_eq!(
+        serde_json::to_value(&recovered.state.right_tranches).unwrap(),
+        hot_tranches
+    );
+    assert_eq!(
+        serde_json::to_value(&recovered.state.orders).unwrap(),
+        hot_orders
+    );
+    assert_eq!(
+        serde_json::to_value(&recovered.state.lots).unwrap(),
+        hot_lots
+    );
+    assert_eq!(recovered.state.cash, hot_cash);
+    assert_eq!(recovered.state.position, hot_position);
+    recovered.state.validate_invariants().unwrap();
+    assert_eq!(
+        recovered
+            .store
+            .load_after(run_id, 0)
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                event.event_type == EventType::GridLevelSkipped
+                    && event.payload["grid_index"] == -2
+                    && event.payload["reason"] == "RIGHT_ALREADY_EXERCISED_AT_LEVEL"
+            })
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn balance_transfer_cannot_move_back_to_a_shallower_owner() {
     let temp = TempDir::new().unwrap();
     let mut store = SqliteStore::open(temp.path().join("back-transfer.db")).unwrap();

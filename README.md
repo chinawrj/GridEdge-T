@@ -18,6 +18,7 @@ cargo run -- validate-data --config configs/default.yaml --data tests/fixtures/s
 cargo run -- fetch-klines --symbol 002256.SZ --start 2023-08-14 --end 2026-08-14 --frequency 5 --adjustment none
 cargo run -- generate-grid --anchor 10
 cargo run -- replay --config configs/default.yaml --data tests/fixtures/sample.csv
+cargo run -- replay --config configs/resource_aware.yaml --data tests/fixtures/sample.csv
 cargo run -- status --config configs/default.yaml
 cargo run -- ledger --config configs/default.yaml
 cargo run -- orders --config configs/default.yaml
@@ -61,6 +62,7 @@ The dashboard lets users switch among compatible CSV files in the same data dire
 - Symmetric geometric levels `anchor × 1.02^k`, ±4 trading levels and ±5 boundaries.
 - Fixed-share-quantity buy/sell rights with grant, defer, risk block, reserve, partial/full exercise, release and cycle expiry.
 - Typed quantity contract with exact `exercise_quantity + defer_quantity = available_quantity`, complete input snapshot/hash, deterministic seed and strict response validation.
+- Resource-aware Decision Contract v4: a 20-bar no-lookahead market gate is evaluated before cash/inventory capacity, pending BUY exposure counts against position limits, and each opportunity is capped at two fixed-share units so abundant cash cannot trigger high-price buying by itself.
 - Killable Rust subprocess-algorithm protocol with executable/argument/environment identity binding, process-tree cleanup and resource limits, plus experimental built-in gate adapters. Stateful checkpoint claims are rejected until durable checkpoint/restore is implemented.
 - SQLite WAL/FULL durability, append-only versioned events, expected-sequence writer fencing, strict idempotency conflicts, atomic prevalidated batches and immutable checksummed snapshots.
 - Crash-resumable bar and order workflows, independent persistent Paper Broker ledger, frozen resources, fill invariants and deterministic execution.

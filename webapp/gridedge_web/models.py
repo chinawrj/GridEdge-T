@@ -149,7 +149,7 @@ class OpportunityRecord(BaseModel):
     resolution_sequence: int
     processed_sequence: int
     resolution: Literal["GRANTED", "SKIPPED", "LEGACY_UNBOUND"]
-    semantics: Literal["CURRENT_V3", "LEGACY_RECORDED"]
+    semantics: Literal["CURRENT_V3", "CURRENT_V4", "LEGACY_RECORDED"]
     standard_quantity: int
     direction: Literal["BUY", "SELL"]
     right_id: str | None
@@ -165,11 +165,22 @@ class OpportunityRecord(BaseModel):
     gross_available_quantity: int | None
     platform_residual_quantity: int | None
     algorithm_authorized_quantity: int | None
+    algorithm_offered_quantity: int | None
+    predecision_blocked_quantity: int | None
     exercise_quantity: int | None
     defer_quantity: int | None
     platform_blocked_quantity: int | None
+    postdecision_blocked_quantity: int | None
     order_intent_quantity: int | None
     remaining_decision_quantity: int | None
+    market_score: str | None
+    market_signal_passed: bool | None
+    cash_affordable_units: int | None
+    sellable_inventory_units: int | None
+    resource_units: int | None
+    target_units: int | None
+    pending_buy_quantity: int | None
+    position_exposure_quantity: int | None
 
     @model_validator(mode="after")
     def validate_resolution(self) -> OpportunityRecord:
@@ -183,7 +194,7 @@ class OpportunityRecord(BaseModel):
             raise ValueError("opportunity resolution must follow its touch")
         if self.processed_sequence < self.resolution_sequence:
             raise ValueError("opportunity cannot resolve after its processed bar")
-        if self.semantics == "CURRENT_V3" and (
+        if self.semantics in ("CURRENT_V3", "CURRENT_V4") and (
             self.standard_quantity <= 0 or self.grid_price is None
         ):
             raise ValueError("current opportunity lacks its audited grid facts")
@@ -198,20 +209,24 @@ class OpportunityRecord(BaseModel):
                 raise ValueError("granted opportunity lacks its right and disposition")
             if self.semantics == "CURRENT_V3" and self.decision_contract_version != 3:
                 raise ValueError("current opportunity lacks its decision contract")
-            if self.decision_contract_version == 3:
+            if self.semantics == "CURRENT_V4" and self.decision_contract_version != 4:
+                raise ValueError("resource-aware opportunity lacks contract v4")
+            if self.decision_contract_version in (3, 4):
                 quantities = [
                     self.gross_available_quantity,
                     self.platform_residual_quantity,
                     self.algorithm_authorized_quantity,
+                    self.algorithm_offered_quantity,
+                    self.predecision_blocked_quantity,
                     self.exercise_quantity,
                     self.defer_quantity,
                     self.platform_blocked_quantity,
+                    self.postdecision_blocked_quantity,
                     self.order_intent_quantity,
                     self.remaining_decision_quantity,
                 ]
                 if (
-                    self.decision_contract_version != 3
-                    or self.algorithm_succeeded is None
+                    self.algorithm_succeeded is None
                     or self.pre_trade_capacity is None
                 ):
                     raise ValueError("current opportunity lacks its algorithm contract")
@@ -219,17 +234,21 @@ class OpportunityRecord(BaseModel):
                     raise ValueError(
                         "current opportunity lacks its exact quantity partition"
                     )
-                c, p, a, e, d, b, i, r = (int(quantity) for quantity in quantities)
+                c, p, a, x, b0, e, d, b, b1, i, r = (
+                    int(quantity) for quantity in quantities
+                )
                 if (
                     c != p + a
-                    or a != e + d
-                    or i != e - b
+                    or a != b0 + x
+                    or x != e + d
+                    or e != i + b1
+                    or b != b0 + b1
                     or r != d + b
                     or p >= self.standard_quantity
                     or b > e
                     or any(
                         quantity % self.standard_quantity
-                        for quantity in [a, e, d, b, i, r]
+                        for quantity in [a, x, b0, e, d, b, b1, i, r]
                     )
                 ):
                     raise ValueError(
@@ -257,6 +276,21 @@ class OpportunityRecord(BaseModel):
                         raise ValueError(
                             "partial block differs from its pre-trade capacity"
                         )
+                v4_fields = [
+                    self.market_score,
+                    self.market_signal_passed,
+                    self.cash_affordable_units,
+                    self.sellable_inventory_units,
+                    self.resource_units,
+                    self.target_units,
+                    self.pending_buy_quantity,
+                    self.position_exposure_quantity,
+                ]
+                if self.decision_contract_version == 4:
+                    if any(value is None for value in v4_fields):
+                        raise ValueError("resource-aware opportunity lacks v4 audit evidence")
+                elif any(value is not None for value in v4_fields):
+                    raise ValueError("v3 opportunity invents v4 resource evidence")
             elif (
                 self.semantics != "LEGACY_RECORDED"
                 or self.decision_contract_version not in (1, 2)
@@ -264,8 +298,24 @@ class OpportunityRecord(BaseModel):
                 or self.gross_available_quantity is not None
                 or self.platform_residual_quantity is not None
                 or self.algorithm_authorized_quantity is not None
+                or self.algorithm_offered_quantity is not None
+                or self.predecision_blocked_quantity is not None
                 or self.platform_blocked_quantity is not None
+                or self.postdecision_blocked_quantity is not None
                 or self.remaining_decision_quantity is not None
+                or any(
+                    value is not None
+                    for value in [
+                        self.market_score,
+                        self.market_signal_passed,
+                        self.cash_affordable_units,
+                        self.sellable_inventory_units,
+                        self.resource_units,
+                        self.target_units,
+                        self.pending_buy_quantity,
+                        self.position_exposure_quantity,
+                    ]
+                )
             ):
                 raise ValueError("legacy opportunity invents current quantity facts")
         elif self.resolution == "LEGACY_UNBOUND":
@@ -287,11 +337,22 @@ class OpportunityRecord(BaseModel):
                         self.gross_available_quantity,
                         self.platform_residual_quantity,
                         self.algorithm_authorized_quantity,
+                        self.algorithm_offered_quantity,
+                        self.predecision_blocked_quantity,
                         self.exercise_quantity,
                         self.defer_quantity,
                         self.platform_blocked_quantity,
+                        self.postdecision_blocked_quantity,
                         self.order_intent_quantity,
                         self.remaining_decision_quantity,
+                        self.market_score,
+                        self.market_signal_passed,
+                        self.cash_affordable_units,
+                        self.sellable_inventory_units,
+                        self.resource_units,
+                        self.target_units,
+                        self.pending_buy_quantity,
+                        self.position_exposure_quantity,
                     ]
                 )
             ):
@@ -315,11 +376,22 @@ class OpportunityRecord(BaseModel):
                     self.gross_available_quantity,
                     self.platform_residual_quantity,
                     self.algorithm_authorized_quantity,
+                    self.algorithm_offered_quantity,
+                    self.predecision_blocked_quantity,
                     self.exercise_quantity,
                     self.defer_quantity,
                     self.platform_blocked_quantity,
+                    self.postdecision_blocked_quantity,
                     self.order_intent_quantity,
                     self.remaining_decision_quantity,
+                    self.market_score,
+                    self.market_signal_passed,
+                    self.cash_affordable_units,
+                    self.sellable_inventory_units,
+                    self.resource_units,
+                    self.target_units,
+                    self.pending_buy_quantity,
+                    self.position_exposure_quantity,
                 ]
             )
         ):

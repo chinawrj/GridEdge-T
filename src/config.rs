@@ -7,6 +7,13 @@ use std::{fs, path::Path, str::FromStr};
 pub const MAX_SHARE_QUANTITY: i64 = 1_000_000_000_000;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CapitalInventorySettings {
+    #[serde(with = "rust_decimal::serde::str")]
+    pub minimum_free_cash: Decimal,
+    pub target_position: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GateSettings {
     pub kind: String,
     #[serde(with = "rust_decimal::serde::str")]
@@ -16,6 +23,8 @@ pub struct GateSettings {
     pub failure_mode: String,
     #[serde(default = "default_gate_timeout_ms")]
     pub timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capital_inventory: Option<CapitalInventorySettings>,
 }
 
 fn default_gate_timeout_ms() -> u64 {
@@ -390,6 +399,28 @@ impl Config {
         }
         if self.gate.timeout_ms == 0 || self.gate.timeout_ms > 60_000 {
             bail!("gate timeout_ms must be within 1..=60000")
+        }
+        match (&*self.gate.kind, &self.gate.capital_inventory) {
+            ("resource_aware", Some(settings)) => {
+                if settings.minimum_free_cash < zero
+                    || settings.minimum_free_cash > self.initial_cash
+                    || settings.target_position < self.min_base_position
+                    || settings.target_position > self.max_position
+                    || settings.target_position > MAX_SHARE_QUANTITY
+                {
+                    bail!("invalid resource-aware cash reserve or target position")
+                }
+                if self.gate.failure_mode == "always_execute" {
+                    bail!("resource_aware gate cannot use an always_execute failure fallback")
+                }
+            }
+            ("resource_aware", None) => {
+                bail!("resource_aware gate requires capital_inventory settings")
+            }
+            (_, Some(_)) => {
+                bail!("capital_inventory settings require gate kind resource_aware")
+            }
+            (_, None) => {}
         }
         for bps in [
             self.paper.reject_probability_bps,

@@ -39,9 +39,8 @@ pub fn current_event_schema(event_type: EventType) -> i32 {
         | EventType::RightBalanceConsumed
         | EventType::RightBalanceRevoked
         | EventType::RightBalanceExpired => 2,
-        EventType::GridRightDeferred
-        | EventType::GridRightResidualHeld
-        | EventType::GateDecisionMade => 3,
+        EventType::GridRightDeferred | EventType::GridRightResidualHeld => 3,
+        EventType::GateDecisionMade => 4,
         EventType::GridRightBlocked | EventType::GridRightReserved => 4,
         EventType::OrderIntentCreated => 6,
         EventType::OrderPartiallyFilled | EventType::OrderFilled => 3,
@@ -366,7 +365,9 @@ impl StrategyState {
             || right.grid_price != intent.limit_price
             || right.reserved_quantity != intent.quantity
             || !right.decision_recorded
-            || if right.decision_contract_version >= crate::decision::DECISION_CONTRACT_VERSION {
+            || if right.decision_contract_version
+                >= crate::decision::WHOLE_UNIT_DECISION_CONTRACT_VERSION
+            {
                 right.decision_intent_quantity != intent.quantity
             } else {
                 right.decided_exercise_quantity != intent.quantity
@@ -530,8 +531,8 @@ impl StrategyState {
             | EventType::RightBalanceReleased
             | EventType::RightBalanceConsumed
             | EventType::RightBalanceRevoked
-            | EventType::RightBalanceExpired
-            | EventType::GateDecisionMade => matches!(event.schema_version, 1..=3),
+            | EventType::RightBalanceExpired => matches!(event.schema_version, 1..=3),
+            EventType::GateDecisionMade => matches!(event.schema_version, 1..=4),
             EventType::GridRightDeferred => matches!(event.schema_version, 1..=3),
             EventType::GridRightBlocked | EventType::GridRightReserved => {
                 matches!(event.schema_version, 1..=4)
@@ -1319,25 +1320,72 @@ impl StrategyState {
                         .get("remaining_decision_quantity")
                         .and_then(Value::as_i64)
                         .context("current disposition lacks remaining_decision_quantity")?;
+                    let (offered, pre_blocked, post_blocked) = if right.decision_contract_version
+                        >= crate::decision::DECISION_CONTRACT_VERSION
+                    {
+                        (
+                            event
+                                .payload
+                                .get("algorithm_offered_quantity")
+                                .and_then(Value::as_i64)
+                                .context("v4 disposition lacks algorithm_offered_quantity")?,
+                            event
+                                .payload
+                                .get("predecision_blocked_quantity")
+                                .and_then(Value::as_i64)
+                                .context("v4 disposition lacks predecision block")?,
+                            event
+                                .payload
+                                .get("postdecision_blocked_quantity")
+                                .and_then(Value::as_i64)
+                                .context("v4 disposition lacks postdecision block")?,
+                        )
+                    } else {
+                        (authorized, 0, blocked)
+                    };
                     let unit = self.audited_standard_quantity;
-                    if right.decision_contract_version < crate::decision::DECISION_CONTRACT_VERSION
+                    if right.decision_contract_version
+                        < crate::decision::WHOLE_UNIT_DECISION_CONTRACT_VERSION
                         || unit <= 0
                         || gross != right.decision_gross_available_quantity
                         || residual != right.decision_platform_residual_quantity
                         || authorized != right.decision_algorithm_authorized_quantity
-                        || gross != authorized + residual
+                        || authorized
+                            .checked_add(residual)
+                            .is_none_or(|quantity| gross != quantity)
+                        || offered
+                            .checked_add(pre_blocked)
+                            .is_none_or(|quantity| authorized != quantity)
+                        || right
+                            .decided_exercise_quantity
+                            .checked_add(right.decided_defer_quantity)
+                            .is_none_or(|quantity| offered != quantity)
+                        || intent
+                            .checked_add(post_blocked)
+                            .is_none_or(|quantity| right.decided_exercise_quantity != quantity)
+                        || pre_blocked
+                            .checked_add(post_blocked)
+                            .is_none_or(|quantity| blocked != quantity)
                         || residual < 0
                         || residual >= unit
+                        || offered < 0
+                        || pre_blocked < 0
+                        || post_blocked < 0
                         || blocked < 0
                         || intent < 0
                         || remaining < 0
-                        || intent != right.decided_exercise_quantity - blocked
-                        || remaining != right.decided_defer_quantity + blocked
+                        || right
+                            .decided_defer_quantity
+                            .checked_add(blocked)
+                            .is_none_or(|quantity| remaining != quantity)
                         || [
                             authorized,
+                            offered,
+                            pre_blocked,
                             right.decided_exercise_quantity,
                             right.decided_defer_quantity,
                             blocked,
+                            post_blocked,
                             intent,
                             remaining,
                         ]
@@ -1345,7 +1393,7 @@ impl StrategyState {
                         .any(|quantity| quantity % unit != 0)
                         || (next == GridRightStatus::Deferred
                             && (right.decided_exercise_quantity != 0
-                                || blocked != 0
+                                || post_blocked != 0
                                 || intent != 0))
                         || (next == GridRightStatus::Residual
                             && (authorized != 0
@@ -1356,7 +1404,7 @@ impl StrategyState {
                                 || intent != 0
                                 || remaining != 0))
                         || (next == GridRightStatus::Blocked
-                            && (intent != 0 || blocked != right.decided_exercise_quantity))
+                            && (intent != 0 || post_blocked != right.decided_exercise_quantity))
                         || (next == GridRightStatus::Reserved && intent <= 0)
                     {
                         return Err(anyhow!(
@@ -1364,6 +1412,9 @@ impl StrategyState {
                         ));
                     }
                     right.decision_platform_blocked_quantity = blocked;
+                    right.decision_algorithm_offered_quantity = offered;
+                    right.decision_pre_blocked_quantity = pre_blocked;
+                    right.decision_post_blocked_quantity = post_blocked;
                     right.decision_intent_quantity = intent;
                     right.decision_remaining_quantity = remaining;
                 }
@@ -2242,7 +2293,21 @@ impl StrategyState {
                         .cloned()
                         .context("gate decision is missing its response")?,
                 )?;
-                response.validate_for(&request)?;
+                let algorithm_succeeded =
+                    if request.contract_version >= crate::decision::DECISION_CONTRACT_VERSION {
+                        event
+                            .payload
+                            .get("algorithm_succeeded")
+                            .and_then(Value::as_bool)
+                            .context("v4 gate decision lacks exact algorithm success status")?
+                    } else {
+                        event
+                            .payload
+                            .get("algorithm_succeeded")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true)
+                    };
+                response.validate_for_algorithm_status(&request, algorithm_succeeded)?;
                 if request.context.standard_quantity != self.audited_standard_quantity
                     || request.context.lot_size != self.audited_lot_size
                 {
@@ -2257,26 +2322,34 @@ impl StrategyState {
                 }
                 let (exercise_quantity, defer_quantity) = response.outcome.quantities();
                 right.decision_contract_version = response.contract_version;
-                right.decision_gross_available_quantity =
+                right.decision_gross_available_quantity = if response.contract_version
+                    >= crate::decision::WHOLE_UNIT_DECISION_CONTRACT_VERSION
+                {
+                    request.context.gross_available_quantity
+                } else {
+                    request.context.available_quantity
+                };
+                right.decision_platform_residual_quantity = if response.contract_version
+                    >= crate::decision::WHOLE_UNIT_DECISION_CONTRACT_VERSION
+                {
+                    request.context.platform_residual_quantity
+                } else {
+                    0
+                };
+                right.decision_algorithm_authorized_quantity =
                     if response.contract_version >= crate::decision::DECISION_CONTRACT_VERSION {
-                        request.context.gross_available_quantity
+                        request.context.algorithm_authorized_quantity
                     } else {
                         request.context.available_quantity
                     };
-                right.decision_platform_residual_quantity =
-                    if response.contract_version >= crate::decision::DECISION_CONTRACT_VERSION {
-                        request.context.platform_residual_quantity
-                    } else {
-                        0
-                    };
-                right.decision_algorithm_authorized_quantity = request.context.available_quantity;
+                right.decision_algorithm_offered_quantity = request.context.available_quantity;
+                right.decision_pre_blocked_quantity = right
+                    .decision_algorithm_authorized_quantity
+                    .checked_sub(right.decision_algorithm_offered_quantity)
+                    .context("v4 pre-decision resource partition underflow")?;
                 right.decided_exercise_quantity = exercise_quantity;
                 right.decided_defer_quantity = defer_quantity;
-                right.decision_is_algorithm = event
-                    .payload
-                    .get("algorithm_succeeded")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true);
+                right.decision_is_algorithm = algorithm_succeeded;
                 right.decision_recorded = true;
             }
             EventType::DeferredBudgetAccrued if self.audited_standard_quantity > 0 => {

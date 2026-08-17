@@ -53,6 +53,59 @@ BUY 的现金批准与预留也必须使用同一份订单级累计费用函数�
 现行 Blocked/Reserved 处置使用 schema 4，OrderIntent 使用 schema 6；历史 schema 3 处置与
 schema 5 intent 必须按当时“双最低佣金”的事实只读重放，不能用新口径改写，也不能继续新写。
 
+Decision Contract v4 使用 `RESOURCE_AWARE_WHOLE_Q_V1`，把决策前已知的资金/库存不足与算法
+主动递延分开。令 `Q=standard_quantity`、`C=P+A`、`P=C mod Q`，并定义资源最多支持 `M`
+份，则：
+
+```text
+A = B0 + X                 X = min(A, M×Q)
+X = E + D                  E = I + B1
+R = D + B0 + B1            C = P + I + R
+```
+
+`B0` 是算法调用前已知的平台资源阻断，`B1` 是算法选择后重新审批产生的阻断；二者都不能
+伪装为算法 `Defer`。`A/X/B0/E/D/I/B1/R` 全部是 `Q` 的非负整数倍。页面空心标记只显示
+`D/Q`，`B0/B1`、T+1、底仓、冻结和不保本数量必须独立审计。
+
+市场条件只使用当前机会之前已经 `Processed` 的最近 20 根行情。少于 20 根时不得行权。
+固定参数为 `short_window=5`、`volatility_floor=0.005`、门槛 `0.60`，市场分数是规则分而非
+概率：
+
+```text
+depth = abs(grid_index) / trade_levels
+r5 = last_close / first_close_of_last_5 - 1
+VWAP20 = sum(close×volume) / sum(volume)       # 总量为0时退回close简单均值
+v20 = last_close / VWAP20 - 1
+scale = max((max(close20)-min(close20))/first_close20, 0.005)
+
+BUY:  trend=clamp(-r5/scale,0,1), location=clamp(-v20/scale,0,1)
+SELL: trend=clamp(+r5/scale,0,1), location=clamp(+v20/scale,0,1)
+m = 0.35×depth + 0.40×trend + 0.25×location
+passed = m>=0.60 and (trend>0 or location>0)
+```
+
+资金和库存绝不能进入 `m` 或单独触发 BUY，只能在市场门槛通过后降低速度。资源节奏固定为：
+
+```text
+rho = M/(M+4)
+g = 0.50 + 0.50×rho
+pace = min(0.50, m×g)
+e_units = min(X/Q, 2, max(1, floor((X/Q)×pace)))   # 仅在passed且X>0
+E = e_units×Q, D = X-E
+```
+
+因此单个机会最多行权 2 份，`X=Q` 且市场通过时恰好行权 1 份；资源再多也不能让失败的市场
+条件通过或一次用尽大量授权。`alpha` 仅作解释，必须同时记录整数 numerator/denominator，数量
+只能以 typed `E/D` 为真值。
+
+BUY 可买份数使用 `F=cash.available-cash.frozen`、不利价格、一次订单级累计佣金和仓位差值
+精确求最大整份。仓位差值必须以 `position_exposure=position.total+pending_buy_quantity`
+计算；所有未完成 BUY 的剩余数量均计入 exposure，target/max headroom 都不能因订单尚未成交而重复
+授权连续接盘。SELL 必须逐候选份数调用同一个 canonical no-loss planner，允许多个合格 lot
+（如 `700+800`）共同组成一份，不能假定费用线性。Decision v4 必须冻结完整资金/库存证据、
+20 根行情身份和特征、`A/X/B0`、`rho/g/pace`、整数目标及算法身份，Ledger 从同一已处理前缀
+独立重算。Decision v2/v3 保持原始 hash 和数量解释，只读重放，绝不能套用 v4 规则。
+
 ## 2. 账本的职责
 
 账本必须记录**每一次机械网格机会**，不以是否最终产生交易为条件。每次进入网格点都形成一个具有稳定 opportunity ID 的追加式日志链：

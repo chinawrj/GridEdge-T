@@ -734,9 +734,12 @@ fn complete_opportunity_history(client: &TestClient, run_id: &str, through: i64)
                     "gross_available_quantity",
                     "platform_residual_quantity",
                     "algorithm_authorized_quantity",
+                    "algorithm_offered_quantity",
+                    "predecision_blocked_quantity",
                     "exercise_quantity",
                     "defer_quantity",
                     "platform_blocked_quantity",
+                    "postdecision_blocked_quantity",
                     "order_intent_quantity",
                     "remaining_decision_quantity",
                 ]
@@ -745,13 +748,40 @@ fn complete_opportunity_history(client: &TestClient, run_id: &str, through: i64)
                         .as_i64()
                         .unwrap_or_else(|| panic!("granted opportunity lacks {field}"))
                 });
-                let [gross, residual, authorized, exercise, deferred, blocked, intent, remaining] =
+                let [gross, residual, authorized, offered, pre_blocked, exercise, deferred, blocked, post_blocked, intent, remaining] =
                     quantities;
-                assert_eq!(record["decision_contract_version"], 3);
+                let contract = record["decision_contract_version"].as_i64().unwrap();
+                assert!(matches!(contract, 3 | 4));
+                assert_eq!(
+                    record["semantics"],
+                    if contract == 4 {
+                        "CURRENT_V4"
+                    } else {
+                        "CURRENT_V3"
+                    }
+                );
                 assert_eq!(gross, residual + authorized);
-                assert_eq!(authorized, exercise + deferred);
-                assert_eq!(intent, exercise - blocked);
+                assert_eq!(authorized, pre_blocked + offered);
+                assert_eq!(offered, exercise + deferred);
+                assert_eq!(exercise, intent + post_blocked);
+                assert_eq!(blocked, pre_blocked + post_blocked);
                 assert_eq!(remaining, deferred + blocked);
+                for field in [
+                    "market_score",
+                    "market_signal_passed",
+                    "cash_affordable_units",
+                    "sellable_inventory_units",
+                    "resource_units",
+                    "target_units",
+                    "pending_buy_quantity",
+                    "position_exposure_quantity",
+                ] {
+                    assert_eq!(
+                        record[field].is_null(),
+                        contract == 3,
+                        "contract {contract} exposes the wrong {field} shape"
+                    );
+                }
                 assert!(record["right_id"].as_str().is_some());
                 assert!(record["decision_id"].as_str().is_some());
                 assert!(record["reason"].is_null());
@@ -800,11 +830,22 @@ fn complete_opportunity_history(client: &TestClient, run_id: &str, through: i64)
                     "gross_available_quantity",
                     "platform_residual_quantity",
                     "algorithm_authorized_quantity",
+                    "algorithm_offered_quantity",
+                    "predecision_blocked_quantity",
                     "exercise_quantity",
                     "defer_quantity",
                     "platform_blocked_quantity",
+                    "postdecision_blocked_quantity",
                     "order_intent_quantity",
                     "remaining_decision_quantity",
+                    "market_score",
+                    "market_signal_passed",
+                    "cash_affordable_units",
+                    "sellable_inventory_units",
+                    "resource_units",
+                    "target_units",
+                    "pending_buy_quantity",
+                    "position_exposure_quantity",
                 ] {
                     assert!(record[field].is_null(), "skip unexpectedly exposes {field}");
                 }
@@ -858,6 +899,26 @@ fn synthetic_intraday_csv(bar_count: usize) -> String {
             "2026-01-05 {hour:02}:{minute:02}:00,600000.SH,10.00,{high},{low},10.00,1000,10000\n"
         ));
     }
+    csv
+}
+
+fn resource_aware_warmup_csv() -> String {
+    let mut csv = String::from("timestamp,symbol,open,high,low,close,volume,amount\n");
+    let start =
+        chrono::NaiveDateTime::parse_from_str("2026-01-05 09:30:00", "%Y-%m-%d %H:%M:%S").unwrap();
+    let closes = [
+        "10", "10", "10", "10", "10", "10", "10", "10", "10", "10", "10", "10", "10", "10", "10",
+        "10", "9.96", "9.92", "9.86", "9.81",
+    ];
+    let mut previous = "10";
+    for (offset, close) in closes.into_iter().enumerate() {
+        csv.push_str(&format!(
+            "{},600000.SH,{previous},{previous},{close},{close},100000,1000000\n",
+            start + chrono::Duration::minutes(offset as i64),
+        ));
+        previous = close;
+    }
+    csv.push_str("2026-01-05 09:50:00,600000.SH,9.81,9.82,9.79,9.82,100000,982000\n");
     csv
 }
 
@@ -2441,6 +2502,75 @@ fn opportunity_api_preserves_full_t_plus_one_capacity_and_lot_sources() {
     assert!(capacity["source_right_ids"].is_array());
     assert!(capacity["tranche_ids"].is_array());
     assert_eq!(full_t1["partial_blocks"], json!([]));
+}
+
+#[test]
+fn opportunity_api_exposes_the_complete_resource_aware_v4_partition_and_evidence() {
+    let _serial = WEB_PROCESS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temporary = TempDir::new().unwrap();
+    let database = temporary.path().join("resource-v4-web.db");
+    let mut config = Config::load("configs/resource_aware.yaml").unwrap();
+    config.database = database.display().to_string();
+    let config_path = temporary.path().join("resource-v4.yaml");
+    fs::write(&config_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    let data = temporary.path().join("resource-v4.csv");
+    fs::write(&data, resource_aware_warmup_csv()).unwrap();
+
+    let mut server = ServerProcess::start(&config_path, &data);
+    let client = server.client.clone();
+    start_run_with_dataset(&client, "resource-v4-web", "resource-v4.csv");
+    let started = snapshot(&client, "resource-v4-web");
+    let finish = command_request(
+        "resource-v4-finish",
+        "finish",
+        "resource-v4-web",
+        started["sequence"].as_i64().unwrap(),
+        started["command_version"].as_i64().unwrap(),
+    );
+    assert_eq!(client.command(&finish).status, 200);
+    let terminal = snapshot(&client, "resource-v4-web");
+    assert_cursor(&terminal, 21);
+    let history = complete_opportunity_history(
+        &client,
+        "resource-v4-web",
+        terminal["sequence"].as_i64().unwrap(),
+    );
+    let opportunity = history["opportunities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["grid_index"] == -1 && record["resolution"] == "GRANTED")
+        .expect("resource-aware crossing was not exposed as a complete opportunity");
+    assert_eq!(opportunity["semantics"], "CURRENT_V4");
+    assert_eq!(opportunity["decision_contract_version"], 4);
+    assert_eq!(opportunity["gross_available_quantity"], 1500);
+    assert_eq!(opportunity["platform_residual_quantity"], 0);
+    assert_eq!(opportunity["algorithm_authorized_quantity"], 1500);
+    assert_eq!(opportunity["algorithm_offered_quantity"], 1500);
+    assert_eq!(opportunity["predecision_blocked_quantity"], 0);
+    assert_eq!(opportunity["exercise_quantity"], 1500);
+    assert_eq!(opportunity["defer_quantity"], 0);
+    assert_eq!(opportunity["platform_blocked_quantity"], 0);
+    assert_eq!(opportunity["postdecision_blocked_quantity"], 0);
+    assert_eq!(opportunity["order_intent_quantity"], 1500);
+    assert_eq!(opportunity["remaining_decision_quantity"], 0);
+    assert_eq!(opportunity["market_signal_passed"], true);
+    assert!(opportunity["market_score"]
+        .as_str()
+        .is_some_and(|score| !score.is_empty()));
+    assert!(opportunity["cash_affordable_units"]
+        .as_i64()
+        .is_some_and(|units| units >= 1));
+    assert_eq!(opportunity["sellable_inventory_units"], 3);
+    assert!(opportunity["resource_units"]
+        .as_i64()
+        .is_some_and(|units| units >= 1));
+    assert_eq!(opportunity["target_units"], 1);
+    assert_eq!(opportunity["pending_buy_quantity"], 0);
+    assert_eq!(opportunity["position_exposure_quantity"], 10000);
+    server.stop();
 }
 
 #[test]

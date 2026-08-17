@@ -1,9 +1,8 @@
 use crate::{
     config::Config,
     data::{CsvReplayFeed, MarketBar},
-    decision::{AlgorithmManifest, GateAlgorithmAdapter, GridRightStatus, QuantDecisionAlgorithm},
+    decision::{algorithm_from_config, AlgorithmManifest, GridRightStatus},
     domain::{GridLevelStatus, OrderStatus, ServiceMode, StrategyState},
-    gate,
     journal::{
         web_command_plan_sha256, EventReader, PendingWebCommand, SqliteStore, StateReader,
         WebCommandClaim, WebCommandReceipt, WebPlaybackControl,
@@ -589,11 +588,22 @@ struct ApiOpportunityRecord {
     gross_available_quantity: Option<i64>,
     platform_residual_quantity: Option<i64>,
     algorithm_authorized_quantity: Option<i64>,
+    algorithm_offered_quantity: Option<i64>,
+    predecision_blocked_quantity: Option<i64>,
     exercise_quantity: Option<i64>,
     defer_quantity: Option<i64>,
     platform_blocked_quantity: Option<i64>,
+    postdecision_blocked_quantity: Option<i64>,
     order_intent_quantity: Option<i64>,
     remaining_decision_quantity: Option<i64>,
+    market_score: Option<String>,
+    market_signal_passed: Option<bool>,
+    cash_affordable_units: Option<i64>,
+    sellable_inventory_units: Option<i64>,
+    resource_units: Option<i64>,
+    target_units: Option<i64>,
+    pending_buy_quantity: Option<i64>,
+    position_exposure_quantity: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1096,9 +1106,18 @@ async fn api_run_opportunities(
     if !store.run_ids()?.contains(&run_id) {
         return Err(WebError::not_found("run not found"));
     }
-    let standard_quantity = crate::run_context::RunContext::load(&store, &run_id)?
+    let run_context = crate::run_context::RunContext::load(&store, &run_id)?;
+    let standard_quantity = run_context
+        .as_ref()
         .map(|context| context.config.standard_quantity)
         .unwrap_or(config.standard_quantity);
+    let current_decision_contract = run_context.as_ref().map_or(3, |context| {
+        if context.config.gate.kind == "resource_aware" {
+            4
+        } else {
+            3
+        }
+    });
     let page = store
         .with_consistent_read(|store| {
             let latest = store.latest_sequence(&run_id)?;
@@ -1123,7 +1142,13 @@ async fn api_run_opportunities(
                 .map(|(touch, processed_sequence)| {
                     let events =
                         store.opportunity_events_for_touch(&run_id, &touch, processed_sequence)?;
-                    project_opportunity(touch, processed_sequence, events, standard_quantity)
+                    project_opportunity(
+                        touch,
+                        processed_sequence,
+                        events,
+                        standard_quantity,
+                        current_decision_contract,
+                    )
                 })
                 .collect::<Result<Vec<_>>>()?;
             let next_sequence = opportunities
@@ -1157,6 +1182,7 @@ fn project_opportunity(
     processed_sequence: i64,
     events: Vec<crate::event::EventEnvelope>,
     standard_quantity: i64,
+    current_decision_contract: i64,
 ) -> Result<ApiOpportunityRecord> {
     use crate::event::EventType;
 
@@ -1267,7 +1293,11 @@ fn project_opportunity(
             processed_sequence,
             resolution: "SKIPPED",
             semantics: if touch.schema_version == 2 && skip.schema_version == 2 {
-                "CURRENT_V3"
+                if current_decision_contract == 4 {
+                    "CURRENT_V4"
+                } else {
+                    "CURRENT_V3"
+                }
             } else {
                 "LEGACY_RECORDED"
             },
@@ -1286,11 +1316,22 @@ fn project_opportunity(
             gross_available_quantity: None,
             platform_residual_quantity: None,
             algorithm_authorized_quantity: None,
+            algorithm_offered_quantity: None,
+            predecision_blocked_quantity: None,
             exercise_quantity: None,
             defer_quantity: None,
             platform_blocked_quantity: None,
+            postdecision_blocked_quantity: None,
             order_intent_quantity: None,
             remaining_decision_quantity: None,
+            market_score: None,
+            market_signal_passed: None,
+            cash_affordable_units: None,
+            sellable_inventory_units: None,
+            resource_units: None,
+            target_units: None,
+            pending_buy_quantity: None,
+            position_exposure_quantity: None,
         });
     }
     if grants.len() != 1 {
@@ -1321,7 +1362,7 @@ fn project_opportunity(
         bail!("decision does not belong to the granted right")
     }
     let contract_version = json_i64(&decision.payload, &["response", "contract_version"])?;
-    if !matches!(contract_version, 1..=3) {
+    if !matches!(contract_version, 1..=4) {
         bail!("opportunity decision uses an unsupported future contract")
     }
     let decision_direction = json_string(&decision.payload, &["request", "context", "direction"])?;
@@ -1426,29 +1467,62 @@ fn project_opportunity(
     let terminal_gross = json_i64(&terminal.payload, &["gross_available_quantity"])?;
     let terminal_residual = json_i64(&terminal.payload, &["platform_residual_quantity"])?;
     let terminal_authorized = json_i64(&terminal.payload, &["algorithm_authorized_quantity"])?;
+    let (offered, pre_blocked, post_blocked) = if contract_version == 4 {
+        (
+            json_i64(&terminal.payload, &["algorithm_offered_quantity"])?,
+            json_i64(&terminal.payload, &["predecision_blocked_quantity"])?,
+            json_i64(&terminal.payload, &["postdecision_blocked_quantity"])?,
+        )
+    } else {
+        (
+            authorized,
+            0,
+            json_i64(&terminal.payload, &["platform_blocked_quantity"])?,
+        )
+    };
     let blocked = json_i64(&terminal.payload, &["platform_blocked_quantity"])?;
     let intent_quantity = json_i64(&terminal.payload, &["order_intent_quantity"])?;
     let remaining = json_i64(&terminal.payload, &["remaining_decision_quantity"])?;
     if (gross, residual, authorized) != (terminal_gross, terminal_residual, terminal_authorized)
-        || gross != residual + authorized
-        || authorized != exercise + deferred
-        || intent_quantity != exercise - blocked
-        || remaining != deferred + blocked
+        || residual
+            .checked_add(authorized)
+            .is_none_or(|value| gross != value)
+        || pre_blocked
+            .checked_add(offered)
+            .is_none_or(|value| authorized != value)
+        || exercise
+            .checked_add(deferred)
+            .is_none_or(|value| offered != value)
+        || intent_quantity
+            .checked_add(post_blocked)
+            .is_none_or(|value| exercise != value)
+        || pre_blocked
+            .checked_add(post_blocked)
+            .is_none_or(|value| blocked != value)
+        || deferred
+            .checked_add(blocked)
+            .is_none_or(|value| remaining != value)
         || gross < 0
         || residual < 0
         || authorized < 0
+        || offered < 0
+        || pre_blocked < 0
         || exercise < 0
         || deferred < 0
         || blocked < 0
+        || post_blocked < 0
         || intent_quantity < 0
         || remaining < 0
-        || blocked > exercise
+        || post_blocked > exercise
         || residual >= standard_quantity
         || [
             authorized,
+            offered,
+            pre_blocked,
             exercise,
             deferred,
             blocked,
+            post_blocked,
             intent_quantity,
             remaining,
         ]
@@ -1475,9 +1549,11 @@ fn project_opportunity(
             bail!("opportunity order intent is not bound to its decision")
         }
     }
+    let expected_decision_schema = 4;
     let current_semantics = touch.schema_version == 2
         && grant.schema_version == 2
-        && decision.schema_version == 3
+        && decision.schema_version == expected_decision_schema
+        && contract_version == current_decision_contract
         && terminal.schema_version == crate::event::current_event_schema(terminal.event_type)
         && intents.iter().all(|intent| {
             intent.schema_version == crate::event::current_event_schema(intent.event_type)
@@ -1495,7 +1571,11 @@ fn project_opportunity(
         processed_sequence,
         resolution: "GRANTED",
         semantics: if current_semantics {
-            "CURRENT_V3"
+            if contract_version == 4 {
+                "CURRENT_V4"
+            } else {
+                "CURRENT_V3"
+            }
         } else {
             "LEGACY_RECORDED"
         },
@@ -1514,11 +1594,103 @@ fn project_opportunity(
         gross_available_quantity: Some(gross),
         platform_residual_quantity: Some(residual),
         algorithm_authorized_quantity: Some(authorized),
+        algorithm_offered_quantity: Some(offered),
+        predecision_blocked_quantity: Some(pre_blocked),
         exercise_quantity: Some(exercise),
         defer_quantity: Some(deferred),
         platform_blocked_quantity: Some(blocked),
+        postdecision_blocked_quantity: Some(post_blocked),
         order_intent_quantity: Some(intent_quantity),
         remaining_decision_quantity: Some(remaining),
+        market_score: if contract_version == 4 {
+            Some(json_string(
+                &decision.payload,
+                &["request", "context", "funds_inventory", "market_score"],
+            )?)
+        } else {
+            None
+        },
+        market_signal_passed: if contract_version == 4 {
+            Some(json_bool(
+                &decision.payload,
+                &[
+                    "request",
+                    "context",
+                    "funds_inventory",
+                    "market_signal_passed",
+                ],
+            )?)
+        } else {
+            None
+        },
+        cash_affordable_units: if contract_version == 4 {
+            Some(json_i64(
+                &decision.payload,
+                &[
+                    "request",
+                    "context",
+                    "funds_inventory",
+                    "cash_affordable_units",
+                ],
+            )?)
+        } else {
+            None
+        },
+        sellable_inventory_units: if contract_version == 4 {
+            Some(json_i64(
+                &decision.payload,
+                &[
+                    "request",
+                    "context",
+                    "funds_inventory",
+                    "sellable_inventory_units",
+                ],
+            )?)
+        } else {
+            None
+        },
+        resource_units: if contract_version == 4 {
+            Some(json_i64(
+                &decision.payload,
+                &["request", "context", "funds_inventory", "resource_units"],
+            )?)
+        } else {
+            None
+        },
+        target_units: if contract_version == 4 {
+            Some(json_i64(
+                &decision.payload,
+                &["request", "context", "funds_inventory", "target_units"],
+            )?)
+        } else {
+            None
+        },
+        pending_buy_quantity: if contract_version == 4 {
+            Some(json_i64(
+                &decision.payload,
+                &[
+                    "request",
+                    "context",
+                    "funds_inventory",
+                    "pending_buy_quantity",
+                ],
+            )?)
+        } else {
+            None
+        },
+        position_exposure_quantity: if contract_version == 4 {
+            Some(json_i64(
+                &decision.payload,
+                &[
+                    "request",
+                    "context",
+                    "funds_inventory",
+                    "position_exposure_quantity",
+                ],
+            )?)
+        } else {
+            None
+        },
     })
 }
 
@@ -1565,11 +1737,22 @@ fn project_legacy_unbound_opportunity(
         gross_available_quantity: None,
         platform_residual_quantity: None,
         algorithm_authorized_quantity: None,
+        algorithm_offered_quantity: None,
+        predecision_blocked_quantity: None,
         exercise_quantity: None,
         defer_quantity: None,
         platform_blocked_quantity: None,
+        postdecision_blocked_quantity: None,
         order_intent_quantity: None,
         remaining_decision_quantity: None,
+        market_score: None,
+        market_signal_passed: None,
+        cash_affordable_units: None,
+        sellable_inventory_units: None,
+        resource_units: None,
+        target_units: None,
+        pending_buy_quantity: None,
+        position_exposure_quantity: None,
     }
 }
 
@@ -1664,6 +1847,8 @@ fn project_legacy_granted_opportunity(
         gross_available_quantity: None,
         platform_residual_quantity: None,
         algorithm_authorized_quantity: None,
+        algorithm_offered_quantity: None,
+        predecision_blocked_quantity: None,
         exercise_quantity: json_optional_i64(
             &decision.payload,
             &["response", "outcome", "exercise_quantity"],
@@ -1673,8 +1858,17 @@ fn project_legacy_granted_opportunity(
             &["response", "outcome", "defer_quantity"],
         )?,
         platform_blocked_quantity: None,
+        postdecision_blocked_quantity: None,
         order_intent_quantity: intent_quantity,
         remaining_decision_quantity: None,
+        market_score: None,
+        market_signal_passed: None,
+        cash_affordable_units: None,
+        sellable_inventory_units: None,
+        resource_units: None,
+        target_units: None,
+        pending_buy_quantity: None,
+        position_exposure_quantity: None,
     })
 }
 
@@ -1805,6 +1999,18 @@ fn json_i64(value: &serde_json::Value, path: &[&str]) -> Result<i64> {
     json_at(value, path)?
         .as_i64()
         .ok_or_else(|| anyhow::anyhow!("opportunity quantity is not an integer"))
+}
+
+fn json_bool(value: &serde_json::Value, path: &[&str]) -> Result<bool> {
+    let mut current = value;
+    for key in path {
+        current = current
+            .get(*key)
+            .with_context(|| format!("missing JSON field {}", path.join(".")))?;
+    }
+    current
+        .as_bool()
+        .with_context(|| format!("JSON field {} is not a boolean", path.join(".")))
 }
 
 fn json_optional_i64(value: &serde_json::Value, path: &[&str]) -> Result<Option<i64>> {
@@ -2494,7 +2700,7 @@ fn algorithm_manifest_sha256(manifest: &AlgorithmManifest) -> Result<String, Web
 
 fn current_command_runtime_identity(app: &WebState) -> Result<(String, String), WebError> {
     let config_sha256 = app.config.content_sha256()?;
-    let algorithm = GateAlgorithmAdapter::new(gate::from_config(&app.config)?);
+    let algorithm = algorithm_from_config(&app.config)?;
     let algorithm_sha256 = algorithm_manifest_sha256(&algorithm.manifest())?;
     Ok((config_sha256, algorithm_sha256))
 }
@@ -3267,8 +3473,14 @@ fn step_start_sync(
         first_timestamp,
         last_timestamp,
     };
-    let policy = gate::from_config(&config)?;
-    GridAutomationService::start_new_replay(config, store, policy, Some(run_id), &descriptor)?;
+    let algorithm = algorithm_from_config(&config)?;
+    GridAutomationService::start_new_replay_with_algorithm(
+        config,
+        store,
+        algorithm,
+        Some(run_id),
+        &descriptor,
+    )?;
     Ok(())
 }
 
@@ -3293,8 +3505,9 @@ fn step_once_sync(
         .get(processed)
         .cloned()
         .context("replay cursor exceeds dataset")?;
-    let policy = gate::from_config(&config)?;
-    let mut service = GridAutomationService::recover(config, store, policy, run_id)?;
+    let algorithm = algorithm_from_config(&config)?;
+    let mut service =
+        GridAutomationService::recover_with_algorithm(config, store, algorithm, run_id)?;
     service.on_bar(&bar)?;
     let complete = processed + 1 == descriptor.total_bars;
     if complete {
@@ -3324,8 +3537,9 @@ fn step_finish_sync(
     if finish_terminal_evidence(&store, &run_id, descriptor.total_bars)? {
         return Ok(());
     }
-    let policy = gate::from_config(&config)?;
-    let mut service = GridAutomationService::recover(config, store, policy, run_id)?;
+    let algorithm = algorithm_from_config(&config)?;
+    let mut service =
+        GridAutomationService::recover_with_algorithm(config, store, algorithm, run_id)?;
     for bar in &dataset.bars[processed..] {
         if let Some(database) = database {
             database.probe_identity()?;
@@ -3364,8 +3578,9 @@ fn step_play_sync(
         return Ok(PlaybackResult::Paused);
     }
 
-    let policy = gate::from_config(&config)?;
-    let mut service = GridAutomationService::recover(config, store, policy, run_id)?;
+    let algorithm = algorithm_from_config(&config)?;
+    let mut service =
+        GridAutomationService::recover_with_algorithm(config, store, algorithm, run_id)?;
     let control_store = if let Some(database) = database {
         database.open_store()?
     } else {
@@ -3524,8 +3739,9 @@ fn reconcile_sync(
     database: Option<&WebDatabaseGuard>,
 ) -> Result<bool> {
     let store = open_runtime_or_test_store(&config, database)?;
-    let policy = gate::from_config(&config)?;
-    let mut service = GridAutomationService::recover(config, store, policy, run_id)?;
+    let algorithm = algorithm_from_config(&config)?;
+    let mut service =
+        GridAutomationService::recover_with_algorithm(config, store, algorithm, run_id)?;
     Ok(service.reconcile()?.matched)
 }
 
@@ -3536,8 +3752,9 @@ fn resume_sync(
     database: Option<&WebDatabaseGuard>,
 ) -> Result<()> {
     let store = open_runtime_or_test_store(&config, database)?;
-    let policy = gate::from_config(&config)?;
-    let mut service = GridAutomationService::recover(config, store, policy, run_id)?;
+    let algorithm = algorithm_from_config(&config)?;
+    let mut service =
+        GridAutomationService::recover_with_algorithm(config, store, algorithm, run_id)?;
     service.resume_after_reconciliation(&reason)
 }
 

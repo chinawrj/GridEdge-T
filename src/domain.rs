@@ -630,33 +630,62 @@ impl StrategyState {
             } else {
                 right.capacity.eligible_quantity
             };
-            if right.decision_contract_version >= crate::decision::DECISION_CONTRACT_VERSION {
+            if right.decision_contract_version
+                >= crate::decision::WHOLE_UNIT_DECISION_CONTRACT_VERSION
+            {
                 let unit = self.audited_standard_quantity;
                 let residual = authorization % unit;
                 let authorized = authorization - residual;
+                let (offered, pre_blocked, post_blocked) = if right.decision_contract_version
+                    >= crate::decision::DECISION_CONTRACT_VERSION
+                {
+                    (
+                        right.decision_algorithm_offered_quantity,
+                        right.decision_pre_blocked_quantity,
+                        right.decision_post_blocked_quantity,
+                    )
+                } else {
+                    (
+                        right.decision_algorithm_authorized_quantity,
+                        0,
+                        right.decision_platform_blocked_quantity,
+                    )
+                };
                 if right.decision_gross_available_quantity != authorization
                     || right.decision_platform_residual_quantity != residual
                     || right.decision_algorithm_authorized_quantity != authorized
+                    || offered < 0
+                    || pre_blocked < 0
+                    || post_blocked < 0
+                    || offered
+                        .checked_add(pre_blocked)
+                        .is_none_or(|quantity| quantity != authorized)
                     || right.decided_exercise_quantity < 0
                     || right.decided_defer_quantity < 0
                     || right
                         .decided_exercise_quantity
                         .checked_add(right.decided_defer_quantity)
-                        .is_none_or(|quantity| quantity != authorized)
+                        .is_none_or(|quantity| quantity != offered)
                     || right.decided_exercise_quantity % unit != 0
                     || right.decided_defer_quantity % unit != 0
                     || right.decision_platform_blocked_quantity < 0
                     || right.decision_intent_quantity < 0
                     || right.decision_remaining_quantity < 0
                     || right
-                        .decided_exercise_quantity
-                        .checked_sub(right.decision_platform_blocked_quantity)
-                        .is_none_or(|quantity| right.decision_intent_quantity != quantity)
+                        .decision_intent_quantity
+                        .checked_add(post_blocked)
+                        .is_none_or(|quantity| right.decided_exercise_quantity != quantity)
+                    || pre_blocked
+                        .checked_add(post_blocked)
+                        .is_none_or(|quantity| right.decision_platform_blocked_quantity != quantity)
                     || right
                         .decided_defer_quantity
                         .checked_add(right.decision_platform_blocked_quantity)
                         .is_none_or(|quantity| right.decision_remaining_quantity != quantity)
                     || right.decision_platform_blocked_quantity % unit != 0
+                    || offered % unit != 0
+                    || pre_blocked % unit != 0
+                    || post_blocked % unit != 0
                     || right.decision_intent_quantity % unit != 0
                     || right.decision_remaining_quantity % unit != 0
                 {

@@ -4,8 +4,8 @@ use clap::{Parser, Subcommand};
 use gridedge_t::{
     config::Config,
     data::CsvReplayFeed,
+    decision::algorithm_from_config,
     domain::StrategyState,
-    gate,
     grid::GridSpec,
     journal::{EventReader, SqliteStore, StateReader},
     market_data::{
@@ -332,10 +332,10 @@ async fn run() -> Result<()> {
             let mut store = SqliteStore::open(&config.database)?;
             store.migrate()?;
             let run_id = resolve_run_id(&store, args.run_id)?;
-            let mut service = GridAutomationService::recover(
+            let mut service = GridAutomationService::recover_with_algorithm(
                 config.clone(),
                 store,
-                gate::from_config(&config)?,
+                algorithm_from_config(&config)?,
                 run_id,
             )?;
             let result = service.reconcile()?;
@@ -358,10 +358,10 @@ async fn run() -> Result<()> {
             let mut store = SqliteStore::open(&config.database)?;
             store.migrate()?;
             let run_id = resolve_run_id(&store, run_id)?;
-            let mut service = GridAutomationService::recover(
+            let mut service = GridAutomationService::recover_with_algorithm(
                 config.clone(),
                 store,
-                gate::from_config(&config)?,
+                algorithm_from_config(&config)?,
                 run_id.clone(),
             )?;
             service.resume_after_reconciliation(&reason)?;
@@ -475,11 +475,22 @@ fn replay(
             bail!("replay dataset changed; refusing unsafe continuation")
         }
     }
-    let gate = gate::from_config(&config)?;
     let mut service = if exists {
-        GridAutomationService::recover(config.clone(), store, gate, run_id.expect("checked"))?
+        GridAutomationService::recover_with_algorithm(
+            config.clone(),
+            store,
+            algorithm_from_config(&config)?,
+            run_id.expect("checked"),
+        )?
     } else {
-        GridAutomationService::start_new_replay(config, store, gate, run_id, &descriptor)?
+        let algorithm = algorithm_from_config(&config)?;
+        GridAutomationService::start_new_replay_with_algorithm(
+            config,
+            store,
+            algorithm,
+            run_id,
+            &descriptor,
+        )?
     };
     service.run_feed(&mut feed)?;
     service.stop()?;

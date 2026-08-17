@@ -1306,6 +1306,43 @@ impl SqliteStore {
         Ok(payloads)
     }
 
+    pub fn recent_processed_market_bars(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, String, crate::data::MarketBar)>> {
+        let limit = i64::try_from(limit).context("market history limit is out of range")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT processed.sequence_number, processed.event_id, received.payload
+             FROM events AS processed
+             JOIN events AS received
+               ON received.run_id = processed.run_id
+              AND received.correlation_id = processed.correlation_id
+              AND received.event_type = 'MARKET_DATA_RECEIVED'
+             WHERE processed.run_id=?1
+               AND processed.event_type='MARKET_BAR_PROCESSED'
+             ORDER BY processed.sequence_number DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![run_id, limit], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut bars = rows
+            .map(|row| {
+                let (sequence, event_id, payload) = row?;
+                let bar = serde_json::from_str(&payload)
+                    .context("invalid received market payload JSON")?;
+                Ok((sequence, event_id, bar))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        bars.reverse();
+        Ok(bars)
+    }
+
     pub(crate) fn has_grid_touch(
         &self,
         run_id: &str,

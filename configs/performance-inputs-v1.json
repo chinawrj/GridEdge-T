@@ -6,7 +6,7 @@
       "iterations": 3,
       "source_config_sha256": "268340b73416db5984aa656430b15cf054884e2ae92338c698999a6ff0d94c26",
       "canonical_config_sha256": "6f5d8e72ba49540aea45a2527adf49fdc42a61e2aae116fa96b2d2b30a825d71",
-      "data_sha256": "6863f6b4187ce2d9bce3e427785bd923d056f6bfa9659f3687aef98349c6bfdf",
+      "data_sha256": "0daa2cf5b5b170125318e526c53b8af246b5f67bda4a301b7910c833e65af97b",
       "dataset_bars": 21,
       "symbol": "600000.SH",
       "first_timestamp": "2026-01-05T09:30:00",

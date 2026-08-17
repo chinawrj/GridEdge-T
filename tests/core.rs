@@ -5,6 +5,7 @@ use gridedge_t::{
     decision::{
         whole_unit_partition, DecisionRequest, DecisionResponse, GridRight, GridRightCapacity,
         GridRightStatus, ProcessAlgorithm, QuantDecisionAlgorithm, RightDecision, RightTranche,
+        WHOLE_UNIT_DECISION_CONTRACT_VERSION,
     },
     domain::{
         AccountSnapshot, Direction, Fill, LotQuantityAllocation, Order, OrderIntent, OrderStatus,
@@ -13,8 +14,8 @@ use gridedge_t::{
     event::{current_event_schema, EventEnvelope, EventType},
     execution::{ExecutionGateway, ExecutionReport, PaperExecutionGateway},
     gate::{
-        context_hash, legacy_v2_context_hash, FixedGate, GateContext, GateDecision, GatePolicy,
-        SimpleRuleGate,
+        context_hash, context_hash_v4, legacy_v2_context_hash, FixedGate, GateContext,
+        GateDecision, GatePolicy, SimpleRuleGate,
     },
     grid::{available_deferred_budget, board_lot_quantity, crossed_levels, GridSpec},
     journal::{AppendOutcome, EventReader, SqliteStore, StateReader},
@@ -764,6 +765,8 @@ impl QuantDecisionAlgorithm for CatalogAlgorithm {
         let decision = GateDecision {
             probability: alpha,
             alpha,
+            alpha_numerator: None,
+            alpha_denominator: None,
             action: if exercise_quantity == 0 {
                 "SKIP"
             } else {
@@ -2492,6 +2495,7 @@ fn typed_decision_event(
         volatility: Decimal::ZERO,
         market_regime: "TEST".into(),
         cycle_id: right.cycle_id.clone(),
+        funds_inventory: None,
     };
     let request = DecisionRequest::new(right.clone(), context.clone());
     let defer_quantity = available_quantity - exercise_quantity;
@@ -2514,6 +2518,8 @@ fn typed_decision_event(
         } else {
             Decimal::ZERO
         },
+        alpha_numerator: None,
+        alpha_denominator: None,
         action: if exercise_quantity > 0 {
             "EXECUTE".into()
         } else {
@@ -3472,6 +3478,8 @@ impl GatePolicy for MixedDayGate {
         Ok(GateDecision {
             probability: alpha,
             alpha,
+            alpha_numerator: None,
+            alpha_denominator: None,
             action: if alpha.is_zero() { "SKIP" } else { "EXECUTE" }.into(),
             reason_codes: vec!["MIXED_DAY_TEST".into()],
             model_name: "mixed-day-test".into(),
@@ -3494,6 +3502,8 @@ impl GatePolicy for DirectionalGate {
         Ok(GateDecision {
             probability: alpha,
             alpha,
+            alpha_numerator: None,
+            alpha_denominator: None,
             action: "EXECUTE".into(),
             reason_codes: vec!["DIRECTIONAL_TEST".into()],
             model_name: "directional-test".into(),
@@ -3514,6 +3524,8 @@ impl GatePolicy for SequenceGate {
         Ok(GateDecision {
             probability: alpha,
             alpha,
+            alpha_numerator: None,
+            alpha_denominator: None,
             action: if alpha.is_zero() {
                 "SKIP".into()
             } else {
@@ -4077,6 +4089,7 @@ fn gate_context() -> GateContext {
         volatility: d("0.03"),
         market_regime: "DOWN".into(),
         cycle_id: "cycle".into(),
+        funds_inventory: None,
     }
 }
 
@@ -4118,7 +4131,7 @@ fn quantity_decision_request(
     );
     let (authorized, residual) =
         whole_unit_partition(gross_available_quantity, standard_quantity).unwrap();
-    DecisionRequest::new(
+    DecisionRequest::new_with_contract(
         right.clone(),
         GateContext {
             right_id: right.right_id,
@@ -4145,7 +4158,9 @@ fn quantity_decision_request(
             volatility: Decimal::ZERO,
             market_regime: "TEST".into(),
             cycle_id: "cycle".into(),
+            funds_inventory: None,
         },
+        WHOLE_UNIT_DECISION_CONTRACT_VERSION,
     )
 }
 
@@ -4175,6 +4190,8 @@ fn quantity_decision_response(
         decision: GateDecision {
             probability: alpha,
             alpha,
+            alpha_numerator: None,
+            alpha_denominator: None,
             action: if exercise_quantity > 0 {
                 "EXECUTE"
             } else {
@@ -4906,6 +4923,8 @@ impl GatePolicy for DeepSellHalfGate {
         Ok(GateDecision {
             probability: alpha,
             alpha,
+            alpha_numerator: None,
+            alpha_denominator: None,
             action: if alpha.is_zero() { "SKIP" } else { "EXECUTE" }.into(),
             reason_codes: vec!["DEEP_SELL_HALF_TEST".into()],
             model_name: "deep-sell-half-test".into(),
@@ -5317,6 +5336,8 @@ fn gate_fraction_is_discretized_by_standard_quantity_not_lot_size() {
     let half = GateDecision {
         probability: d("0.5"),
         alpha: d("0.5"),
+        alpha_numerator: None,
+        alpha_denominator: None,
         action: "EXECUTE".into(),
         reason_codes: vec!["HALF".into()],
         model_name: "test".into(),
@@ -5449,6 +5470,8 @@ impl GatePolicy for FailOnceGate {
         Ok(GateDecision {
             probability: Decimal::ONE,
             alpha: Decimal::ONE,
+            alpha_numerator: None,
+            alpha_denominator: None,
             action: "EXECUTE".into(),
             reason_codes: vec!["SECOND_CALL_WOULD_EXECUTE".into()],
             model_name: "fail-once-test".into(),
@@ -5809,6 +5832,8 @@ impl GatePolicy for SellCarryGate {
         Ok(GateDecision {
             probability: alpha,
             alpha,
+            alpha_numerator: None,
+            alpha_denominator: None,
             action: if alpha.is_zero() {
                 "SKIP".into()
             } else {
@@ -6655,6 +6680,8 @@ impl GatePolicy for InvalidGate {
         Ok(GateDecision {
             probability: Decimal::ONE,
             alpha: Decimal::MAX,
+            alpha_numerator: None,
+            alpha_denominator: None,
             action: "EXECUTE".into(),
             reason_codes: vec!["INVALID".into()],
             model_name: "invalid-test".into(),
@@ -6682,6 +6709,8 @@ impl QuantDecisionAlgorithm for FractionalUnitAlgorithm {
             decision: GateDecision {
                 probability: Decimal::ONE,
                 alpha: Decimal::ONE,
+                alpha_numerator: None,
+                alpha_denominator: None,
                 action: "EXECUTE".into(),
                 reason_codes: vec!["FRACTIONAL_UNIT_ATTACK".into()],
                 model_name: "fractional-unit-test".into(),
@@ -7036,6 +7065,8 @@ impl GatePolicy for SlowGate {
         Ok(GateDecision {
             probability: Decimal::ONE,
             alpha: Decimal::ONE,
+            alpha_numerator: None,
+            alpha_denominator: None,
             action: "EXECUTE".into(),
             reason_codes: vec!["TOO_LATE".into()],
             model_name: "slow-test".into(),
@@ -7881,6 +7912,8 @@ fn legacy_v2_fractional_decision_rebuilds_deterministically_but_cannot_be_newly_
         decision: GateDecision {
             probability: d("0.4"),
             alpha: d("0.4"),
+            alpha_numerator: None,
+            alpha_denominator: None,
             action: "EXECUTE".into(),
             reason_codes: vec!["LEGACY_V2_GOLDEN".into()],
             model_name: "legacy-v2".into(),
@@ -8455,9 +8488,10 @@ fn ledger_atomically_rejects_forged_current_quantity_partitions_and_fractional_i
         .store
         .load_after("quantity-partition-source", before_sequence)
         .unwrap();
-    assert!(canonical
-        .iter()
-        .any(|event| event.event_type == EventType::GateDecisionMade && event.schema_version == 3));
+    assert!(canonical.iter().any(|event| {
+        event.event_type == EventType::GateDecisionMade
+            && event.schema_version == current_event_schema(EventType::GateDecisionMade)
+    }));
     assert!(canonical.iter().any(|event| {
         event.event_type == EventType::GridRightReserved
             && event.schema_version == current_event_schema(EventType::GridRightReserved)
@@ -8476,8 +8510,17 @@ fn ledger_atomically_rejects_forged_current_quantity_partitions_and_fractional_i
             mutate(&mut event.payload["request"]["context"]);
             let context: GateContext =
                 serde_json::from_value(event.payload["request"]["context"].clone()).unwrap();
+            let contract_version = event.payload["request"]["contract_version"]
+                .as_i64()
+                .unwrap();
             event.payload["response"]["decision"]["input_snapshot_hash"] =
-                json!(context_hash(&context).unwrap());
+                json!(if contract_version
+                    == i64::from(gridedge_t::decision::DECISION_CONTRACT_VERSION)
+                {
+                    context_hash_v4(&context).unwrap()
+                } else {
+                    context_hash(&context).unwrap()
+                });
         };
 
     let mut attacks: Vec<(&str, Vec<EventEnvelope>)> = Vec::new();
@@ -8596,6 +8639,167 @@ fn ledger_atomically_rejects_forged_current_quantity_partitions_and_fractional_i
             before,
             "forged batch {name} changed the projection"
         );
+    }
+}
+
+#[test]
+fn ledger_recomputes_resource_aware_market_cash_and_pending_buy_evidence_from_prefix() {
+    let source_temp = TempDir::new().unwrap();
+    let mut config = Config::load("configs/resource_aware.yaml").unwrap();
+    config.database = source_temp
+        .path()
+        .join("resource-evidence-source.db")
+        .display()
+        .to_string();
+    let run_id = "resource-evidence-source";
+    let mut service = GridAutomationService::start_new_with_algorithm(
+        config.clone(),
+        SqliteStore::open(&config.database).unwrap(),
+        gridedge_t::decision::algorithm_from_config(&config).unwrap(),
+        Some(run_id.into()),
+    )
+    .unwrap();
+    let start = dt("2026-01-05 09:30:00");
+    let closes = [
+        "10", "10", "10", "10", "10", "10", "10", "10", "10", "10", "10", "10", "10", "10", "10",
+        "10", "9.96", "9.92", "9.86", "9.81",
+    ];
+    let mut previous = d("10");
+    for (offset, close) in closes.into_iter().enumerate() {
+        let close = d(close);
+        service
+            .on_bar(&MarketBar {
+                timestamp: start + chrono::Duration::minutes(offset as i64),
+                symbol: config.symbol.clone(),
+                open: previous,
+                high: previous.max(close),
+                low: previous.min(close),
+                close,
+                volume: 100_000,
+                amount: None,
+            })
+            .unwrap();
+        previous = close;
+    }
+    let before_state = service.state.clone();
+    let before_sequence = service
+        .store
+        .load_after(run_id, 0)
+        .unwrap()
+        .last()
+        .unwrap()
+        .sequence_number;
+    let prefix_database = source_temp.path().join("resource-prefix.db");
+    copy_sqlite_database(std::path::Path::new(&config.database), &prefix_database);
+
+    service.inject_fault_once(WorkflowFaultPoint::IntentCommitted);
+    assert!(service
+        .on_bar(&MarketBar {
+            timestamp: start + chrono::Duration::minutes(20),
+            symbol: config.symbol.clone(),
+            open: d("9.81"),
+            high: d("9.82"),
+            low: d("9.79"),
+            close: d("9.82"),
+            volume: 100_000,
+            amount: None,
+        })
+        .is_err());
+    let canonical = service.store.load_after(run_id, before_sequence).unwrap();
+    let canonical_decision = canonical
+        .iter()
+        .find(|event| event.event_type == EventType::GateDecisionMade)
+        .unwrap();
+    assert_eq!(canonical_decision.schema_version, 4);
+    assert_eq!(canonical_decision.payload["request"]["contract_version"], 4);
+
+    let accepted_database = source_temp.path().join("resource-canonical.db");
+    copy_sqlite_database(&prefix_database, &accepted_database);
+    assert_canonical_batch_is_accepted_from(&before_state, &canonical, &accepted_database);
+
+    let mut forged_alpha = canonical.clone();
+    let decision = forged_alpha
+        .iter_mut()
+        .find(|event| event.event_type == EventType::GateDecisionMade)
+        .unwrap();
+    decision.payload["response"]["decision"]["alpha_numerator"] = json!(0);
+    decision.payload["response"]["decision"]["alpha"] = json!("0");
+    let alpha_attack_database = source_temp.path().join("resource-alpha-ratio.db");
+    copy_sqlite_database(&prefix_database, &alpha_attack_database);
+    assert_forged_batch_is_atomically_rejected_from(
+        &before_state,
+        forged_alpha,
+        &alpha_attack_database,
+    );
+
+    let mut attacks = Vec::new();
+    let mut forged_bars = canonical.clone();
+    let decision = forged_bars
+        .iter_mut()
+        .find(|event| event.event_type == EventType::GateDecisionMade)
+        .unwrap();
+    decision.payload["request"]["context"]["funds_inventory"]["feature_bar_ids"][0] =
+        json!("forged-processed-bar");
+    decision.payload["request"]["context"]["funds_inventory"]["feature_bars_sha256"] =
+        json!("ab".repeat(32));
+    attacks.push(("processed-market-prefix", forged_bars));
+
+    let mut forged_cash = canonical.clone();
+    let decision = forged_cash
+        .iter_mut()
+        .find(|event| event.event_type == EventType::GateDecisionMade)
+        .unwrap();
+    let cash = decision.payload["request"]["context"]["funds_inventory"]["cash_available"]
+        .as_str()
+        .unwrap()
+        .parse::<Decimal>()
+        .unwrap()
+        + d("1000");
+    let spendable = decision.payload["request"]["context"]["funds_inventory"]["spendable_cash"]
+        .as_str()
+        .unwrap()
+        .parse::<Decimal>()
+        .unwrap()
+        + d("1000");
+    decision.payload["request"]["context"]["funds_inventory"]["cash_available"] =
+        json!(cash.to_string());
+    decision.payload["request"]["context"]["funds_inventory"]["spendable_cash"] =
+        json!(spendable.to_string());
+    attacks.push(("cash", forged_cash));
+
+    let mut forged_pending = canonical.clone();
+    let decision = forged_pending
+        .iter_mut()
+        .find(|event| event.event_type == EventType::GateDecisionMade)
+        .unwrap();
+    let evidence = &mut decision.payload["request"]["context"]["funds_inventory"];
+    evidence["pending_buy_quantity"] = json!(config.standard_quantity);
+    evidence["position_exposure_quantity"] =
+        json!(config.initial_position + config.standard_quantity);
+    evidence["position_headroom_units"] = json!(12);
+    evidence["target_headroom_units"] = json!(5);
+    attacks.push(("pending-buy-exposure", forged_pending));
+
+    for (name, mut forged) in attacks {
+        let decision = forged
+            .iter_mut()
+            .find(|event| event.event_type == EventType::GateDecisionMade)
+            .unwrap();
+        let context: GateContext =
+            serde_json::from_value(decision.payload["request"]["context"].clone()).unwrap();
+        decision.payload["response"]["decision"]["input_snapshot_hash"] =
+            json!(context_hash_v4(&context).unwrap());
+        let request: DecisionRequest =
+            serde_json::from_value(decision.payload["request"].clone()).unwrap();
+        let response: DecisionResponse =
+            serde_json::from_value(decision.payload["response"].clone()).unwrap();
+        response
+            .validate_for(&request)
+            .unwrap_or_else(|error| panic!("{name} was not a self-consistent attack: {error:#}"));
+
+        let attack_database = source_temp.path().join(format!("resource-{name}.db"));
+        copy_sqlite_database(&prefix_database, &attack_database);
+        assert_forged_batch_is_atomically_rejected_from(&before_state, forged, &attack_database);
     }
 }
 

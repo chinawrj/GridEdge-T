@@ -105,9 +105,111 @@ impl OrderStatus {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum OrderIntentOrigin {
+    #[default]
+    GridRight,
+    InitialDeploymentV1 {
+        deployment_id: String,
+        source_market_event_id: String,
+        source_evidence_sha256: String,
+        policy_version: String,
+    },
+}
+
+impl OrderIntentOrigin {
+    pub fn is_initial_deployment(&self) -> bool {
+        matches!(self, Self::InitialDeploymentV1 { .. })
+    }
+
+    pub fn is_grid_right(&self) -> bool {
+        matches!(self, Self::GridRight)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum InitialDeploymentOutcome {
+    Authorized,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingMarketEvidence {
+    pub event_id: String,
+    pub evidence_sha256: String,
+    pub bar: crate::data::MarketBar,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InitialDeploymentEvaluation {
+    pub deployment_id: String,
+    pub policy_version: String,
+    pub source_market_event_id: String,
+    pub source_evidence_sha256: String,
+    pub symbol: String,
+    pub market_time: NaiveDateTime,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub limit_price: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub pre_available_cash: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub pre_frozen_cash: Decimal,
+    pub pre_position: i64,
+    pub pre_pending_buy_quantity: i64,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub minimum_free_cash: Decimal,
+    pub standard_quantity: i64,
+    pub maximum_units: i64,
+    pub selected_units: i64,
+    pub quantity: i64,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub canonical_reservation: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub projected_remaining_cash: Decimal,
+    pub outcome: InitialDeploymentOutcome,
+    pub reason: String,
+}
+
+pub const ONGOING_RESOURCE_POLICY_VERSION: &str = "ONGOING_RESOURCE_POLICY_V1";
+
+/// A versioned, append-only change to the resource envelope used by ordinary
+/// grid opportunities. This is deliberately separate from the one-shot
+/// opening-allocation floor recorded in `InitialDeploymentEvaluation`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OngoingResourcePolicyActivation {
+    pub policy_id: String,
+    pub policy_version: String,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub minimum_free_cash: Decimal,
+    pub position_limit_mode: String,
+    pub effective_max_position: i64,
+    pub config_content_sha256: String,
+    pub effective_platform_sha256: String,
+    pub initial_deployment_id: String,
+    pub initial_deployment_sha256: String,
+    pub expected_head_sequence: i64,
+    pub paper_snapshot_sha256: String,
+    pub outbox_snapshot_sha256: String,
+    pub reason_code: String,
+    pub operator: String,
+    pub activated_at: NaiveDateTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EffectiveOngoingResourcePolicy {
+    #[serde(with = "rust_decimal::serde::str")]
+    pub minimum_free_cash: Decimal,
+    pub effective_max_position: i64,
+    pub policy_version: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderIntent {
     pub intent_id: String,
+    #[serde(default)]
+    pub origin: OrderIntentOrigin,
     #[serde(default)]
     pub right_id: String,
     pub grid_index: i32,
@@ -225,6 +327,8 @@ pub struct TradingLot {
     pub lot_id: String,
     pub source_order_id: String,
     pub grid_index: i32,
+    #[serde(default)]
+    pub opening_allocation: bool,
     pub opened_on: NaiveDate,
     pub original_quantity: i64,
     pub remaining_quantity: i64,
@@ -337,6 +441,18 @@ pub struct StrategyState {
     pub last_reconciliation: Option<ReconciliationResult>,
     #[serde(default)]
     pub last_reconciliation_event_sequence: Option<i64>,
+    /// Current unprocessed market fact. It is retained only long enough to
+    /// bind decision-time facts to the exact durable source evidence.
+    #[serde(default)]
+    pub pending_market_evidence: Option<PendingMarketEvidence>,
+    /// The one-shot opening allocation decision. Once present it is never
+    /// recomputed from a later (possibly more attractive) market price.
+    #[serde(default)]
+    pub initial_deployment_evaluation: Option<InitialDeploymentEvaluation>,
+    /// Optional append-only override for ordinary grid opportunities. Legacy
+    /// runs without this fact retain the CONFIG_SNAPSHOTTED v4 semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ongoing_resource_policy: Option<OngoingResourcePolicyActivation>,
 }
 
 impl StrategyState {
@@ -407,6 +523,9 @@ impl StrategyState {
             last_recovery: None,
             last_reconciliation: None,
             last_reconciliation_event_sequence: None,
+            pending_market_evidence: None,
+            initial_deployment_evaluation: None,
+            ongoing_resource_policy: None,
         }
     }
 
@@ -732,7 +851,11 @@ impl StrategyState {
     }
 
     pub fn apply_fill(&mut self, fill: &Fill, grid_index: i32) -> Result<bool, DomainError> {
-        self.apply_fill_with_policy(fill, grid_index, true)
+        self.apply_fill_with_policy(fill, grid_index, true, false)
+    }
+
+    pub fn apply_initial_deployment_fill(&mut self, fill: &Fill) -> Result<bool, DomainError> {
+        self.apply_fill_with_policy(fill, 0, true, true)
     }
 
     pub(crate) fn apply_legacy_fill(
@@ -740,7 +863,7 @@ impl StrategyState {
         fill: &Fill,
         grid_index: i32,
     ) -> Result<bool, DomainError> {
-        self.apply_fill_with_policy(fill, grid_index, false)
+        self.apply_fill_with_policy(fill, grid_index, false, false)
     }
 
     fn apply_fill_with_policy(
@@ -748,12 +871,14 @@ impl StrategyState {
         fill: &Fill,
         grid_index: i32,
         enforce_no_loss: bool,
+        opening_allocation: bool,
     ) -> Result<bool, DomainError> {
         if self.processed_fills.contains(&fill.fill_id) {
             return Ok(false);
         }
         let mut projected = self.clone();
-        let applied = projected.apply_fill_inner(fill, grid_index, enforce_no_loss)?;
+        let applied =
+            projected.apply_fill_inner(fill, grid_index, enforce_no_loss, opening_allocation)?;
         *self = projected;
         Ok(applied)
     }
@@ -763,6 +888,7 @@ impl StrategyState {
         fill: &Fill,
         grid_index: i32,
         enforce_no_loss: bool,
+        opening_allocation: bool,
     ) -> Result<bool, DomainError> {
         if self.processed_fills.contains(&fill.fill_id) {
             return Ok(false);
@@ -821,6 +947,7 @@ impl StrategyState {
                         lot_id,
                         source_order_id: fill.order_id.clone(),
                         grid_index,
+                        opening_allocation,
                         opened_on: fill.trade_date,
                         original_quantity: fill.quantity,
                         remaining_quantity: fill.quantity,

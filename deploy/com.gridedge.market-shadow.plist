@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.gridedge.market-shadow</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/market-mqtt/venv/bin/python</string>
+    <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/market-mqtt/bin/shadow_publisher.py</string>
+    <string>--quote-log</string>
+    <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/runtime/002256-quotes.jsonl</string>
+    <string>--state-db</string>
+    <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/market-mqtt/state/ths-002256-shadow.db</string>
+    <string>--ca-file</string>
+    <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/market-mqtt/ca.crt</string>
+    <string>--password-file</string>
+    <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/market-mqtt/publisher.password</string>
+    <string>--source-id</string>
+    <string>ths-sim-quote</string>
+    <string>--venue</string>
+    <string>XSHE</string>
+    <string>--symbol</string>
+    <string>002256</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>25</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>25</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>25</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>25</integer></dict>
+    <dict><key>Weekday</key><integer>6</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>25</integer></dict>
+  </array>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/market-mqtt/logs/shadow.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/market-mqtt/logs/shadow.stderr.log</string>
+</dict>
+</plist>

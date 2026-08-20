@@ -1,17 +1,24 @@
 use crate::data::{validate_bar, MarketBar};
 use crate::decision::{GridRight, GridRightStatus, RightTranche, RightTrancheUnit};
 use crate::domain::{
-    Fill, GridLevelState, GridLevelStatus, Order, OrderStatus, ReconciliationResult, ServiceMode,
-    StrategyState,
+    Fill, GridLevelState, GridLevelStatus, InitialDeploymentEvaluation, InitialDeploymentOutcome,
+    Order, OrderIntentOrigin, OrderStatus, PendingMarketEvidence, ReconciliationResult,
+    ServiceMode, StrategyState,
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, str::FromStr};
 use uuid::Uuid;
 
 pub const EVENT_SCHEMA_VERSION: i32 = 1;
+pub const INITIAL_DEPLOYMENT_POLICY_VERSION: &str = "INITIAL_DEPLOYMENT_V1";
+
+pub fn market_evidence_sha256(bar: &MarketBar) -> Result<String> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(bar)?)))
+}
 
 pub fn current_event_schema(event_type: EventType) -> i32 {
     match event_type {
@@ -42,7 +49,8 @@ pub fn current_event_schema(event_type: EventType) -> i32 {
         EventType::GridRightDeferred | EventType::GridRightResidualHeld => 3,
         EventType::GateDecisionMade => 4,
         EventType::GridRightBlocked | EventType::GridRightReserved => 4,
-        EventType::OrderIntentCreated => 6,
+        EventType::OrderIntentCreated => 7,
+        EventType::InitialDeploymentEvaluated => 1,
         EventType::OrderPartiallyFilled | EventType::OrderFilled => 3,
         _ => EVENT_SCHEMA_VERSION,
     }
@@ -54,6 +62,9 @@ pub enum EventType {
     RunStarted,
     ConfigSnapshotted,
     AlgorithmRegistered,
+    PlatformUpgradeAuthorized,
+    PlatformUpgradeActivated,
+    OngoingResourcePolicyActivated,
     GridCycleStarted,
     GridLevelArmed,
     GridLevelTouched,
@@ -80,6 +91,7 @@ pub enum EventType {
     DeferredBudgetAccrued,
     DeferredQuantityAccrued,
     GateDecisionMade,
+    InitialDeploymentEvaluated,
     OrderIntentCreated,
     OrderSubmitted,
     OrderAccepted,
@@ -335,6 +347,12 @@ impl StrategyState {
 
     fn validate_current_order_intent(&self, event: &EventEnvelope, order: &Order) -> Result<()> {
         let intent = &order.intent;
+        if intent.origin.is_initial_deployment() {
+            return self.validate_initial_deployment_intent(event, order);
+        }
+        if !intent.origin.is_grid_right() {
+            return Err(anyhow!("unknown current order-intent origin"));
+        }
         let right = self
             .grid_rights
             .get(&intent.right_id)
@@ -506,6 +524,176 @@ impl StrategyState {
         Ok(())
     }
 
+    fn validate_initial_deployment_evaluation(
+        &self,
+        event: &EventEnvelope,
+        evaluation: &InitialDeploymentEvaluation,
+    ) -> Result<()> {
+        let config = self
+            .audited_config
+            .as_ref()
+            .context("initial deployment lacks its audited configuration")?;
+        let settings = config
+            .gate
+            .capital_inventory
+            .as_ref()
+            .context("initial deployment lacks capital-inventory settings")?;
+        let pending = self
+            .pending_market_evidence
+            .as_ref()
+            .context("initial deployment lacks an unprocessed market source")?;
+        let expected_deployment_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!("{}:initial-deployment:v1", self.run_id).as_bytes(),
+        )
+        .to_string();
+        let plan = crate::risk::canonical_initial_deployment_plan(config, self, pending.bar.close)
+            .context("initial deployment plan is not representable")?;
+        let expected_outcome = if plan.selected_units > 0 {
+            InitialDeploymentOutcome::Authorized
+        } else {
+            InitialDeploymentOutcome::Blocked
+        };
+        let expected_reason = if plan.selected_units > 0 {
+            "AUTHORIZED"
+        } else {
+            "NO_AFFORDABLE_UNITS"
+        };
+        if !settings.deploy_initial_balance
+            || self.initial_deployment_evaluation.is_some()
+            || event.schema_version != 1
+            || event.event_id == pending.event_id
+            || event.event_time != pending.bar.timestamp
+            || event.symbol != pending.bar.symbol
+            || event.cycle_id != self.cycle_id
+            || evaluation.deployment_id != expected_deployment_id
+            || evaluation.policy_version != INITIAL_DEPLOYMENT_POLICY_VERSION
+            || evaluation.source_market_event_id != pending.event_id
+            || evaluation.source_evidence_sha256 != pending.evidence_sha256
+            || evaluation.symbol != pending.bar.symbol
+            || evaluation.market_time != pending.bar.timestamp
+            || evaluation.limit_price != pending.bar.close
+            || evaluation.pre_available_cash != self.cash.available
+            || evaluation.pre_frozen_cash != self.cash.frozen
+            || evaluation.pre_position != self.position.total
+            || evaluation.pre_pending_buy_quantity != plan.pending_buy_quantity
+            || evaluation.minimum_free_cash != settings.minimum_free_cash
+            || evaluation.standard_quantity != config.standard_quantity
+            || evaluation.maximum_units != plan.maximum_units
+            || evaluation.selected_units != plan.selected_units
+            || evaluation.quantity != plan.quantity
+            || evaluation.canonical_reservation != plan.reservation
+            || evaluation.projected_remaining_cash != plan.projected_remaining_cash
+            || evaluation.outcome != expected_outcome
+            || evaluation.reason != expected_reason
+        {
+            return Err(anyhow!(
+                "initial deployment evaluation differs from its durable market and cash evidence"
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_initial_deployment_intent(
+        &self,
+        event: &EventEnvelope,
+        order: &Order,
+    ) -> Result<()> {
+        let intent = &order.intent;
+        let OrderIntentOrigin::InitialDeploymentV1 {
+            deployment_id,
+            source_market_event_id,
+            source_evidence_sha256,
+            policy_version,
+        } = &intent.origin
+        else {
+            return Err(anyhow!("initial deployment lacks its typed origin"));
+        };
+        let config = self
+            .audited_config
+            .as_ref()
+            .context("initial deployment lacks its audited configuration")?;
+        if event.schema_version != 7
+            || !config
+                .gate
+                .capital_inventory
+                .as_ref()
+                .is_some_and(|settings| settings.deploy_initial_balance)
+            || self
+                .orders
+                .values()
+                .any(|existing| existing.intent.origin.is_initial_deployment())
+        {
+            return Err(anyhow!("initial deployment is not unique and enabled"));
+        }
+        let evaluation = self
+            .initial_deployment_evaluation
+            .as_ref()
+            .context("initial deployment intent lacks its durable evaluation")?;
+        let plan = crate::risk::canonical_initial_deployment_plan(config, self, intent.limit_price)
+            .context("initial deployment quantity is not canonical")?;
+        let expected_quantity = plan.quantity;
+        let expected_intent_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!("{}:initial-deployment:v1", self.run_id).as_bytes(),
+        )
+        .to_string();
+        let expected_order_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!("paper:order:{expected_intent_id}:0").as_bytes(),
+        )
+        .to_string();
+        let expected_budget = intent
+            .limit_price
+            .checked_mul(rust_decimal::Decimal::from(intent.quantity))
+            .context("NUMERIC_RANGE_VIOLATION: initial deployment budget overflow")?;
+        let policy = crate::domain::ProfitGuardPolicy::from(config);
+        let expected_reservation = crate::profit::checked_buy_cash_reservation_with_policy(
+            &policy,
+            intent.limit_price,
+            intent.quantity,
+        )
+        .context("NUMERIC_RANGE_VIOLATION: initial deployment reservation overflow")?;
+        if evaluation.outcome != InitialDeploymentOutcome::Authorized
+            || evaluation.selected_units <= 0
+            || deployment_id != &evaluation.deployment_id
+            || source_market_event_id != &evaluation.source_market_event_id
+            || source_evidence_sha256 != &evaluation.source_evidence_sha256
+            || policy_version != &evaluation.policy_version
+            || policy_version != INITIAL_DEPLOYMENT_POLICY_VERSION
+            || plan.selected_units != evaluation.selected_units
+            || plan.reservation != evaluation.canonical_reservation
+            || !intent.right_id.is_empty()
+            || expected_quantity <= 0
+            || intent.direction != crate::domain::Direction::Buy
+            || intent.grid_index != 0
+            || intent.quantity != expected_quantity
+            || intent.quantity % config.standard_quantity != 0
+            || intent.budget != expected_budget
+            || intent.created_at != event.event_time
+            || event.cycle_id != self.cycle_id
+            || intent.intent_id != expected_intent_id
+            || order.order_id != expected_order_id
+            || !intent.target_lot_ids.is_empty()
+            || !intent.target_lot_allocations.is_empty()
+            || !intent.profit_guard_version.is_empty()
+            || intent.profit_guard_policy.as_ref() != Some(&policy)
+            || order.status != OrderStatus::Created
+            || order.filled_quantity != 0
+            || order.filled_notional != rust_decimal::Decimal::ZERO
+            || order.commission_charged != rust_decimal::Decimal::ZERO
+            || order.reserved_cash_remaining != expected_reservation
+            || order.reserved_quantity_remaining != 0
+            || order.cancel_requested_reason.is_some()
+            || order.cancel_requested_at.is_some()
+        {
+            return Err(anyhow!(
+                "initial deployment order differs from its audited cash-floor plan"
+            ));
+        }
+        Ok(())
+    }
+
     fn apply_event_in_place(&mut self, event: &EventEnvelope) -> Result<()> {
         let supported = match event.event_type {
             EventType::MarketDataReceived => matches!(event.schema_version, 1 | 2),
@@ -538,7 +726,7 @@ impl StrategyState {
                 matches!(event.schema_version, 1..=4)
             }
             EventType::GridRightResidualHeld => event.schema_version == 3,
-            EventType::OrderIntentCreated => matches!(event.schema_version, 1..=6),
+            EventType::OrderIntentCreated => matches!(event.schema_version, 1..=7),
             EventType::OrderPartiallyFilled | EventType::OrderFilled => {
                 matches!(event.schema_version, 1..=3)
             }
@@ -1631,6 +1819,44 @@ impl StrategyState {
                     right.reserved_quantity = right.exercised_quantity;
                 }
             }
+            EventType::InitialDeploymentEvaluated => {
+                let evaluation: InitialDeploymentEvaluation =
+                    serde_json::from_value(event.payload.clone())?;
+                self.validate_initial_deployment_evaluation(event, &evaluation)?;
+                self.initial_deployment_evaluation = Some(evaluation);
+            }
+            EventType::OngoingResourcePolicyActivated => {
+                let activation: crate::domain::OngoingResourcePolicyActivation =
+                    serde_json::from_value(event.payload.clone())?;
+                if self.ongoing_resource_policy.is_some() {
+                    return Err(anyhow!("ongoing resource policy is already activated"));
+                }
+                let config = self
+                    .audited_config
+                    .as_ref()
+                    .context("ongoing resource policy lacks audited configuration")?;
+                let opening = self
+                    .initial_deployment_evaluation
+                    .as_ref()
+                    .context("ongoing resource policy requires an opening evaluation")?;
+                if opening.outcome != InitialDeploymentOutcome::Authorized
+                    || activation.policy_version != crate::domain::ONGOING_RESOURCE_POLICY_VERSION
+                    || activation.minimum_free_cash != rust_decimal::Decimal::ZERO
+                    || activation.position_limit_mode != "NUMERIC_SAFETY_ONLY"
+                    || activation.effective_max_position != config.max_position
+                    || activation.config_content_sha256 != config.content_sha256()?
+                    || activation.initial_deployment_id != opening.deployment_id
+                    || activation.initial_deployment_sha256
+                        != hex::encode(Sha256::digest(serde_json::to_vec(opening)?))
+                    || activation.reason_code.trim().is_empty()
+                    || activation.operator.trim().is_empty()
+                {
+                    return Err(anyhow!(
+                        "ongoing resource policy activation is not canonical"
+                    ));
+                }
+                self.ongoing_resource_policy = Some(activation);
+            }
             EventType::OrderIntentCreated => {
                 let order: Order = serde_json::from_value(event.payload.clone())?;
                 if event.schema_version >= 4 {
@@ -2047,8 +2273,11 @@ impl StrategyState {
                 } else {
                     None
                 };
+                let opening_allocation = order.intent.origin.is_initial_deployment();
                 if event.schema_version == 1 {
                     self.apply_legacy_fill(&fill, grid_index)?;
+                } else if opening_allocation {
+                    self.apply_initial_deployment_fill(&fill)?;
                 } else {
                     self.apply_fill(&fill, grid_index)?;
                 }
@@ -2081,9 +2310,11 @@ impl StrategyState {
                     order.reserved_cash_remaining = rust_decimal::Decimal::ZERO;
                     order.reserved_quantity_remaining = 0;
                 }
-                self.historically_executed_levels.insert(grid_index);
-                if let Some(level) = self.levels.get_mut(&grid_index) {
-                    level.status = GridLevelStatus::Executed;
+                if !opening_allocation {
+                    self.historically_executed_levels.insert(grid_index);
+                    if let Some(level) = self.levels.get_mut(&grid_index) {
+                        level.status = GridLevelStatus::Executed;
+                    }
                 }
             }
             EventType::AmbiguousBarDetected => {
@@ -2359,6 +2590,8 @@ impl StrategyState {
             }
             EventType::RunStarted
             | EventType::AlgorithmRegistered
+            | EventType::PlatformUpgradeAuthorized
+            | EventType::PlatformUpgradeActivated
             | EventType::ReplayInitialized
             | EventType::DeferredBudgetAccrued
             | EventType::DeferredQuantityAccrued
@@ -2409,6 +2642,16 @@ impl StrategyState {
                 if let Some(close) = event.payload.get("close").and_then(Value::as_str) {
                     self.last_price = Some(close.parse()?);
                 }
+                if self
+                    .pending_market_evidence
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.bar.symbol == event.symbol
+                            && pending.bar.timestamp == event.event_time
+                    })
+                {
+                    self.pending_market_evidence = None;
+                }
             }
             EventType::MarketDataReceived => {
                 if event.schema_version == 1 {
@@ -2434,6 +2677,11 @@ impl StrategyState {
                             "current market-data payload does not match its event envelope"
                         ));
                     }
+                    self.pending_market_evidence = Some(PendingMarketEvidence {
+                        event_id: event.event_id.clone(),
+                        evidence_sha256: market_evidence_sha256(&bar)?,
+                        bar,
+                    });
                 }
             }
             EventType::MarketBarDecisionsCommitted => {

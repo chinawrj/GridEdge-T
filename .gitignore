@@ -11,3 +11,20 @@ __pycache__/
 *.db-wal
 *.web.lock
 .DS_Store
+
+# Machine-local runtime state and logs must never be published.
+/runtime/
+/logs/
+*.log
+
+# Deployment credentials and locally generated signing material.
+.env
+.env.*
+!.env.example
+**/secrets/
+*.password
+*.passwd
+*.pem
+*.key
+*.p12
+*.pfx

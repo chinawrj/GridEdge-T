@@ -1,0 +1,8 @@
+user gridedge-publisher
+topic write gridedge/market/v1/#
+topic read gridedge/market/v1/+/+/status
+
+user gridedge-ingestor
+topic read gridedge/market/v1/#
+topic read $SYS/broker/#
+

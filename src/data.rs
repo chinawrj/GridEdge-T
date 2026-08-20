@@ -4,7 +4,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fs::File, io::Read, path::Path};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MarketBar {
     #[serde(with = "csv_datetime")]
     pub timestamp: NaiveDateTime,
@@ -131,7 +131,7 @@ impl MarketDataFeed for CsvReplayFeed {
     }
 }
 
-pub(crate) fn validate_bar(bar: &MarketBar, expected_symbol: &str) -> Result<()> {
+pub fn validate_bar(bar: &MarketBar, expected_symbol: &str) -> Result<()> {
     if bar.symbol != expected_symbol {
         bail!("symbol {} does not match {}", bar.symbol, expected_symbol)
     }

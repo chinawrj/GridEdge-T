@@ -1,0 +1,101 @@
+name: gridedge-market
+
+services:
+  mqtt:
+    image: eclipse-mosquitto:2.1.2-alpine
+    container_name: gridedge-market-mqtt
+    restart: unless-stopped
+    ports:
+      - "8883:8883"
+    volumes:
+      - ${MARKET_ROOT}/app/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ${MARKET_ROOT}/app/mosquitto/acl:/mosquitto/config/acl:ro
+      - ${MARKET_ROOT}/secrets/mosquitto.passwd:/mosquitto/config/mosquitto.passwd:ro
+      - ${MARKET_ROOT}/secrets/tls/ca.crt:/mosquitto/config/tls/ca.crt:ro
+      - ${MARKET_ROOT}/secrets/tls/server.crt:/mosquitto/config/tls/server.crt:ro
+      - ${MARKET_ROOT}/secrets/tls/server.key:/mosquitto/config/tls/server.key:ro
+      - ${MARKET_ROOT}/data/mosquitto:/mosquitto/data
+      - ${MARKET_ROOT}/logs/mosquitto:/mosquitto/log
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -V mqttv5 -h 127.0.0.1 -p 8883 --insecure --cafile /mosquitto/config/tls/ca.crt -u gridedge-ingestor -P \"$$(cat /run/secrets/mqtt_ingestor_password)\" -t '$$SYS/broker/version' -C 1 -W 5 >/dev/null"]
+      interval: 15s
+      timeout: 8s
+      retries: 5
+      start_period: 10s
+    secrets:
+      - mqtt_ingestor_password
+    networks:
+      - market
+
+  postgres:
+    image: postgres:17-bookworm
+    container_name: gridedge-market-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: gridedge_market
+      POSTGRES_USER: gridedge_market
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      PGDATA: /var/lib/postgresql/data
+    secrets:
+      - postgres_password
+    volumes:
+      - ${MARKET_ROOT}/data/postgres:/var/lib/postgresql/data
+      - ${MARKET_ROOT}/app/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gridedge_market -d gridedge_market"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    stop_grace_period: 60s
+    networks:
+      - market
+
+  ingestor:
+    build:
+      context: ${MARKET_ROOT}/app/ingestor
+    image: gridedge-market-ingestor:1
+    container_name: gridedge-market-ingestor
+    restart: unless-stopped
+    environment:
+      MQTT_HOST: mqtt
+      MQTT_PORT: "8883"
+      MQTT_TOPIC: gridedge/market/v1/#
+      MQTT_CLIENT_ID: gridedge-market-ingestor-v1
+      MQTT_USERNAME: gridedge-ingestor
+      MQTT_PASSWORD_FILE: /run/secrets/mqtt_ingestor_password
+      MQTT_CA_FILE: /run/tls/ca.crt
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: gridedge_market
+      POSTGRES_USER: gridedge_market
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - mqtt_ingestor_password
+      - postgres_password
+    volumes:
+      - ${MARKET_ROOT}/secrets/tls/ca.crt:/run/tls/ca.crt:ro
+    depends_on:
+      mqtt:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('mqtt',8883),2).close(); socket.create_connection(('postgres',5432),2).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - market
+
+networks:
+  market:
+    name: gridedge-market-internal
+    driver: bridge
+
+secrets:
+  mqtt_ingestor_password:
+    file: ${MARKET_ROOT}/secrets/mqtt-ingestor.password
+  postgres_password:
+    file: ${MARKET_ROOT}/secrets/postgres.password

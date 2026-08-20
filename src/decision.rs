@@ -1297,7 +1297,7 @@ fn builtin_artifact_sha256(identity: &str) -> String {
     hex::encode(Sha256::digest(identity.as_bytes()))
 }
 
-fn current_platform_sha256() -> String {
+pub fn current_platform_sha256() -> String {
     static PLATFORM_SHA256: OnceLock<String> = OnceLock::new();
     PLATFORM_SHA256
         .get_or_init(|| {

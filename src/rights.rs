@@ -31,8 +31,11 @@ pub fn sell_tranches_to_mint(
         .values()
         .filter(|lot| {
             lot.remaining_quantity > 0
-                && lot.grid_index < 0
-                && lot.grid_index.abs() <= index.abs()
+                && (lot.opening_allocation
+                    || (lot.grid_index < 0
+                        && lot.grid_index.checked_abs().is_some_and(|birth| {
+                            index.checked_abs().is_some_and(|current| birth <= current)
+                        })))
                 && !state.right_tranches.values().any(|tranche| {
                     tranche.cycle_id == state.cycle_id
                         && tranche.direction == Direction::Sell
@@ -432,11 +435,12 @@ impl<'a> RightsGateCoordinator<'a> {
             .values()
             .filter(|lot| {
                 lot.remaining_quantity > 0
-                    && lot.grid_index < 0
-                    && lot
-                        .grid_index
-                        .checked_abs()
-                        .is_some_and(|lot_depth| lot_depth <= depth)
+                    && (lot.opening_allocation
+                        || (lot.grid_index < 0
+                            && lot
+                                .grid_index
+                                .checked_abs()
+                                .is_some_and(|lot_depth| lot_depth <= depth)))
             })
             .collect();
         let mut eligible_lots: Vec<_> = matching_lots

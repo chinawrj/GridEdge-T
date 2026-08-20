@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.gridedge.ths-sim</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/bin/gridedge_ths_live</string>
+    <string>--config</string>
+    <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/config/ths_002256_sim.yaml</string>
+    <string>--run-id</string>
+    <string>ths-002256-20260819-grid15-opening-v1</string>
+    <string>--outbox</string>
+    <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/runtime/002256-outbox-opening-v1.db</string>
+    <string>--quote-log</string>
+    <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/runtime/002256-opening-v1-quotes.jsonl</string>
+    <string>--bar-log</string>
+    <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/runtime/002256-opening-v1-bars.jsonl</string>
+    <string>--interval-minutes</string>
+    <string>5</string>
+    <string>--poll-seconds</string>
+    <string>5</string>
+    <string>--maximum-unchanged-seconds</string>
+    <string>60</string>
+    <string>--maximum-order-age-seconds</string>
+    <string>300</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T</string>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>25</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>25</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>25</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>25</integer></dict>
+    <dict><key>Weekday</key><integer>6</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>25</integer></dict>
+  </array>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>StandardOutPath</key>
+  <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/logs/worker.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/logs/worker.stderr.log</string>
+</dict>
+</plist>

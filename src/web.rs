@@ -2709,29 +2709,18 @@ fn durable_command_runtime_identity(
     store: &SqliteStore,
     run_id: &str,
 ) -> Result<Option<(String, String)>, WebError> {
-    let Some(config_payload) =
-        store.first_payload_by_type(run_id, crate::event::EventType::ConfigSnapshotted)?
+    let Some(context) = crate::run_context::RunContext::load(store, run_id)
+        .map_err(|error| WebError::pending_plan_conflict(error.to_string()))?
     else {
         return Ok(None);
     };
-    Config::from_snapshot_payload(&config_payload)
+    let config_sha256 = context
+        .config
+        .content_sha256()
         .map_err(|error| WebError::pending_plan_conflict(error.to_string()))?;
-    let config_sha256 = config_payload
-        .get("_content_sha256")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            WebError::pending_plan_conflict(
-                "committed command configuration lacks its content identity",
-            )
-        })?
-        .to_owned();
-    let Some(algorithm_payload) =
-        store.first_payload_by_type(run_id, crate::event::EventType::AlgorithmRegistered)?
-    else {
+    let Some(manifest) = context.algorithm_manifest else {
         return Ok(None);
     };
-    let manifest: AlgorithmManifest = serde_json::from_value(algorithm_payload)
-        .map_err(|error| WebError::pending_plan_conflict(error.to_string()))?;
     Ok(Some((config_sha256, algorithm_manifest_sha256(&manifest)?)))
 }
 

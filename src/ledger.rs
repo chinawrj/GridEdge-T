@@ -7,7 +7,10 @@
 use crate::{
     data::MarketBar,
     decision::{DecisionRequest, DecisionResponse, GridRight, DECISION_CONTRACT_VERSION},
-    domain::{Direction, GridLevelState, GridLevelStatus, Order, OrderStatus, StrategyState},
+    domain::{
+        Direction, GridLevelState, GridLevelStatus, InitialDeploymentEvaluation,
+        InitialDeploymentOutcome, Order, OrderStatus, StrategyState,
+    },
     event::{current_event_schema, EventEnvelope, EventType},
     journal::{AppendOutcome, SqliteStore},
     risk::{canonical_approval, canonical_approved_quantity},
@@ -35,7 +38,57 @@ impl<'a> LedgerWriter<'a> {
         }
     }
 
-    pub fn append(&mut self, mut event: EventEnvelope) -> Result<AppendOutcome> {
+    pub fn append(&mut self, event: EventEnvelope) -> Result<AppendOutcome> {
+        self.append_inner(event, false)
+    }
+
+    pub(crate) fn append_platform_upgrade(
+        &mut self,
+        event: EventEnvelope,
+    ) -> Result<AppendOutcome> {
+        if !matches!(
+            event.event_type,
+            EventType::PlatformUpgradeAuthorized | EventType::PlatformUpgradeActivated
+        ) {
+            return Err(anyhow!(
+                "platform identity writer received a business event"
+            ));
+        }
+        self.append_inner(event, true)
+    }
+
+    pub(crate) fn append_ongoing_resource_policy(
+        &mut self,
+        event: EventEnvelope,
+    ) -> Result<AppendOutcome> {
+        if event.event_type != EventType::OngoingResourcePolicyActivated {
+            return Err(anyhow!(
+                "ongoing resource policy writer received an unrelated event"
+            ));
+        }
+        self.append_inner(event, true)
+    }
+
+    fn append_inner(
+        &mut self,
+        mut event: EventEnvelope,
+        offline_policy_boundary: bool,
+    ) -> Result<AppendOutcome> {
+        if matches!(
+            event.event_type,
+            EventType::PlatformUpgradeAuthorized | EventType::PlatformUpgradeActivated
+        ) && !offline_policy_boundary
+        {
+            return Err(anyhow!(
+                "platform identity events require the dedicated offline upgrade boundary"
+            ));
+        }
+        if event.event_type == EventType::OngoingResourcePolicyActivated && !offline_policy_boundary
+        {
+            return Err(anyhow!(
+                "ongoing resource policy requires its dedicated offline boundary"
+            ));
+        }
         if event.run_id != self.state.run_id {
             return Err(anyhow!(
                 "event run {} does not match ledger run {}",
@@ -94,6 +147,16 @@ impl<'a> LedgerWriter<'a> {
                 "current grid opportunities must be written as one atomic touch-resolution batch"
             ));
         }
+        if !exists
+            && (event.event_type == EventType::InitialDeploymentEvaluated
+                || (event.event_type == EventType::OrderIntentCreated
+                    && serde_json::from_value::<Order>(event.payload.clone())
+                        .is_ok_and(|order| order.intent.origin.is_initial_deployment())))
+        {
+            return Err(anyhow!(
+                "initial deployment evaluation and intent require one atomic batch"
+            ));
+        }
         if !exists && event.event_type == EventType::GridLevelRearmed {
             let latest_market = self
                 .store
@@ -142,6 +205,18 @@ impl<'a> LedgerWriter<'a> {
         if events.is_empty() {
             return Err(anyhow!("cannot append an empty event batch"));
         }
+        if events.iter().any(|event| {
+            matches!(
+                event.event_type,
+                EventType::PlatformUpgradeAuthorized
+                    | EventType::PlatformUpgradeActivated
+                    | EventType::OngoingResourcePolicyActivated
+            )
+        }) {
+            return Err(anyhow!(
+                "platform identity events cannot enter a business event batch"
+            ));
+        }
         if events.iter().any(|event| event.run_id != self.state.run_id) {
             return Err(anyhow!(
                 "event batch contains a run other than ledger run {}",
@@ -183,6 +258,76 @@ impl<'a> LedgerWriter<'a> {
             };
             event.causation_id = prior;
             causes.insert(event.correlation_id.clone(), Some(event.event_id.clone()));
+        }
+        for (evaluation_index, (event, exists)) in events.iter().zip(&existing).enumerate() {
+            if *exists || event.event_type != EventType::InitialDeploymentEvaluated {
+                continue;
+            }
+            let evaluation: InitialDeploymentEvaluation =
+                serde_json::from_value(event.payload.clone())?;
+            let matching_intents = events
+                .iter()
+                .zip(&existing)
+                .enumerate()
+                .filter(|(intent_index, (candidate, candidate_exists))| {
+                    if **candidate_exists
+                        || *intent_index <= evaluation_index
+                        || candidate.event_type != EventType::OrderIntentCreated
+                        || candidate.correlation_id != event.correlation_id
+                        || candidate.event_time != event.event_time
+                    {
+                        return false;
+                    }
+                    serde_json::from_value::<Order>(candidate.payload.clone()).is_ok_and(|order| {
+                        match order.intent.origin {
+                            crate::domain::OrderIntentOrigin::InitialDeploymentV1 {
+                                deployment_id,
+                                ..
+                            } => deployment_id == evaluation.deployment_id,
+                            crate::domain::OrderIntentOrigin::GridRight => false,
+                        }
+                    })
+                })
+                .count();
+            let expected = usize::from(evaluation.outcome == InitialDeploymentOutcome::Authorized);
+            if matching_intents != expected {
+                return Err(anyhow!(
+                    "initial deployment evaluation does not have its exact atomic intent outcome"
+                ));
+            }
+        }
+        for (intent_index, (event, exists)) in events.iter().zip(&existing).enumerate() {
+            if *exists || event.event_type != EventType::OrderIntentCreated {
+                continue;
+            }
+            let order: Order = serde_json::from_value(event.payload.clone())?;
+            let crate::domain::OrderIntentOrigin::InitialDeploymentV1 { deployment_id, .. } =
+                &order.intent.origin
+            else {
+                continue;
+            };
+            let matching_evaluations = events[..intent_index]
+                .iter()
+                .zip(&existing[..intent_index])
+                .filter(|(candidate, candidate_exists)| {
+                    !**candidate_exists
+                        && candidate.event_type == EventType::InitialDeploymentEvaluated
+                        && candidate.correlation_id == event.correlation_id
+                        && candidate.event_time == event.event_time
+                        && serde_json::from_value::<InitialDeploymentEvaluation>(
+                            candidate.payload.clone(),
+                        )
+                        .is_ok_and(|evaluation| {
+                            evaluation.deployment_id == *deployment_id
+                                && evaluation.outcome == InitialDeploymentOutcome::Authorized
+                        })
+                })
+                .count();
+            if matching_evaluations != 1 {
+                return Err(anyhow!(
+                    "initial deployment intent lacks one prior atomic evaluation"
+                ));
+            }
         }
         let mut previous_market = self
             .store

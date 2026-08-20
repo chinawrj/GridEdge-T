@@ -61,6 +61,23 @@ pub struct PaperExecutionGateway {
 
 impl PaperExecutionGateway {
     pub fn new(config: &Config, run_id: &str, snapshot: AccountSnapshot) -> Result<Self> {
+        Self::open(config, run_id, snapshot, true)
+    }
+
+    pub(crate) fn open_existing(
+        config: &Config,
+        run_id: &str,
+        snapshot: AccountSnapshot,
+    ) -> Result<Self> {
+        Self::open(config, run_id, snapshot, false)
+    }
+
+    fn open(
+        config: &Config,
+        run_id: &str,
+        snapshot: AccountSnapshot,
+        create_if_missing: bool,
+    ) -> Result<Self> {
         let conn = Connection::open(&config.database)
             .context("failed to open independent Paper Broker ledger")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -76,7 +93,7 @@ impl PaperExecutionGateway {
             .optional()?;
         let snapshot = if let Some(stored) = stored {
             serde_json::from_str(&stored).context("invalid Paper Broker account snapshot")?
-        } else {
+        } else if create_if_missing {
             conn.execute(
                 "INSERT INTO paper_accounts(run_id,snapshot_json,updated_at) VALUES(?1,?2,?3)",
                 params![
@@ -86,6 +103,8 @@ impl PaperExecutionGateway {
                 ],
             )?;
             snapshot
+        } else {
+            anyhow::bail!("independent Paper Broker account is missing")
         };
         let current_trade_date = conn
             .query_row(

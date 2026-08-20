@@ -2,6 +2,7 @@ use crate::{
     config::Config,
     decision::GridRight,
     domain::{Direction, LotQuantityAllocation, StrategyState},
+    grid::GridSpec,
     profit::{checked_buy_cash_reservation_with_policy, plan_non_loss_sales},
 };
 use rust_decimal::Decimal;
@@ -61,6 +62,179 @@ pub fn affordable_buy_units(
         }
     }
     Ok(low)
+}
+
+/// Canonical one-shot opening allocation for a resource-aware run. The
+/// quantity is always a whole-Q amount, never breaches the configured cash
+/// floor, and is capped by the number of trade levels so opening inventory
+/// cannot turn into an unbounded high-price purchase.
+pub fn canonical_initial_buy_units(
+    config: &Config,
+    state: &StrategyState,
+    limit_price: Decimal,
+) -> Result<i64, RiskError> {
+    let Some(settings) = config.gate.capital_inventory.as_ref() else {
+        return Ok(0);
+    };
+    if !settings.deploy_initial_balance || config.standard_quantity <= 0 {
+        return Ok(0);
+    }
+    let free_cash = state
+        .cash
+        .available
+        .checked_sub(state.cash.frozen)
+        .ok_or(RiskError::NumericRange)?;
+    let spendable_cash = free_cash
+        .checked_sub(settings.minimum_free_cash)
+        .unwrap_or(Decimal::ZERO)
+        .max(Decimal::ZERO)
+        .min(
+            config
+                .initial_cash
+                .checked_div(Decimal::from(2))
+                .ok_or(RiskError::NumericRange)?,
+        );
+    let lower_boundary = GridSpec::from(config)
+        .price(-config.boundary_levels)
+        .map_err(|_| RiskError::NumericRange)?;
+    if limit_price < lower_boundary || limit_price > config.anchor_price {
+        return Ok(0);
+    }
+    let pending_buy_quantity = state
+        .orders
+        .values()
+        .filter(|order| {
+            order.intent.direction == Direction::Buy
+                && !matches!(
+                    order.status,
+                    crate::domain::OrderStatus::Filled
+                        | crate::domain::OrderStatus::Rejected
+                        | crate::domain::OrderStatus::Cancelled
+                )
+        })
+        .try_fold(0_i64, |total, order| {
+            order
+                .intent
+                .quantity
+                .checked_sub(order.filled_quantity)
+                .and_then(|quantity| total.checked_add(quantity))
+        })
+        .ok_or(RiskError::NumericRange)?;
+    let exposure = state
+        .position
+        .total
+        .checked_add(pending_buy_quantity)
+        .ok_or(RiskError::NumericRange)?;
+    let position_units = config
+        .max_position
+        .checked_sub(exposure)
+        .ok_or(RiskError::NumericRange)?
+        .max(0)
+        / config.standard_quantity;
+    let target_units = settings
+        .target_position
+        .checked_sub(exposure)
+        .ok_or(RiskError::NumericRange)?
+        .max(0)
+        / config.standard_quantity;
+    let maximum_units = i64::from(config.trade_levels)
+        .min(position_units)
+        .min(target_units)
+        .max(0);
+    affordable_buy_units(config, limit_price, spendable_cash, maximum_units)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InitialDeploymentPlan {
+    pub maximum_units: i64,
+    pub selected_units: i64,
+    pub quantity: i64,
+    pub pending_buy_quantity: i64,
+    pub reservation: Decimal,
+    pub projected_remaining_cash: Decimal,
+}
+
+/// Return the complete audited opening-allocation calculation. Keeping this
+/// beside `canonical_initial_buy_units` gives the service and journal
+/// projection one exact formula for both quantity and cash evidence.
+pub fn canonical_initial_deployment_plan(
+    config: &Config,
+    state: &StrategyState,
+    limit_price: Decimal,
+) -> Result<InitialDeploymentPlan, RiskError> {
+    let pending_buy_quantity = state
+        .orders
+        .values()
+        .filter(|order| {
+            order.intent.direction == Direction::Buy
+                && !matches!(
+                    order.status,
+                    crate::domain::OrderStatus::Filled
+                        | crate::domain::OrderStatus::Rejected
+                        | crate::domain::OrderStatus::Cancelled
+                )
+        })
+        .try_fold(0_i64, |total, order| {
+            order
+                .intent
+                .quantity
+                .checked_sub(order.filled_quantity)
+                .and_then(|quantity| total.checked_add(quantity))
+        })
+        .ok_or(RiskError::NumericRange)?;
+    let exposure = state
+        .position
+        .total
+        .checked_add(pending_buy_quantity)
+        .ok_or(RiskError::NumericRange)?;
+    let maximum_units = if config.standard_quantity > 0 {
+        i64::from(config.trade_levels)
+            .min(
+                config
+                    .max_position
+                    .checked_sub(exposure)
+                    .ok_or(RiskError::NumericRange)?
+                    .max(0)
+                    / config.standard_quantity,
+            )
+            .min(
+                config
+                    .gate
+                    .capital_inventory
+                    .as_ref()
+                    .map(|settings| settings.target_position)
+                    .unwrap_or(0)
+                    .checked_sub(exposure)
+                    .ok_or(RiskError::NumericRange)?
+                    .max(0)
+                    / config.standard_quantity,
+            )
+            .max(0)
+    } else {
+        0
+    };
+    let selected_units = canonical_initial_buy_units(config, state, limit_price)?;
+    let quantity = selected_units
+        .checked_mul(config.standard_quantity)
+        .ok_or(RiskError::NumericRange)?;
+    let reservation = if quantity > 0 {
+        estimated_buy_reservation(config, limit_price, quantity)?
+    } else {
+        Decimal::ZERO
+    };
+    let projected_remaining_cash = state
+        .cash
+        .available
+        .checked_sub(reservation)
+        .ok_or(RiskError::NumericRange)?;
+    Ok(InitialDeploymentPlan {
+        maximum_units,
+        selected_units,
+        quantity,
+        pending_buy_quantity,
+        reservation,
+        projected_remaining_cash,
+    })
 }
 
 /// Recompute the maximum whole-standard-quantity slice that the platform can

@@ -11,7 +11,10 @@ use gridedge_t::{
     market_data::{
         default_paths, default_three_year_range, fetch_klines, Adjustment, FetchRequest,
     },
-    service::{compare_states, GridAutomationService, ReplayDescriptor},
+    service::{
+        activate_ongoing_resource_policy, authorize_platform_upgrade, compare_states,
+        GridAutomationService, ReplayDescriptor,
+    },
 };
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -109,6 +112,40 @@ enum Command {
         run_id: Option<String>,
         #[arg(long)]
         reason: String,
+        #[arg(long)]
+        json: bool,
+    },
+    AuthorizePlatformUpgrade {
+        #[arg(long, default_value = "configs/default.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        target_binary: PathBuf,
+        #[arg(long)]
+        certification_report: PathBuf,
+        #[arg(long)]
+        outbox: PathBuf,
+        #[arg(long)]
+        reason_code: String,
+        #[arg(long)]
+        operator: String,
+        #[arg(long)]
+        json: bool,
+    },
+    ActivateOngoingResourcePolicy {
+        #[arg(long, default_value = "configs/default.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        platform_binary: PathBuf,
+        #[arg(long)]
+        outbox: PathBuf,
+        #[arg(long)]
+        reason_code: String,
+        #[arg(long)]
+        operator: String,
         #[arg(long)]
         json: bool,
     },
@@ -372,6 +409,70 @@ async fn run() -> Result<()> {
                 );
             } else {
                 println!("run {run_id} resumed after audited reconciliation");
+            }
+        }
+        Command::AuthorizePlatformUpgrade {
+            config,
+            run_id,
+            target_binary,
+            certification_report,
+            outbox,
+            reason_code,
+            operator,
+            json,
+        } => {
+            let config = Config::load(config)?;
+            let store = SqliteStore::open(&config.database)?;
+            let authorization = authorize_platform_upgrade(
+                config,
+                store,
+                &run_id,
+                &target_binary,
+                &certification_report,
+                &outbox,
+                &reason_code,
+                &operator,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&authorization)?);
+            } else {
+                println!(
+                    "authorized platform upgrade {}: {} -> {}",
+                    authorization.upgrade_id,
+                    authorization.from_platform_sha256,
+                    authorization.to_platform_sha256
+                );
+            }
+        }
+        Command::ActivateOngoingResourcePolicy {
+            config,
+            run_id,
+            platform_binary,
+            outbox,
+            reason_code,
+            operator,
+            json,
+        } => {
+            let config = Config::load(config)?;
+            let store = SqliteStore::open(&config.database)?;
+            let activation = activate_ongoing_resource_policy(
+                config,
+                store,
+                &run_id,
+                &platform_binary,
+                &outbox,
+                &reason_code,
+                &operator,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&activation)?);
+            } else {
+                println!(
+                    "activated ongoing resource policy {}: minimum cash {} and numeric-only position limit {}",
+                    activation.policy_id,
+                    activation.minimum_free_cash,
+                    activation.effective_max_position
+                );
             }
         }
         Command::RebuildState(args) => {

@@ -7,10 +7,12 @@ use crate::{
         DECISION_CONTRACT_VERSION, WHOLE_UNIT_DECISION_CONTRACT_VERSION,
     },
     domain::{
-        Direction, Fill, LotQuantityAllocation, Order, OrderIntent, OrderStatus, ProfitGuardPolicy,
-        ReconciliationResult, ServiceMode, StrategyState,
+        Direction, EffectiveOngoingResourcePolicy, Fill, InitialDeploymentEvaluation,
+        InitialDeploymentOutcome, LotQuantityAllocation, OngoingResourcePolicyActivation, Order,
+        OrderIntent, OrderIntentOrigin, OrderStatus, ProfitGuardPolicy, ReconciliationResult,
+        ServiceMode, StrategyState, ONGOING_RESOURCE_POLICY_VERSION,
     },
-    event::{EventEnvelope, EventType},
+    event::{market_evidence_sha256, EventEnvelope, EventType, INITIAL_DEPLOYMENT_POLICY_VERSION},
     execution::{ExecutionGateway, ExecutionReport, PaperExecutionGateway},
     gate::{
         AlwaysExecuteGate, FixedGate, FundsInventoryContextV1, GateContext, GatePolicy,
@@ -19,6 +21,12 @@ use crate::{
     grid::{crossed_levels, maybe_rearm, GridSpec, TouchClassification},
     journal::{AppendOutcome, EventReader, SqliteStore, StateReader},
     ledger::LedgerWriter,
+    platform_upgrade::{
+        algorithm_contract_sha256, manifests_match_except_platform, platform_upgrade_id,
+        sha256_bytes, sha256_file, state_sha256, PlatformUpgradeActivated,
+        PlatformUpgradeAuthorized, PlatformUpgradeCertification,
+        PLATFORM_UPGRADE_AUTHORIZATION_KIND, PLATFORM_UPGRADE_CERTIFICATION_PROFILE,
+    },
     profit::{
         canonical_fill_allocations, checked_actual_order_fill_charges_with_policy,
         PROFIT_GUARD_VERSION,
@@ -26,8 +34,10 @@ use crate::{
     rights::{sell_tranches_to_mint, RightsGateCoordinator},
     risk::{
         affordable_buy_units, canonical_approval, canonical_approved_quantity,
-        estimated_buy_reservation, DefaultRiskChecker, RiskChecker,
+        canonical_initial_deployment_plan, estimated_buy_reservation, DefaultRiskChecker,
+        RiskChecker,
     },
+    ths_sim_outbox::{StagedIntentState, StagedTerminalResolution, ThsSimOutbox},
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::NaiveDateTime;
@@ -35,10 +45,320 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Digest;
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 use uuid::Uuid;
 
 type TrancheAllocationSource = (String, i32, Option<String>, Decimal, Decimal, i64, i64);
+
+pub fn effective_ongoing_resource_policy(
+    config: &Config,
+    state: &StrategyState,
+) -> Result<EffectiveOngoingResourcePolicy> {
+    let settings = config
+        .gate
+        .capital_inventory
+        .as_ref()
+        .context("resource-aware strategy lacks capital/inventory settings")?;
+    if let Some(activation) = state.ongoing_resource_policy.as_ref() {
+        if activation.policy_version != ONGOING_RESOURCE_POLICY_VERSION
+            || activation.minimum_free_cash != Decimal::ZERO
+            || activation.position_limit_mode != "NUMERIC_SAFETY_ONLY"
+            || activation.effective_max_position != config.max_position
+            || activation.config_content_sha256 != config.content_sha256()?
+        {
+            anyhow::bail!("durable ongoing resource policy is not canonical")
+        }
+        return Ok(EffectiveOngoingResourcePolicy {
+            minimum_free_cash: activation.minimum_free_cash,
+            effective_max_position: activation.effective_max_position,
+            policy_version: activation.policy_version.clone(),
+        });
+    }
+    Ok(EffectiveOngoingResourcePolicy {
+        minimum_free_cash: settings.minimum_free_cash,
+        effective_max_position: settings.target_position,
+        policy_version: "LEGACY_CONFIG_V4".to_owned(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn activate_ongoing_resource_policy(
+    config: Config,
+    mut store: SqliteStore,
+    run_id: &str,
+    platform_binary: &Path,
+    outbox_path: &Path,
+    reason_code: &str,
+    operator: &str,
+) -> Result<OngoingResourcePolicyActivation> {
+    config.validate()?;
+    if reason_code.trim().is_empty() || operator.trim().is_empty() {
+        anyhow::bail!("ongoing resource policy activation requires reason and operator")
+    }
+    store.migrate()?;
+    let context = crate::run_context::RunContext::load(&store, run_id)?
+        .context("ongoing resource policy requires a durable run")?;
+    let mut expected_config = config.clone();
+    expected_config.database = context.config.database.clone();
+    if expected_config != context.config {
+        anyhow::bail!("ongoing resource policy configuration differs from the durable run")
+    }
+    if context.pending_platform_upgrade.is_some() {
+        anyhow::bail!("pending platform upgrade prevents policy activation")
+    }
+    let effective_manifest = context
+        .algorithm_manifest
+        .as_ref()
+        .context("ongoing resource policy lacks an effective algorithm manifest")?;
+    if sha256_file(platform_binary)? != effective_manifest.platform_sha256 {
+        anyhow::bail!("policy activation binary differs from the effective platform")
+    }
+    if store.pending_web_command(run_id)?.is_some()
+        || store.web_playback_control(run_id)?.active
+        || store.first_incomplete_market_sequence(run_id)?.is_some()
+    {
+        anyhow::bail!("pending work prevents ongoing resource policy activation")
+    }
+    let (state, expected_head_sequence) = store.rebuild_full(context.initial_state())?;
+    if state.ongoing_resource_policy.is_some() {
+        anyhow::bail!("ongoing resource policy is already activated")
+    }
+    if state.orders.values().any(|order| {
+        !matches!(
+            order.status,
+            OrderStatus::Filled | OrderStatus::Rejected | OrderStatus::Cancelled
+        )
+    }) {
+        anyhow::bail!("non-terminal Paper order prevents policy activation")
+    }
+    let opening = state
+        .initial_deployment_evaluation
+        .as_ref()
+        .context("ongoing policy requires a completed opening allocation")?;
+    if opening.outcome != InitialDeploymentOutcome::Authorized {
+        anyhow::bail!("ongoing policy requires an authorized opening allocation")
+    }
+    let local = state.snapshot()?;
+    let gateway = PaperExecutionGateway::open_existing(&config, run_id, local.clone())?;
+    if gateway.account_snapshot() != local {
+        anyhow::bail!("independent Paper account differs from the ledger rebuild")
+    }
+    let outbox = ThsSimOutbox::open(outbox_path)?;
+    let outbox_status = outbox.status()?;
+    if outbox_status.source_database_instance_id != store.database_instance_id()?
+        || outbox_status.run_id != run_id
+        || outbox_status.cursor != expected_head_sequence
+        || outbox_status.discovered != 0
+        || outbox_status.eligible != 0
+        || outbox_status.submitting != 0
+        || outbox_status.ambiguous != 0
+        || outbox_status.cancel_requested != 0
+        || outbox_status.cancelling != 0
+        || outbox_status.cancel_ambiguous != 0
+        || outbox.staged_intents()?.iter().any(|intent| {
+            intent.state != StagedIntentState::Submitted
+                || intent.terminal_resolution != StagedTerminalResolution::Filled
+        })
+    {
+        anyhow::bail!("Tonghuashun outbox is not a reconciled terminal prefix")
+    }
+    if store.latest_sequence(run_id)? != expected_head_sequence {
+        anyhow::bail!("journal head changed during policy activation")
+    }
+    let config_content_sha256 = context.config.content_sha256()?;
+    let initial_deployment_sha256 =
+        sha256_bytes(&serde_json::to_vec(opening).context("serialize opening evaluation")?);
+    let paper_snapshot_sha256 = sha256_bytes(&serde_json::to_vec(&local)?);
+    let outbox_snapshot_sha256 = sha256_bytes(&serde_json::to_vec(&outbox_status)?);
+    let policy_id = sha256_bytes(&serde_json::to_vec(&json!({
+        "run_id": run_id,
+        "policy_version": ONGOING_RESOURCE_POLICY_VERSION,
+        "config_content_sha256": config_content_sha256,
+        "effective_platform_sha256": effective_manifest.platform_sha256,
+        "initial_deployment_sha256": initial_deployment_sha256,
+        "expected_head_sequence": expected_head_sequence,
+        "paper_snapshot_sha256": paper_snapshot_sha256,
+        "outbox_snapshot_sha256": outbox_snapshot_sha256,
+    }))?);
+    let now = chrono::Utc::now().naive_utc();
+    let activation = OngoingResourcePolicyActivation {
+        policy_id: policy_id.clone(),
+        policy_version: ONGOING_RESOURCE_POLICY_VERSION.to_owned(),
+        minimum_free_cash: Decimal::ZERO,
+        position_limit_mode: "NUMERIC_SAFETY_ONLY".to_owned(),
+        effective_max_position: config.max_position,
+        config_content_sha256,
+        effective_platform_sha256: effective_manifest.platform_sha256.clone(),
+        initial_deployment_id: opening.deployment_id.clone(),
+        initial_deployment_sha256,
+        expected_head_sequence,
+        paper_snapshot_sha256,
+        outbox_snapshot_sha256,
+        reason_code: reason_code.trim().to_owned(),
+        operator: operator.trim().to_owned(),
+        activated_at: now,
+    };
+    let event = make_event(
+        &config,
+        &state,
+        EventType::OngoingResourcePolicyActivated,
+        now,
+        &format!("ongoing-resource-policy:{policy_id}"),
+        format!("ongoing-resource-policy-activated:{policy_id}"),
+        serde_json::to_value(&activation)?,
+    );
+    let mut projected = state;
+    let mut last_sequence = expected_head_sequence;
+    LedgerWriter::new(&mut store, &mut projected, &mut last_sequence)
+        .append_ongoing_resource_policy(event)?;
+    if last_sequence != expected_head_sequence + 1
+        || projected.ongoing_resource_policy.as_ref() != Some(&activation)
+    {
+        anyhow::bail!("persisted ongoing policy failed projection verification")
+    }
+    Ok(activation)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn authorize_platform_upgrade(
+    config: Config,
+    mut store: SqliteStore,
+    run_id: &str,
+    target_binary: &Path,
+    certification_report: &Path,
+    outbox_path: &Path,
+    reason_code: &str,
+    operator: &str,
+) -> Result<PlatformUpgradeAuthorized> {
+    config.validate()?;
+    if reason_code.trim().is_empty() || operator.trim().is_empty() {
+        anyhow::bail!("platform upgrade requires a reason code and operator")
+    }
+    store.migrate()?;
+    let context = crate::run_context::RunContext::load(&store, run_id)?
+        .context("platform upgrade requires a current durable run identity")?;
+    if context.pending_platform_upgrade.is_some() {
+        anyhow::bail!("run already has a pending platform upgrade")
+    }
+    let mut expected_config = config.clone();
+    expected_config.database = context.config.database.clone();
+    if expected_config != context.config {
+        anyhow::bail!("platform upgrade configuration differs from the durable run")
+    }
+    if store.pending_web_command(run_id)?.is_some() || store.web_playback_control(run_id)?.active {
+        anyhow::bail!("pending or active Web work prevents a platform upgrade")
+    }
+    if store.first_incomplete_market_sequence(run_id)?.is_some() {
+        anyhow::bail!("an incomplete market bar prevents a platform upgrade")
+    }
+    let target_binary_sha256 = sha256_file(target_binary)?;
+    let report_bytes = std::fs::read(certification_report).with_context(|| {
+        format!(
+            "failed to read platform certification {}",
+            certification_report.display()
+        )
+    })?;
+    PlatformUpgradeCertification::parse_and_validate(&report_bytes, run_id, &target_binary_sha256)?;
+    let certification_evidence_sha256 = sha256_bytes(&report_bytes);
+    let base_manifest = context
+        .base_algorithm_manifest
+        .as_ref()
+        .context("platform upgrade requires an audited algorithm manifest")?;
+    let effective_manifest = context
+        .algorithm_manifest
+        .as_ref()
+        .context("platform upgrade lacks its effective algorithm manifest")?;
+    if target_binary_sha256 == effective_manifest.platform_sha256
+        || context
+            .platform_sha256_history
+            .contains(&target_binary_sha256)
+    {
+        anyhow::bail!("platform upgrade target is current or appears in platform history")
+    }
+    let (state, expected_head_sequence) = store.rebuild_full(context.initial_state())?;
+    if state.orders.values().any(|order| {
+        !matches!(
+            order.status,
+            OrderStatus::Filled | OrderStatus::Rejected | OrderStatus::Cancelled
+        )
+    }) {
+        anyhow::bail!("non-terminal core Paper order prevents a platform upgrade")
+    }
+    let local = state.snapshot()?;
+    let gateway = PaperExecutionGateway::open_existing(&config, run_id, local.clone())?;
+    if gateway.account_snapshot() != local {
+        anyhow::bail!("independent Paper account differs from the full ledger rebuild")
+    }
+    let outbox = ThsSimOutbox::open(outbox_path)?;
+    let outbox_status = outbox.status()?;
+    if outbox_status.source_database_instance_id != store.database_instance_id()?
+        || outbox_status.run_id != run_id
+        || outbox_status.cursor != expected_head_sequence
+        || outbox_status.discovered != 0
+        || outbox_status.eligible != 0
+        || outbox_status.submitting != 0
+        || outbox_status.ambiguous != 0
+        || outbox_status.cancel_requested != 0
+        || outbox_status.cancelling != 0
+        || outbox_status.cancel_ambiguous != 0
+        || outbox.staged_intents()?.iter().any(|intent| {
+            intent.state != StagedIntentState::Submitted
+                || intent.terminal_resolution != StagedTerminalResolution::Filled
+        })
+    {
+        anyhow::bail!("Tonghuashun outbox is not a fully reconciled frozen prefix")
+    }
+    if store.latest_sequence(run_id)? != expected_head_sequence {
+        anyhow::bail!("journal head changed during platform upgrade authorization")
+    }
+    let now = chrono::Utc::now().naive_utc();
+    let upgrade_id = platform_upgrade_id(
+        run_id,
+        &effective_manifest.platform_sha256,
+        &target_binary_sha256,
+        expected_head_sequence,
+        &certification_evidence_sha256,
+    );
+    let authorization = PlatformUpgradeAuthorized {
+        upgrade_id: upgrade_id.clone(),
+        from_platform_sha256: effective_manifest.platform_sha256.clone(),
+        to_platform_sha256: target_binary_sha256.clone(),
+        algorithm_contract_sha256: algorithm_contract_sha256(base_manifest)?,
+        config_content_sha256: context.config.content_sha256()?,
+        reason_code: reason_code.trim().to_owned(),
+        operator: operator.trim().to_owned(),
+        authorization_kind: PLATFORM_UPGRADE_AUTHORIZATION_KIND.to_owned(),
+        expected_head_sequence,
+        certification_profile_version: PLATFORM_UPGRADE_CERTIFICATION_PROFILE.to_owned(),
+        certification_evidence_sha256,
+        target_binary_sha256,
+        authorized_at: now,
+    };
+    let mut event = make_event(
+        &config,
+        &state,
+        EventType::PlatformUpgradeAuthorized,
+        now,
+        &format!("platform-upgrade:{upgrade_id}"),
+        format!("platform-upgrade-authorized:{upgrade_id}"),
+        serde_json::to_value(&authorization)?,
+    );
+    let mut projected = state;
+    let mut last_sequence = expected_head_sequence;
+    LedgerWriter::new(&mut store, &mut projected, &mut last_sequence)
+        .append_platform_upgrade(event.clone())?;
+    event.sequence_number = last_sequence;
+    let verified = crate::run_context::RunContext::load(&store, run_id)?
+        .context("authorized run identity disappeared")?;
+    if verified
+        .pending_platform_upgrade
+        .as_ref()
+        .is_none_or(|pending| pending.authorization != authorization)
+    {
+        anyhow::bail!("persisted platform authorization failed chain verification")
+    }
+    Ok(authorization)
+}
 
 pub struct GridAutomationService {
     pub config: Config,
@@ -279,15 +599,35 @@ impl GridAutomationService {
                 "runtime configuration differs from the run's audited configuration snapshot"
             ));
         }
-        let stored_manifest = store
-            .first_payload_by_type(&run_id, EventType::AlgorithmRegistered)?
-            .context(
-                "run lacks an audited algorithm manifest; legacy history is replay-compatible but read-only",
+        let mut run_context = crate::run_context::RunContext::load(&store, &run_id)?
+            .context("run lacks a durable run context")?;
+        if let Some(pending) = run_context.pending_platform_upgrade.clone() {
+            if !manifests_match_except_platform(
+                run_context
+                    .base_algorithm_manifest
+                    .as_ref()
+                    .context("platform upgrade lacks its base algorithm manifest")?,
+                &manifest,
+            ) || manifest.platform_sha256 != pending.authorization.to_platform_sha256
+            {
+                return Err(anyhow!(
+                    "pending platform upgrade can only be activated by its exact target binary"
+                ));
+            }
+            activate_authorized_platform_upgrade(
+                &config,
+                &mut store,
+                &run_context,
+                &manifest,
+                &run_id,
             )?;
+            run_context = crate::run_context::RunContext::load(&store, &run_id)?
+                .context("activated run identity disappeared")?;
+        }
+        let stored_manifest = run_context.algorithm_manifest.clone().context(
+            "run lacks an audited algorithm manifest; legacy history is replay-compatible but read-only",
+        )?;
         {
-            let stored_manifest: crate::decision::AlgorithmManifest =
-                serde_json::from_value(stored_manifest)
-                    .context("invalid algorithm manifest snapshot")?;
             let legacy_identity = stored_manifest.artifact_sha256.is_empty()
                 && stored_manifest.environment_sha256.is_empty();
             let identity_matches = if legacy_identity {
@@ -582,6 +922,7 @@ impl GridAutomationService {
             market_key.clone(),
             serde_json::to_value(bar)?,
         );
+        let market_event_id = market_event.event_id.clone();
         let market_duplicate = self.record(market_event)? == AppendOutcome::Duplicate;
         self.maybe_inject_fault(WorkflowFaultPoint::MarketReceived)?;
         if market_duplicate
@@ -606,6 +947,10 @@ impl GridAutomationService {
                 json!({"date": bar.timestamp.date().to_string()}),
             );
             self.record(day_event)?;
+        }
+
+        if self.state.mode == ServiceMode::Running && !decisions_committed {
+            self.maybe_initial_deployment(bar, &market_event_id)?;
         }
 
         if self.state.mode != ServiceMode::Running {
@@ -1505,6 +1850,116 @@ impl GridAutomationService {
             })?
     }
 
+    fn maybe_initial_deployment(
+        &mut self,
+        bar: &MarketBar,
+        source_market_event_id: &str,
+    ) -> Result<()> {
+        if self.state.initial_deployment_evaluation.is_some()
+            || !self
+                .config
+                .gate
+                .capital_inventory
+                .as_ref()
+                .is_some_and(|settings| settings.deploy_initial_balance)
+        {
+            return Ok(());
+        }
+        let settings = self
+            .config
+            .gate
+            .capital_inventory
+            .as_ref()
+            .context("initial deployment lacks capital-inventory settings")?;
+        let plan = canonical_initial_deployment_plan(&self.config, &self.state, bar.close)
+            .context("initial deployment plan is not representable")?;
+        let deployment_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!("{}:initial-deployment:v1", self.state.run_id).as_bytes(),
+        )
+        .to_string();
+        let source_evidence_sha256 = market_evidence_sha256(bar)?;
+        let outcome = if plan.selected_units > 0 {
+            InitialDeploymentOutcome::Authorized
+        } else {
+            InitialDeploymentOutcome::Blocked
+        };
+        let evaluation = InitialDeploymentEvaluation {
+            deployment_id: deployment_id.clone(),
+            policy_version: INITIAL_DEPLOYMENT_POLICY_VERSION.to_owned(),
+            source_market_event_id: source_market_event_id.to_owned(),
+            source_evidence_sha256: source_evidence_sha256.clone(),
+            symbol: bar.symbol.clone(),
+            market_time: bar.timestamp,
+            limit_price: bar.close,
+            pre_available_cash: self.state.cash.available,
+            pre_frozen_cash: self.state.cash.frozen,
+            pre_position: self.state.position.total,
+            pre_pending_buy_quantity: plan.pending_buy_quantity,
+            minimum_free_cash: settings.minimum_free_cash,
+            standard_quantity: self.config.standard_quantity,
+            maximum_units: plan.maximum_units,
+            selected_units: plan.selected_units,
+            quantity: plan.quantity,
+            canonical_reservation: plan.reservation,
+            projected_remaining_cash: plan.projected_remaining_cash,
+            outcome,
+            reason: if outcome == InitialDeploymentOutcome::Authorized {
+                "AUTHORIZED".to_owned()
+            } else {
+                "NO_AFFORDABLE_UNITS".to_owned()
+            },
+        };
+        let correlation = format!("initial-deployment:{deployment_id}");
+        let evaluation_event = self.event(
+            EventType::InitialDeploymentEvaluated,
+            bar.timestamp,
+            &correlation,
+            format!("initial-deployment-evaluated:{deployment_id}"),
+            serde_json::to_value(&evaluation)?,
+        );
+        if outcome == InitialDeploymentOutcome::Blocked {
+            let mut events = vec![evaluation_event];
+            self.record_batch(&mut events)?;
+            return Ok(());
+        }
+        let intent = OrderIntent {
+            intent_id: deployment_id.clone(),
+            origin: OrderIntentOrigin::InitialDeploymentV1 {
+                deployment_id: deployment_id.clone(),
+                source_market_event_id: source_market_event_id.to_owned(),
+                source_evidence_sha256,
+                policy_version: INITIAL_DEPLOYMENT_POLICY_VERSION.to_owned(),
+            },
+            right_id: String::new(),
+            grid_index: 0,
+            direction: Direction::Buy,
+            limit_price: bar.close,
+            quantity: plan.quantity,
+            budget: bar
+                .close
+                .checked_mul(Decimal::from(plan.quantity))
+                .context("NUMERIC_RANGE_VIOLATION: initial deployment budget overflow")?,
+            target_lot_ids: Vec::new(),
+            target_lot_allocations: Vec::new(),
+            profit_guard_version: String::new(),
+            profit_guard_policy: Some(ProfitGuardPolicy::from(&self.config)),
+            created_at: bar.timestamp,
+        };
+        let order = self.order_for_intent(&intent)?;
+        let intent_event = self.event(
+            EventType::OrderIntentCreated,
+            bar.timestamp,
+            &correlation,
+            format!("intent:{}", intent.intent_id),
+            serde_json::to_value(order)?,
+        );
+        let mut events = vec![evaluation_event, intent_event];
+        self.record_batch(&mut events)?;
+        self.maybe_inject_fault(WorkflowFaultPoint::IntentCommitted)?;
+        self.dispatch_intent(intent, bar.timestamp, &correlation)
+    }
+
     fn dispatch_intent(
         &mut self,
         intent: OrderIntent,
@@ -1543,7 +1998,7 @@ impl GridAutomationService {
                     json!({"order_id": order_id, "reason": reason}),
                 );
                 let mut events = vec![rejected];
-                if !intent.right_id.is_empty() {
+                if intent.origin.is_grid_right() {
                     let release_allocations = self.tranche_allocations(
                         &intent.right_id,
                         None,
@@ -1589,7 +2044,7 @@ impl GridAutomationService {
                     json!({"order_id": order_id, "reason": reason}),
                 );
                 let mut events = vec![cancelled];
-                if !intent.right_id.is_empty() {
+                if intent.origin.is_grid_right() {
                     let release_allocations = self.tranche_allocations(
                         &intent.right_id,
                         None,
@@ -1716,7 +2171,7 @@ impl GridAutomationService {
                         format!("lot-change:{}", report.fill_id),
                         json!({"fill_id": report.fill_id, "target_lots": intent.target_lot_ids}),
                     ));
-                    if !intent.right_id.is_empty() {
+                    if intent.origin.is_grid_right() {
                         let right = self
                             .state
                             .grid_rights
@@ -2574,12 +3029,13 @@ impl GridAutomationService {
     ) -> Result<FundsInventoryContextV1> {
         const SHORT_WINDOW: usize = 5;
         const LONG_WINDOW: usize = 20;
-        let settings = self
+        let _settings = self
             .config
             .gate
             .capital_inventory
             .as_ref()
             .context("decision contract v4 requires capital_inventory settings")?;
+        let ongoing_policy = effective_ongoing_resource_policy(&self.config, &self.state)?;
         let history = self
             .store
             .recent_processed_market_bars(&self.state.run_id, LONG_WINDOW)?;
@@ -2713,7 +3169,7 @@ impl GridAutomationService {
             anyhow::bail!("cash account has negative spendable balance")
         }
         let spendable_cash = free_cash
-            .checked_sub(settings.minimum_free_cash)
+            .checked_sub(ongoing_policy.minimum_free_cash)
             .unwrap_or(Decimal::ZERO)
             .max(Decimal::ZERO);
         let pending_buy_quantity = self
@@ -2747,8 +3203,8 @@ impl GridAutomationService {
             .max_position
             .checked_sub(position_exposure_quantity)
             .context("NUMERIC_RANGE_VIOLATION: position headroom underflow")?;
-        let target_headroom = settings
-            .target_position
+        let target_headroom = ongoing_policy
+            .effective_max_position
             .checked_sub(position_exposure_quantity)
             .context("NUMERIC_RANGE_VIOLATION: target position headroom underflow")?
             .max(0);
@@ -2874,7 +3330,7 @@ impl GridAutomationService {
             market_signal_passed,
             cash_available: self.state.cash.available,
             cash_frozen: self.state.cash.frozen,
-            minimum_free_cash: settings.minimum_free_cash,
+            minimum_free_cash: ongoing_policy.minimum_free_cash,
             spendable_cash,
             adverse_buy_price,
             cash_affordable_units,
@@ -2886,7 +3342,7 @@ impl GridAutomationService {
             position_frozen_sell: self.state.position.frozen_sell,
             max_position: self.config.max_position,
             min_base_position: self.config.min_base_position,
-            target_position: settings.target_position,
+            target_position: ongoing_policy.effective_max_position,
             position_headroom_units,
             target_headroom_units,
             sellable_inventory_units,
@@ -2959,6 +3415,7 @@ impl GridAutomationService {
             .collect();
         OrderIntent {
             intent_id,
+            origin: OrderIntentOrigin::GridRight,
             right_id: right_id.to_owned(),
             grid_index: index,
             direction,
@@ -3185,6 +3642,76 @@ impl GridAutomationService {
     }
 }
 
+fn activate_authorized_platform_upgrade(
+    config: &Config,
+    store: &mut SqliteStore,
+    context: &crate::run_context::RunContext,
+    runtime_manifest: &crate::decision::AlgorithmManifest,
+    run_id: &str,
+) -> Result<()> {
+    let pending = context
+        .pending_platform_upgrade
+        .as_ref()
+        .context("platform activation lacks its authorization")?;
+    if store.pending_web_command(run_id)?.is_some()
+        || store.web_playback_control(run_id)?.active
+        || store.first_incomplete_market_sequence(run_id)?.is_some()
+    {
+        anyhow::bail!("pending work prevents platform upgrade activation")
+    }
+    let (state, validated_through_sequence) = store.rebuild_full(context.initial_state())?;
+    if validated_through_sequence != pending.sequence_number
+        || store.latest_sequence(run_id)? != pending.sequence_number
+    {
+        anyhow::bail!("platform authorization is not the frozen journal head")
+    }
+    if state.orders.values().any(|order| {
+        !matches!(
+            order.status,
+            OrderStatus::Filled | OrderStatus::Rejected | OrderStatus::Cancelled
+        )
+    }) {
+        anyhow::bail!("non-terminal core Paper order prevents platform activation")
+    }
+    let local = state.snapshot()?;
+    let gateway = PaperExecutionGateway::open_existing(config, run_id, local.clone())?;
+    let paper = gateway.account_snapshot();
+    if paper != local {
+        anyhow::bail!("independent Paper account differs from the full ledger rebuild")
+    }
+    let now = chrono::Utc::now().naive_utc();
+    let activation = PlatformUpgradeActivated {
+        upgrade_id: pending.authorization.upgrade_id.clone(),
+        authorization_event_id: pending.event_id.clone(),
+        authorization_sequence: pending.sequence_number,
+        from_platform_sha256: pending.authorization.from_platform_sha256.clone(),
+        to_platform_sha256: pending.authorization.to_platform_sha256.clone(),
+        observed_platform_sha256: runtime_manifest.platform_sha256.clone(),
+        validated_through_sequence,
+        full_rebuild_state_sha256: state_sha256(&state)?,
+        paper_snapshot_sha256: sha256_bytes(&serde_json::to_vec(&paper)?),
+        paper_reconciled: true,
+        activated_at: now,
+    };
+    let mut event = make_event(
+        config,
+        &state,
+        EventType::PlatformUpgradeActivated,
+        now,
+        &format!("platform-upgrade:{}", activation.upgrade_id),
+        format!("platform-upgrade-activated:{}", activation.upgrade_id),
+        serde_json::to_value(&activation)?,
+    );
+    event.causation_id = Some(pending.event_id.clone());
+    let mut projected = state;
+    let mut last_sequence = validated_through_sequence;
+    LedgerWriter::new(store, &mut projected, &mut last_sequence).append_platform_upgrade(event)?;
+    if last_sequence != pending.sequence_number + 1 {
+        anyhow::bail!("platform activation sequence is not adjacent to authorization")
+    }
+    Ok(())
+}
+
 fn make_event(
     config: &Config,
     state: &StrategyState,
@@ -3317,11 +3844,12 @@ pub(crate) fn validate_funds_inventory_evidence(
         .as_ref()
         .context("v4 decision lacks funds/inventory evidence")?;
     evidence.validate_canonical(context)?;
-    let settings = config
+    let _settings = config
         .gate
         .capital_inventory
         .as_ref()
         .context("audited v4 configuration lacks capital_inventory")?;
+    let ongoing_policy = effective_ongoing_resource_policy(config, state)?;
     let history = store.recent_processed_market_bars(&state.run_id, LONG_WINDOW)?;
     let ids = history
         .iter()
@@ -3406,7 +3934,7 @@ pub(crate) fn validate_funds_inventory_evidence(
         anyhow::bail!("audited cash account has negative spendable balance")
     }
     let spendable = free_cash
-        .checked_sub(settings.minimum_free_cash)
+        .checked_sub(ongoing_policy.minimum_free_cash)
         .unwrap_or(Decimal::ZERO)
         .max(Decimal::ZERO);
     let pending_buy_quantity = state
@@ -3439,8 +3967,8 @@ pub(crate) fn validate_funds_inventory_evidence(
         .context("NUMERIC_RANGE_VIOLATION: audited position headroom overflow")?
         .max(0)
         / config.standard_quantity;
-    let target_headroom = settings
-        .target_position
+    let target_headroom = ongoing_policy
+        .effective_max_position
         .checked_sub(position_exposure)
         .context("NUMERIC_RANGE_VIOLATION: audited target headroom overflow")?
         .max(0)
@@ -3498,7 +4026,7 @@ pub(crate) fn validate_funds_inventory_evidence(
         || evidence.range_scale_20 != range_scale_20
         || evidence.cash_available != state.cash.available
         || evidence.cash_frozen != state.cash.frozen
-        || evidence.minimum_free_cash != settings.minimum_free_cash
+        || evidence.minimum_free_cash != ongoing_policy.minimum_free_cash
         || evidence.spendable_cash != spendable
         || evidence.adverse_buy_price != expected_adverse_price
         || evidence.cash_affordable_units != cash_units
@@ -3510,7 +4038,7 @@ pub(crate) fn validate_funds_inventory_evidence(
         || evidence.position_frozen_sell != state.position.frozen_sell
         || evidence.max_position != config.max_position
         || evidence.min_base_position != config.min_base_position
-        || evidence.target_position != settings.target_position
+        || evidence.target_position != ongoing_policy.effective_max_position
         || evidence.position_headroom_units != position_headroom
         || evidence.target_headroom_units != target_headroom
         || evidence.sellable_inventory_units != sellable_units

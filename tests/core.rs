@@ -26,8 +26,8 @@ use gridedge_t::{
     },
     rights::{sell_tranches_to_mint, RightsGateCoordinator},
     risk::{
-        canonical_approval, canonical_approved_quantity, estimated_buy_reservation,
-        DefaultRiskChecker, RiskChecker,
+        affordable_buy_units, canonical_approval, canonical_approved_quantity,
+        estimated_buy_reservation, DefaultRiskChecker, RiskChecker,
     },
     service::{GridAutomationService, WorkflowFaultPoint},
 };
@@ -1624,6 +1624,7 @@ fn priced_lot(id: &str, grid_index: i32, quantity: i64, cost: Decimal) -> Tradin
         lot_id: id.to_owned(),
         source_order_id: format!("source-{id}"),
         grid_index,
+        opening_allocation: false,
         opened_on: NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(),
         original_quantity: quantity,
         remaining_quantity: quantity,
@@ -2010,6 +2011,7 @@ fn a_deeper_sell_excursion_mints_a_source_for_every_unowned_matching_lot() {
 fn sample_intent() -> OrderIntent {
     OrderIntent {
         intent_id: "intent-1".to_owned(),
+        origin: gridedge_t::domain::OrderIntentOrigin::GridRight,
         right_id: String::new(),
         grid_index: -1,
         direction: Direction::Buy,
@@ -2105,6 +2107,7 @@ fn boundary_buy_intent(config: &Config, intent_id: &str) -> OrderIntent {
     let limit_price = d("10");
     OrderIntent {
         intent_id: intent_id.to_owned(),
+        origin: gridedge_t::domain::OrderIntentOrigin::GridRight,
         right_id: "boundary-buy-right".into(),
         grid_index: -1,
         direction: Direction::Buy,
@@ -4605,6 +4608,13 @@ fn platform_approval_is_recomputed_in_complete_standard_quantity_units() {
         canonical_approved_quantity(&config, &jointly_supported, &sell_right, 1_500).unwrap(),
         1_500
     );
+    let mut cash_rich_sell = jointly_supported.clone();
+    cash_rich_sell.cash.available = d("1000000");
+    assert_eq!(
+        canonical_approved_quantity(&config, &cash_rich_sell, &sell_right, 1_500).unwrap(),
+        canonical_approved_quantity(&config, &jointly_supported, &sell_right, 1_500).unwrap(),
+        "SELL approval depends on eligible no-loss inventory, never cash"
+    );
     let joined_approval =
         canonical_approval(&config, &jointly_supported, &sell_right, 1_500).unwrap();
     assert_eq!(joined_approval.quantity, 1_500);
@@ -4676,6 +4686,43 @@ fn platform_approval_is_recomputed_in_complete_standard_quantity_units() {
         canonical_approval(&config, &non_closed_state, &non_closed_right, 3_000).unwrap();
     assert_eq!(approval.quantity, 0);
     assert!(approval.sell_allocations.is_empty());
+}
+
+#[test]
+fn ongoing_buy_units_use_all_free_cash_while_the_opening_floor_remains_a_report() {
+    let config = Config::load("configs/ths_002256_sim.yaml").unwrap();
+    let one_unit = estimated_buy_reservation(&config, d("3.36"), config.standard_quantity).unwrap();
+    assert_eq!(one_unit, d("18491.05"));
+    assert_eq!(
+        affordable_buy_units(&config, d("3.36"), one_unit - d("0.01"), 10).unwrap(),
+        0
+    );
+    assert_eq!(
+        affordable_buy_units(&config, d("3.36"), one_unit, 10).unwrap(),
+        1
+    );
+
+    let opening_quantity = 5 * config.standard_quantity;
+    let opening_reservation =
+        estimated_buy_reservation(&config, d("3.51"), opening_quantity).unwrap();
+    let post_opening_cash = config.initial_cash - opening_reservation;
+    assert_eq!(post_opening_cash, d("103418.53"));
+    assert_eq!(
+        affordable_buy_units(&config, d("3.36"), post_opening_cash, 10).unwrap(),
+        5
+    );
+    assert!(
+        config
+            .gate
+            .capital_inventory
+            .as_ref()
+            .unwrap()
+            .minimum_free_cash
+            > post_opening_cash
+                - estimated_buy_reservation(&config, d("3.36"), 5 * config.standard_quantity)
+                    .unwrap(),
+        "the configured opening floor remains reportable but does not reduce ongoing cash"
+    );
 }
 
 fn minimum_commission_buy_config(temp: &TempDir, initial_cash: Decimal) -> Config {
@@ -4829,7 +4876,7 @@ fn buy_cash_boundary_drives_exact_b_i_and_partial_fills_rebuild_without_double_f
         event.event_type == EventType::GridRightReserved && event.schema_version == 4
     }));
     assert!(events.iter().any(|event| {
-        event.event_type == EventType::OrderIntentCreated && event.schema_version == 6
+        event.event_type == EventType::OrderIntentCreated && event.schema_version == 7
     }));
     let fills = events
         .iter()
@@ -4969,8 +5016,25 @@ fn buy_minimum_commission_replays_complete_legacy_and_current_prefixes_by_schema
         event.event_type == EventType::GridRightReserved && event.schema_version == 4
     }));
     assert!(current_prefix.iter().any(|event| {
-        event.event_type == EventType::OrderIntentCreated && event.schema_version == 6
+        event.event_type == EventType::OrderIntentCreated && event.schema_version == 7
     }));
+
+    let mut schema6_replay_prefix = current_prefix.clone();
+    schema6_replay_prefix
+        .iter_mut()
+        .find(|event| event.event_type == EventType::OrderIntentCreated)
+        .unwrap()
+        .schema_version = 6;
+    let mut schema6_replay = pre_crossing.clone();
+    for event in &schema6_replay_prefix {
+        schema6_replay.apply_event(event).unwrap();
+    }
+    schema6_replay.validate_invariants().unwrap();
+    assert_eq!(schema6_replay.orders.len(), 1);
+    assert!(schema6_replay
+        .orders
+        .values()
+        .all(|order| order.intent.origin.is_grid_right()));
 
     let mut legacy_blocked_prefix = current_prefix.clone();
     legacy_blocked_prefix.retain(|event| {
@@ -6923,6 +6987,7 @@ fn paper_acceptance_and_projection_share_the_exact_fee_allocation_function() {
     ];
     let intent = OrderIntent {
         intent_id: "shared-fee-intent".into(),
+        origin: gridedge_t::domain::OrderIntentOrigin::GridRight,
         right_id: "right".into(),
         grid_index: 1,
         direction: Direction::Sell,
@@ -8125,6 +8190,7 @@ fn schema_v2_buy_without_embedded_fee_policy_remains_replayable() {
     );
     let intent = OrderIntent {
         intent_id: "v2-buy-intent".into(),
+        origin: gridedge_t::domain::OrderIntentOrigin::GridRight,
         right_id: String::new(),
         grid_index: -1,
         direction: Direction::Buy,
@@ -8373,6 +8439,7 @@ fn v1_loss_making_sell_is_replayed_as_history_but_new_fills_remain_guarded() {
 
     let buy_intent = OrderIntent {
         intent_id: "legacy-buy-intent".into(),
+        origin: gridedge_t::domain::OrderIntentOrigin::GridRight,
         right_id: String::new(),
         grid_index: -1,
         direction: Direction::Buy,
@@ -8443,6 +8510,7 @@ fn v1_loss_making_sell_is_replayed_as_history_but_new_fills_remain_guarded() {
 
     let sell_intent = OrderIntent {
         intent_id: "legacy-sell-intent".into(),
+        origin: gridedge_t::domain::OrderIntentOrigin::GridRight,
         right_id: String::new(),
         grid_index: 1,
         direction: Direction::Sell,

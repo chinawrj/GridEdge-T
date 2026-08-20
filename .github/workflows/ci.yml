@@ -55,6 +55,12 @@ jobs:
       - name: Rust tests
         run: cargo test --locked --all-targets --all-features
 
+      - name: Market data identity and durable shadow tests
+        run: >-
+          python3 -m unittest -v
+          deploy/market_data/ingestor/test_market_ingestor.py
+          deploy/market_data/publisher/test_shadow_publisher.py
+
       - name: Build the release-facing CLI
         run: cargo build --locked --bin gridedge
 

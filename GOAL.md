@@ -50,7 +50,9 @@ BUY 的现金批准与预留也必须使用同一份订单级累计费用函数�
 收取“累计应收佣金减已收佣金”的增量，绝不能按预计或实际 fill 数量重复预留、重复收费。
 平台批准、订单预留、current-schema 账本复算和恢复必须共享这一口径；恰好够支付一次最低
 佣金的现金必须批准，少一分钱必须整份阻断，不能由联合伪造 `B/I`、reservation 与 intent 绕过。
-现行 Blocked/Reserved 处置使用 schema 4，OrderIntent 使用 schema 6；历史 schema 3 处置与
+现行 Blocked/Reserved 处置使用 schema 4，OrderIntent 使用 schema 7；schema 7 必须以 typed
+origin 区分普通 GridRight 与一次性 InitialDeployment，并把初始部署绑定到同批审计结果及尚未
+Processed 的精确行情 event/hash。历史 schema 6 保留单最低佣金语义只读重放，schema 3 处置与
 schema 5 intent 必须按当时“双最低佣金”的事实只读重放，不能用新口径改写，也不能继续新写。
 
 Decision Contract v4 使用 `RESOURCE_AWARE_WHOLE_Q_V1`，把决策前已知的资金/库存不足与算法
@@ -169,7 +171,98 @@ block 的分类股数与 lot 来源。自动播放、刷新、服务重启和多
 - 账本是唯一事实源；任何派生状态都必须能够从账本重建和对账。
 - 当前平台只用于研究、回测和 Paper 交易，不接入实盘经纪商。
 
+macOS 同花顺连接只允许控制客户端内明确标记为“模拟练习”的 Paper 账户。页面上仅存在“模拟”
+标签并不足以证明安全：每次读取或写入前必须同时锁定应用 bundle、已审版本、唯一模拟账户标志、
+委托控件结构，并确认银证转账、券商退出和账户设置等实盘控件均不存在。任一标志、版本或布局
+变化都必须 fail closed。只读 probe 和 dry-run 不得填写表单或点击提交；后续执行层只能消费已经
+持久化的 GridEdge 订单意图，并必须具有本地 outbox、字段回读、单笔上限、委托结果核对与重启
+幂等，不能把 GUI 超时当成未提交后盲目重发。实盘标签或账户永远不在允许范围内。
+外部模拟执行还必须使用当前市场事实：源 `ORDER_INTENT_CREATED` 的 event_time 只能在明确的短
+时限内使用，未来时间和十分钟以上的历史事件永远不能进入 UI，三年 replay 即使格式完全合法也
+只能被记录或审计，不能成为当天委托。
+同花顺页面行情采样只能在已审模拟窗口内重新写入证券代码以触发报价刷新；不得填写价格/数量或
+点击订单动作。每个样本必须保存 UI 证据读取前后的本地时间、精确价格和 UI 证据哈希；证据读取
+跨越五分钟桶或交易时段边界时整条样本拒绝，不能把边界后的价格倒记入前一根。样本只能在 bundle、
+版本、模拟账户标志和规范哈希全部复核后进入聚合，再以已完成的交易时段桶
+聚合 OHLC；不得编造成交量、午休 K 线或缺失桶。陈旧判定必须依据每次完整安全取证的
+`observed_at` 严格推进，而不是要求价格发生变化：持续数分钟同价但证据时间推进仍是新行情；重复、
+倒退或不推进的旧证据即使价格变化也必须停机，并从 append-only 历史恢复最后已接受证据边界，失败
+重启不能重新获得宽限期。quote/bar 日志中的时间倒退、重复或同时间内容冲突必须在服务/下单前
+fail closed。首日部署以 `minimum_free_cash` 作为一次性硬边界，至少保留
+一半初始模拟现金；初始部署完成并追加唯一、完整绑定平台/初始部署/Paper/outbox 前缀的
+`ONGOING_RESOURCE_POLICY_ACTIVATED` 后，`minimum_free_cash` 只作为报告指标，不再阻断持续 BUY。
+持续 BUY 使用全部可用现金，只有足以覆盖一整份 `Q` 及费用才获批；持续 SELL 只由合格可卖库存决定，
+不受现金余额影响。`max_position`/target 只保留数值安全上限，不得成为盈利后持仓增长的业务上限。
+正式 002256 模拟运行在首个有效 3.51 元行情上只允许一次账本化初始部署：20 万元初始现金、10 万元
+现金底线和 `Q=5500` 精确选择 `5Q=27500` 股，机械上即使开放 6 份也不得越过现金底线。该行为必须
+先写 `INITIAL_DEPLOYMENT_EVALUATED`，再以 schema-7 typed origin 形成唯一 intent，经 Paper
+成交后才可由 outbox 派生 UI 动作；拒单必须零 UI，部分成交必须守恒，重启不得重做。初始持仓 lot
+不得污染 grid rights 或 `historically_executed_levels`，当日受 T+1 阻断，下一交易日才可成为 SELL
+tranche 来源。
+连续模拟执行必须以独立 durable outbox 的 cursor 追随源账本：只有配对的当前
+`ORDER_INTENT_CREATED → ORDER_SUBMITTED` 可触发一次模拟提交，只有同一 order 的当前
+`ORDER_CANCEL_REQUESTED` 可触发一次精确合同撤单。worker 重启只能从 SUBMITTING/CANCELLING
+继续核对，不能再次点击；任何 AMBIGUOUS 都必须阻断后续自动 UI 动作，直到人工对账。
+委托页中合同行消失不能被解释为撤单成功。若撤单已进入 AMBIGUOUS，只有读取已审模拟
+账户的成交页，以唯一成交编号按合同号精确聚合，并证明 symbol/方向一致、累计数量恰好等于
+该 durable intent 时，才可以把该合同以
+独立的 `FILLED` 远程终态收口。该事实不得伪记为 `CANCELLED`，不得再点击撤单；相同证据重启
+必须幂等。部分成交、超量、跨合同混合、重复成交编号或无法表示的价格仍必须保持未解决并 fail closed。
+已完整成交但价格劣于 Paper 保守加权价时，客观远端事实仍记为 `FILLED`、永不再撤，但 live permit
+必须继续阻断；两个状态不得混为一个。上述恢复和阻断全程保持零资金 UI 动作。
+委托页的“成交价格”不可当作精确加权均价：它只需为严格正数并落在该合同成交明细的
+`[min(price), max(price)]` 内。精确成交数量、成交额和加权均价只能由成交页每个唯一 fill 求和。
+跨交易日使用“今天”筛选时，昨日合同可以不再出现在委托表，但该缺席只对已经持久化为独立
+`FILLED` 终态、且完整规范成交证据仍能与源账 Paper modeled fill 对账的合同成立；缺少、损坏或
+篡改证据，以及任何 SUBMITTED/CANCELLING/AMBIGUOUS 等非终态合同仍必须阻断。若昨日合同仍出现，
+仍须逐字段匹配 durable intent。跨日缺席只是只读审计规则，绝不能触发重复提交、撤单或修改源账。
+同花顺 5.3.2 委托表允许且只允许两个受审列布局：原十二列，或在“合同编号”与“委托属性”之间
+增加只读“申报编号”的十三列。所有列都必须先物化并按精确表头名映射；申报编号必须保留用于审计，
+但订单提交、远端成交对账与精确撤单的唯一身份始终是合同编号。缺失、重复、乱序关键列或出现任何
+其他未知列都必须在资金动作前 fail closed，不能按固定 ordinal 把申报编号误作合同编号。
+订单只读探测定位该 12/13 列表格时，委托 tab 按钮、筛选标签 static texts、checkboxes、scroll area、
+逐层 UI element、table/group/header、row 和 cell 集合都必须先 `get` 并物化为冻结对象列表后才能遍历，
+禁止让 AppleScript 将循环重新解析为活集合的
+`item N of every ...`。动态树导致的 `-1719/-1728` 只能使本次探测安全失败或整轮重试，其他错误必须
+原编号抛出；任一失败都不得产生提交、确认或撤单动作。
+点击唯一“委托”tab 本身会重建 AX 树，因此点击前审出的 `targetWindow` 在 delay 后必须作废；读取筛选器
+或表格前必须重新从 unfiltered windows 建立冻结快照，再次证明唯一模拟 marker、标准窗口仍存活且无
+账户设置/转账/退出等实盘负证据。该重验证完成前不得输出任何部分订单证据。
+最终通用 UI probe 的每次窗口快照也必须原子包含恰好三个可读订单字段；tab 重建期间暂时观测到 0、1
+或 2 个字段时，必须在 AppleScript 内丢弃整轮证据并进入同一有界重试，不能先返回部分 receipt 再由
+Rust 解析失败。只有完整一轮才能发布 bundle/version/marker/controls/fields，未知 AX 错误仍须原编号抛出。
+订单探测的原子边界还必须覆盖 tab 后窗口重取、筛选器、table/group/header、rows/cells 直到完整序列化；
+仅重试窗口列表而让后续冻结 descendant 在重建期间失效仍不够。该整段任何 `-1719/-1728` 都必须丢弃
+attempt-local 输出并从 unfiltered windows 重来，不能发布半张委托表；其他错误继续原编号抛出。
+连续部署在处理每根新行情前，必须先拒绝未知开放合同、完成 durable outbox 对账，并证明所有已绑定
+合同已达到规范的“全部成交”或“全部撤单”终态；只有该严格审计产生的不可伪造 permit 才能进入
+`process_bar`。这只是暂停后续市场处理，不能把远端未成交解释成算法 Defer。上午和下午最后一根可执行
+五分钟 bar 分别在 11:25 和 14:55 结算，给新委托保留完整五分钟成交窗口；午休和收盘后不得产生新的
+行情驱动 UI 点击。
+当前同花顺模拟部署是“影子执行”：核心 Paper 仍以不利滑点形成保守事实，但远端合同必须完整成交
+`Q`，且实际成交价不得劣于核心逐 fill 加权均价（BUY 不得更高，SELL 不得更低），否则不能取得
+下一根 bar 的 permit。远端更优成交不会反写或美化核心收益。同花顺委托表无法证明实际费用，因此
+该模式必须继续使用核心 Paper 的保守费用模型；10 万元只是一致展示的报告指标，不是持续交易硬门禁，
+且绝不能扩展为实盘；未来实盘阶段必须让经纪端实际 fill/fee 直接
+进入 Ledger，不能继续使用影子 Paper fill。
+任何模拟提交都必须在最终点击的同一 AppleScript 内再次验证唯一模拟窗口、已审版本、
+无实盘控件和三个字段回读，并且只能点击一次。输入框识别只能依据几何坐标，不能依赖 macOS
+可访问性集合的枚举顺序或对惰性集合直接取 `item 3`。点击后必须以提交前合同号集合为基线，
+仅接受唯一新增且方向、代码、价格、数量完全相同的合同。任何二次确认或撤单都必须重读并精确
+绑定该合同号；不得按表格行号、当前选中行或“最新一笔”撤单。
+
 既有运行的初始现金、总持仓、可卖持仓、symbol、anchor、配置版本、算法身份和估值/费用策略必须由账本中唯一且有序的 `RUN_STARTED → CONFIG_SNAPSHOTTED → ALGORITHM_REGISTERED` bootstrap 确定。CONFIG 必须保留可复核的规范内容哈希，算法 artifact/environment/platform 必须保留规范小写 SHA-256。当前配置文件只负责定位数据库，不能作为恢复种子覆盖旧运行事实。Web 快照、原生页面、CLI 只读查询、完整重放、snapshot 恢复和未完成 bar 的前缀重建都必须使用同一冻结运行上下文；即使没有 snapshot、snapshot 被删或损坏、或当前配置中的初始账户/symbol/anchor 已漂移，读结果仍必须保持账本事实。任何新 STEP/PLAY/FINISH 写入则必须在命令 claim 前拒绝运行身份漂移。bootstrap 任一事实缺失、乱序、不一致或被篡改时立即 fail closed，绝不能用合法 snapshot 或调用方当前配置“修复”。
+
+承载算法的 Rust 平台二进制升级不能改写 `ALGORITHM_REGISTERED`。离线授权必须先验证目标二进制、
+认证报告、冻结配置/算法合同，以及绑定同一 source/run 且 cursor 已到 journal head 的模拟 outbox；outbox
+不得含未决状态，所有 staged intent 都必须已有 `SUBMITTED + FILLED` 远端终态。通过后只追加唯一
+`PLATFORM_UPGRADE_AUTHORIZED`，其中 `from` 必须等于当前有效平台、`to` 必须是未使用的新 SHA。
+目标平台只能在完整日志重建与 Paper 对账逐字一致后，紧邻授权追加唯一
+`PLATFORM_UPGRADE_ACTIVATED`；授权与激活之间禁止任何业务事实。有效平台身份由这条 append-only 链
+推导，Web durable command identity、CLI 和恢复均使用该 effective manifest，而不是初始 manifest 或
+当前文件。无授权新平台、授权后的旧平台、非 platform manifest 漂移、重复 pending、分叉、降级、
+认证证据或目标 SHA 篡改都必须在任何业务写入前拒绝。授权后进程退出不丢失许可；目标平台重启只可
+幂等补同一激活，不得重复 opening deployment、Paper fill、outbox UI 动作或改变现金/持仓/业务状态哈希。
 
 Web 的 liveness 与 readiness 必须分离：`/health` 只证明进程存活，不能代表数据库可读或可写。核心只能在数据库租约、一次性迁移、当前 schema、不可变数据库实例 UUID 与关键业务读取全部成功后对外 ready；启动后必须同时绑定文件和库内实例身份，运行中数据库丢失、替换、原位覆写或 schema 异常会永久撤销该进程的 readiness，所有业务读写返回不可用且不得创建或迁移替代账本。恢复只能显式重启。Launcher、BFF、浏览器和 CI 必须同时通过 `/ready` 与带内部令牌的业务读取，SIGINT/SIGTERM 都必须干净停止播放 worker 并释放租约。
 
@@ -190,6 +283,32 @@ FINISH 的业务完成判据必须同时包含目标范围内每根行情的 `RE
 页面收益必须把“盯市”和“逐 lot 保守退出”明确分开，不能用一个含糊的“未实现收益”替代。盯市未实现收益按最新已完整处理的价格减每个策略 lot 的未摊销买入成本计算，不扣尚未发生的退出成本；逐 lot 保守退出估值使用账本冻结的保本策略，对每个剩余 lot 独立施加不利滑点、最低卖出佣金和印花税，允许如实显示负数，且不因 T+1、冻结或当前不可卖而删去该 lot。该估值不代表当前可成交或可卖。两种总收益都必须分别等于已实现收益加各自未实现收益；逐 lot 保守退出调整等于保守退出未实现减盯市未实现。没有最新已处理价格、存在未知成本 lot，或缺少账本冻结估值策略时，相应值必须明确显示不可用，绝不能默认为零。若已实现与未实现分量各自可表示、但二者之和超出 Decimal 数值域，总收益字段同样必须明确为不可用并保留两个可审计分量，不得 panic、回绕、截断或伪造总值。所有字段只能来自已处理账本前缀，并在热缓存、重启冷恢复和完整日志重建后保持一致。
 
 ## 6. 开发验收原则
+
+## 5.1 独立行情数据面
+
+行情采集、发布与长期存储必须和交易执行权限分离。群晖行情节点只允许承担经过 TLS 与账号鉴权的
+MQTT 5 接入、原始事件持久化、精确重投去重和身份冲突留痕；不得获得同花顺 UI、交易账本、
+订单 outbox 或任何下单/撤单能力。Mac 旁路发布器只能读取已经落盘并通过现有身份检查的行情
+JSONL，自身使用 durable source sequence 与发送 outbox；网络失败或 ACK 丢失只能导致原始字节
+重投，不能改变交易工作流。
+
+行情公共模型必须按 `venue + symbol + source_id + source_instance_id + source_sequence` 保存来源事实，
+同一证券、同一时刻来自网页逐笔、同花顺页面和未来商业数据源的记录可以并存，绝不能按证券代码
+互相覆盖。全局 `event_id` 和单来源 `(source_id, source_instance_id, source_sequence)` 均是唯一边界：
+原字节重投记为 duplicate，不同内容复用身份记为 conflict，非法 schema/topic/content-type 记为
+rejection。事件时间、接收时间和来源序号在 wire 上都是 u64；时间单位固定为 Unix 微秒，数据库须
+完整保存 u64 数值域。
+
+`TRADE_TICK` 表示网页逐笔成交表中的真实单条成交；三秒采样只是一种采集节奏，不能把三秒内的
+最新价误写成逐笔成交。只读最新价使用 `QUOTE_SNAPSHOT`；盘口使用 `BOOK_SNAPSHOT/BOOK_DELTA`；
+K 线使用 `BAR`。公共行情事件只保存来源、证券、时间、载荷与证据哈希，`account_marker` 等交易
+页面安全控件不是行情事实，只允许作为 Mac 本地准入检查，禁止传播到公共行情模型。
+
+行情消息使用 MQTT 5 QoS 1、非 retained 数据事件及显式 `application/json` content type。首版 codec
+是 canonical JSON，但数据库必须同时保留原始字节与 payload format，以便未来增加 Protobuf 而不
+破坏来源身份和关系索引。数据库不得直接暴露到局域网；匿名 MQTT、明文 1883 和越权 topic 发布
+均必须拒绝。容器、数据库与发布器重启后，唯一事件数、重复投递数、冲突/拒绝记录和 source cursor
+必须保持一致。
 
 所有产品文案、状态模型、接口、图形和测试都必须符合本文件。若实现与本文件冲突，以本文件为准，并先补充机器可执行案例，再修改代码。
 

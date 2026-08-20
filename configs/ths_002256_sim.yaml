@@ -1,0 +1,46 @@
+symbol: "002256.SZ"
+anchor_price: "3.55"
+grid_ratio: "0.015"
+trade_levels: 5
+boundary_levels: 6
+standard_budget: "0"
+# Five lower grid levels cover at most 27,500 shares. At the deployment
+# anchor this is about ¥97,625 before fees, just below the first-day budget.
+standard_quantity: 5500
+initial_cash: "200000.00"
+initial_position: 0
+initial_sellable: 0
+# Numeric envelope only; the strategy has no business position ceiling.
+max_position: 1000000000000
+min_base_position: 0
+lot_size: 100
+price_scale: 3
+hysteresis_ratio: "0.20"
+commission_rate: "0.0003"
+minimum_commission: "5.00"
+sell_tax_rate: "0.001"
+slippage_rate: "0.0001"
+gate:
+  kind: resource_aware
+  probability: "1"
+  alpha: "1"
+  failure_mode: safe
+  timeout_ms: 100
+  capital_inventory:
+    # First-day hard safety boundary: at least half of the initial simulated
+    # cash remains free. Profits above the floor may fund later positions.
+    minimum_free_cash: "100000.00"
+    # One durable opening allocation balances stock value against remaining
+    # cash, capped at trade_levels whole units. It never repeats after restart.
+    deploy_initial_balance: true
+    # Equal to the numeric envelope, therefore not a business position cap.
+    target_position: 1000000000000
+paper:
+  reject_probability_bps: 0
+  partial_fill_bps: 0
+  latency_ms: 0
+  seed: 20260818
+  hold_open_probability_bps: 0
+ambiguity_policy: conservative
+database: "runtime/ths/002256-grid.db"
+config_version: "v2-ths-002256-sim-half-cash-grid-1p5"

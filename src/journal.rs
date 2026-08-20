@@ -306,7 +306,7 @@ impl SqliteStore {
         Self::from_connection(conn)
     }
 
-    pub(crate) fn open_existing_read_only(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn open_existing_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -331,7 +331,7 @@ impl SqliteStore {
         })
     }
 
-    pub(crate) fn verify_current_schema(&self) -> Result<()> {
+    pub fn verify_current_schema(&self) -> Result<()> {
         const CURRENT_SCHEMA_VERSION: i64 = 13;
         let (minimum, maximum, count): (i64, i64, i64) = self
             .conn
@@ -763,7 +763,7 @@ impl SqliteStore {
         .collect()
     }
 
-    pub(crate) fn latest_sequence(&self, run_id: &str) -> Result<i64> {
+    pub fn latest_sequence(&self, run_id: &str) -> Result<i64> {
         self.conn
             .query_row(
                 "SELECT COALESCE(MAX(sequence_number),0) FROM events WHERE run_id=?1",
@@ -771,6 +771,33 @@ impl SqliteStore {
                 |row| row.get(0),
             )
             .context("failed to read the current journal sequence")
+    }
+
+    pub(crate) fn platform_upgrade_events(&self, run_id: &str) -> Result<Vec<EventEnvelope>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT sequence_number FROM events
+             WHERE run_id=?1 AND event_type IN (?2,?3)
+             ORDER BY sequence_number",
+        )?;
+        let sequences = stmt
+            .query_map(
+                params![
+                    run_id,
+                    EventType::PlatformUpgradeAuthorized.to_string(),
+                    EventType::PlatformUpgradeActivated.to_string()
+                ],
+                |row| row.get::<_, i64>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        sequences
+            .into_iter()
+            .map(|sequence| {
+                self.load_after_limited(run_id, sequence - 1, 1)?
+                    .into_iter()
+                    .next()
+                    .context("platform upgrade event disappeared during indexed read")
+            })
+            .collect()
     }
 
     pub(crate) fn web_playback_control(&self, run_id: &str) -> Result<WebPlaybackControl> {

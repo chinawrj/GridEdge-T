@@ -11,6 +11,15 @@ pub struct CapitalInventorySettings {
     #[serde(with = "rust_decimal::serde::str")]
     pub minimum_free_cash: Decimal,
     pub target_position: i64,
+    /// Deploy the initial cash/stock balance once, from the first reviewed
+    /// market bar. False is omitted so historical configuration hashes remain
+    /// byte-for-byte compatible.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deploy_initial_balance: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -412,6 +421,20 @@ impl Config {
                 }
                 if self.gate.failure_mode == "always_execute" {
                     bail!("resource_aware gate cannot use an always_execute failure fallback")
+                }
+                if settings.deploy_initial_balance
+                    && (self.initial_position != 0 || self.initial_sellable != 0)
+                {
+                    bail!("initial balance deployment requires an empty starting position")
+                }
+                if settings.deploy_initial_balance
+                    && settings.minimum_free_cash
+                        < self
+                            .initial_cash
+                            .checked_div(Decimal::from(2))
+                            .context("initial cash midpoint is not representable")?
+                {
+                    bail!("initial balance deployment must retain at least half of initial cash")
                 }
             }
             ("resource_aware", None) => {

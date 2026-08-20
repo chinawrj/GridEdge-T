@@ -569,6 +569,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "core-foundation-sys",
  "crc32fast",
  "csv",
  "flate2",

@@ -17,6 +17,18 @@
     <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/runtime/002256-opening-v1-quotes.jsonl</string>
     <string>--bar-log</string>
     <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/runtime/002256-opening-v1-bars.jsonl</string>
+    <string>--market-event-log</string>
+    <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/runtime/002256-opening-v1-market-mqtt.jsonl</string>
+    <string>--market-mqtt-host</string>
+    <string>192.168.1.201</string>
+    <string>--market-mqtt-port</string>
+    <string>8883</string>
+    <string>--market-mqtt-username</string>
+    <string>gridedge-publisher</string>
+    <string>--market-mqtt-password-file</string>
+    <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/market-mqtt/publisher.password</string>
+    <string>--market-mqtt-ca-file</string>
+    <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/market-mqtt/ca.crt</string>
     <string>--interval-minutes</string>
     <string>5</string>
     <string>--poll-seconds</string>

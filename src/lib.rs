@@ -9,6 +9,7 @@ pub mod grid;
 pub mod journal;
 pub mod ledger;
 pub mod market_data;
+pub mod market_mqtt;
 pub mod platform_upgrade;
 pub mod profit;
 pub mod rights;
@@ -22,6 +23,7 @@ pub mod ths_sim;
 pub mod ths_sim_execution;
 pub mod ths_sim_outbox;
 pub mod web;
+pub mod web_market;
 
 pub use config::Config;
 pub use domain::StrategyState;

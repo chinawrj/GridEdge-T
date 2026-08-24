@@ -1,0 +1,12 @@
+{
+  "name": "gridedge-web-market-extension",
+  "version": "0.6.4",
+  "private": true,
+  "license": "UNLICENSED",
+  "dependencies": {
+    "mqtt": "5.15.2"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "6.2.4"
+  }
+}

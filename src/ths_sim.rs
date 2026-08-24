@@ -162,6 +162,13 @@ tell application "System Events"
     delay 0.2
     if bundle identifier is not "cn.com.10jqka.macstockPro" then error "unexpected application bundle"
     if version of application file is not "5.3.2" then error "unsupported application version"
+    set stableOrderPreflight to false
+    set lastOrderPreflightError to "not attempted"
+    -- Activation can leave the reviewed main window rebuilding for several
+    -- hundred milliseconds. This boundary is read-only and ends before the
+    -- single tab click, so a slightly wider bounded retry is safe.
+    repeat with orderPreflightAttempt from 1 to 5
+      try
     set targetWindow to missing value
     set matchedWindowCount to 0
     set frozenWindows to {}
@@ -180,6 +187,7 @@ tell application "System Events"
           exit repeat
         end if
       on error errorMessage number errorNumber
+        set lastOrderPreflightError to errorMessage & " [" & errorNumber & "]"
         if errorNumber is not -1719 and errorNumber is not -1728 then error errorMessage number errorNumber
       end try
       delay 0.05
@@ -188,64 +196,50 @@ tell application "System Events"
     set observedWindowCount to count of frozenWindows
     repeat with windowIndex from 1 to observedWindowCount
       set w to missing value
-      set wIsAlive to false
       try
         set w to item windowIndex of frozenWindows
         set ignoredWindowRole to role of w
         set candidateWindowSubrole to subrole of w
-        if candidateWindowSubrole is "AXStandardWindow" then set wIsAlive to true
       on error errorMessage number errorNumber
-        if errorNumber is not -1719 and errorNumber is not -1728 then error errorMessage number errorNumber
+        error errorMessage number errorNumber
       end try
+      set wIsAlive to candidateWindowSubrole is "AXStandardWindow"
       if wIsAlive then
-      set hasSimulationMarker to false
-      set hasNestedLiveControl to false
-      set frozenWindowStaticTexts to {}
+      -- The main window contains unrelated dynamic texts (notably the CN
+      -- clock) that are replaced every second.  Reading every static text
+      -- would make identity depend on those stale objects.  Query only the
+      -- reviewed, safety-relevant direct controls and discard the whole
+      -- attempt if any exact query itself is transiently unreadable.
       try
-        repeat with candidateStaticText in static texts of w
-          set end of frozenWindowStaticTexts to contents of candidateStaticText
-        end repeat
+        set hasSimulationMarker to exists static text "模拟练习" of w
+        set hasNestedLiveControl to (exists static text "账户设置" of w)
+        if exists button "转账" of w then set hasNestedLiveControl to true
+        if exists button "退出" of w then set hasNestedLiveControl to true
       on error errorMessage number errorNumber
-        if errorNumber is not -1719 and errorNumber is not -1728 then error errorMessage number errorNumber
+        error errorMessage number errorNumber
       end try
-      repeat with candidateStaticText in frozenWindowStaticTexts
-        set s to contents of candidateStaticText
-        set markerValue to ""
-        try
-          set markerValue to value of s as text
-        end try
-        if markerValue is "" then
-          try
-            set markerValue to name of s as text
-          end try
-        end if
-        if markerValue is "模拟练习" then set hasSimulationMarker to true
-      end repeat
-      -- Some reviewed 5.3.2 layouts nest the account marker below an
-      -- AXScrollArea. Only take the slower descendant path when the stable,
-      -- materialized direct collection did not contain the marker.
       if not hasSimulationMarker then
-        set frozenWindowDescendants to {}
+        set frozenWindowScrollAreas to {}
         try
-          set frozenWindowDescendants to entire contents of w
+          set liveWindowScrollAreas to get (scroll areas of w)
+          repeat with candidateScrollAreaRef in liveWindowScrollAreas
+            set end of frozenWindowScrollAreas to contents of candidateScrollAreaRef
+          end repeat
         on error errorMessage number errorNumber
-          if errorNumber is not -1719 and errorNumber is not -1728 then error errorMessage number errorNumber
+          error errorMessage number errorNumber
         end try
-        repeat with candidateDescendant in frozenWindowDescendants
-          set descendantRef to contents of candidateDescendant
+        repeat with candidateScrollAreaRef in frozenWindowScrollAreas
+          set candidateScrollArea to contents of candidateScrollAreaRef
           try
-            set descendantRole to role of descendantRef
-            if descendantRole is "AXStaticText" then
-              set descendantValue to value of descendantRef as text
-              if descendantValue is "模拟练习" then set hasSimulationMarker to true
-              if descendantValue is "账户设置" then set hasNestedLiveControl to true
-            else if descendantRole is "AXButton" then
-              set descendantName to name of descendantRef as text
-              if descendantName is "转账" or descendantName is "退出" then set hasNestedLiveControl to true
-            end if
+            set ignoredScrollAreaRole to role of candidateScrollArea
+            set nestedSimulationMarker to exists static text "模拟练习" of candidateScrollArea
+            if exists static text "账户设置" of candidateScrollArea then set hasNestedLiveControl to true
+            if exists button "转账" of candidateScrollArea then set hasNestedLiveControl to true
+            if exists button "退出" of candidateScrollArea then set hasNestedLiveControl to true
           on error errorMessage number errorNumber
-            if errorNumber is not -1719 and errorNumber is not -1728 then error errorMessage number errorNumber
+            error errorMessage number errorNumber
           end try
+          if nestedSimulationMarker then set hasSimulationMarker to true
         end repeat
       end if
       if hasSimulationMarker then
@@ -255,36 +249,11 @@ tell application "System Events"
       end if
       end if
     end repeat
-    if matchedWindowCount is not 1 then error "unique simulation order window not found"
+    if matchedWindowCount is 0 then error "simulation order window is rebuilding" number -1719
+    if matchedWindowCount is greater than 1 then error "multiple simulation order windows found"
     if exists button "转账" of targetWindow then error "live transfer control is visible"
     if exists button "退出" of targetWindow then error "live account exit control is visible"
     if exists static text "账户设置" of targetWindow then error "live account settings are visible"
-    set frozenTargetStaticTexts to {}
-    set liveTargetStaticTexts to get (static texts of targetWindow)
-    repeat with candidateStaticTextRef in liveTargetStaticTexts
-      set end of frozenTargetStaticTexts to contents of candidateStaticTextRef
-    end repeat
-    repeat with candidateStaticTextRef in frozenTargetStaticTexts
-      set s to missing value
-      try
-        set s to contents of candidateStaticTextRef
-        set ignoredTargetStaticTextRole to role of s
-      on error errorMessage number errorNumber
-        if errorNumber is not -1719 and errorNumber is not -1728 then error errorMessage number errorNumber
-      end try
-      if s is not missing value then
-        set accountLabel to ""
-        try
-          set accountLabel to value of s as text
-        end try
-        if accountLabel is "" then
-          try
-            set accountLabel to name of s as text
-          end try
-        end if
-        if accountLabel is "账户设置" then error "live account settings are visible"
-      end if
-    end repeat
     set frozenTargetButtons to {}
     set liveTargetButtons to get (buttons of targetWindow)
     repeat with candidateButtonRef in liveTargetButtons
@@ -293,12 +262,26 @@ tell application "System Events"
     set commissionButtons to {}
     repeat with candidateButtonRef in frozenTargetButtons
       set candidateButton to contents of candidateButtonRef
+      set candidateButtonName to ""
       try
-        if (name of candidateButton as text) is "委托" then set end of commissionButtons to candidateButton
+        set candidateButtonName to name of candidateButton as text
+      on error errorMessage number errorNumber
+        if errorNumber is -1719 or errorNumber is -1728 then error errorMessage number errorNumber
+        if errorNumber is not -1700 then error errorMessage number errorNumber
       end try
+      if candidateButtonName is "委托" then set end of commissionButtons to candidateButton
     end repeat
     if (count of commissionButtons) is not 1 then error "simulation commission tab is not unique"
     set commissionButton to item 1 of commissionButtons
+        set stableOrderPreflight to true
+        exit repeat
+      on error errorMessage number errorNumber
+        set lastOrderPreflightError to errorMessage & " [" & errorNumber & "]"
+        if errorNumber is not -1719 and errorNumber is not -1728 then error errorMessage number errorNumber
+      end try
+      delay 0.2
+    end repeat
+    if not stableOrderPreflight then error "stable Tonghuashun order preflight unavailable: " & lastOrderPreflightError
     click commissionButton
     delay 0.3
     -- Switching tabs rebuilds the reviewed 5.3.2 AX window. Never carry the
@@ -333,62 +316,45 @@ tell application "System Events"
     set observedWindowCount to count of frozenWindows
     repeat with windowIndex from 1 to observedWindowCount
       set w to missing value
-      set wIsAlive to false
       try
         set w to item windowIndex of frozenWindows
         set ignoredWindowRole to role of w
         set candidateWindowSubrole to subrole of w
-        if candidateWindowSubrole is "AXStandardWindow" then set wIsAlive to true
       on error errorMessage number errorNumber
-        if errorNumber is not -1719 and errorNumber is not -1728 then error errorMessage number errorNumber
+        error errorMessage number errorNumber
       end try
+      set wIsAlive to candidateWindowSubrole is "AXStandardWindow"
       if wIsAlive then
-        set hasSimulationMarker to false
-        set hasNestedLiveControl to false
-        set frozenWindowStaticTexts to {}
         try
-          set liveWindowStaticTexts to get (static texts of w)
-          repeat with candidateStaticTextRef in liveWindowStaticTexts
-            set end of frozenWindowStaticTexts to contents of candidateStaticTextRef
-          end repeat
+          set hasSimulationMarker to exists static text "模拟练习" of w
+          set hasNestedLiveControl to (exists static text "账户设置" of w)
+          if exists button "转账" of w then set hasNestedLiveControl to true
+          if exists button "退出" of w then set hasNestedLiveControl to true
         on error errorMessage number errorNumber
-          if errorNumber is not -1719 and errorNumber is not -1728 then error errorMessage number errorNumber
+          error errorMessage number errorNumber
         end try
-        repeat with candidateStaticTextRef in frozenWindowStaticTexts
-          set s to contents of candidateStaticTextRef
-          set markerValue to ""
-          try
-            set markerValue to value of s as text
-          end try
-          if markerValue is "" then
-            try
-              set markerValue to name of s as text
-            end try
-          end if
-          if markerValue is "模拟练习" then set hasSimulationMarker to true
-        end repeat
         if not hasSimulationMarker then
-          set frozenWindowDescendants to {}
+          set frozenWindowScrollAreas to {}
           try
-            set frozenWindowDescendants to entire contents of w
+            set liveWindowScrollAreas to get (scroll areas of w)
+            repeat with candidateScrollAreaRef in liveWindowScrollAreas
+              set end of frozenWindowScrollAreas to contents of candidateScrollAreaRef
+            end repeat
           on error errorMessage number errorNumber
-            if errorNumber is not -1719 and errorNumber is not -1728 then error errorMessage number errorNumber
+            error errorMessage number errorNumber
           end try
-          repeat with candidateDescendant in frozenWindowDescendants
-            set descendantRef to contents of candidateDescendant
+          repeat with candidateScrollAreaRef in frozenWindowScrollAreas
+            set candidateScrollArea to contents of candidateScrollAreaRef
             try
-              set descendantRole to role of descendantRef
-              if descendantRole is "AXStaticText" then
-                set descendantValue to value of descendantRef as text
-                if descendantValue is "模拟练习" then set hasSimulationMarker to true
-                if descendantValue is "账户设置" then set hasNestedLiveControl to true
-              else if descendantRole is "AXButton" then
-                set descendantName to name of descendantRef as text
-                if descendantName is "转账" or descendantName is "退出" then set hasNestedLiveControl to true
-              end if
+              set ignoredScrollAreaRole to role of candidateScrollArea
+              set nestedSimulationMarker to exists static text "模拟练习" of candidateScrollArea
+              if exists static text "账户设置" of candidateScrollArea then set hasNestedLiveControl to true
+              if exists button "转账" of candidateScrollArea then set hasNestedLiveControl to true
+              if exists button "退出" of candidateScrollArea then set hasNestedLiveControl to true
             on error errorMessage number errorNumber
-              if errorNumber is not -1719 and errorNumber is not -1728 then error errorMessage number errorNumber
+              error errorMessage number errorNumber
             end try
+            if nestedSimulationMarker then set hasSimulationMarker to true
           end repeat
         end if
         if hasSimulationMarker then
@@ -415,28 +381,30 @@ tell application "System Events"
         if (value of candidateLabelRef as text) is "只显示可撤委托" then set end of filterLabels to candidateLabelRef
       end try
     end repeat
-    if (count of filterLabels) is not 1 then error "simulation order filter label is not unique"
-    set filterLabel to item 1 of filterLabels
-    set filterLabelPosition to position of filterLabel
     set frozenCheckboxes to {}
     set liveCheckboxes to get (checkboxes of targetWindow)
     repeat with candidateCheckboxRef in liveCheckboxes
       set end of frozenCheckboxes to contents of candidateCheckboxRef
     end repeat
-    set cancellableOnlyCheckbox to missing value
-    set filterCheckboxCount to 0
+    set matchedFilterCheckboxes to {}
     set observedCheckboxCount to count of frozenCheckboxes
     repeat with candidateCheckboxRef in frozenCheckboxes
       try
         set candidateCheckbox to contents of candidateCheckboxRef
         set checkboxPosition to position of candidateCheckbox
-        if (item 1 of checkboxPosition) < (item 1 of filterLabelPosition) and ((item 1 of filterLabelPosition) - (item 1 of checkboxPosition)) <= 30 and (item 2 of checkboxPosition) >= ((item 2 of filterLabelPosition) - 10) and (item 2 of checkboxPosition) <= ((item 2 of filterLabelPosition) + 10) then
-          set cancellableOnlyCheckbox to candidateCheckbox
-          set filterCheckboxCount to filterCheckboxCount + 1
-        end if
+        set candidateFilterCheckboxMatched to false
+        repeat with candidateLabelRef in filterLabels
+          set filterLabelPosition to position of (contents of candidateLabelRef)
+          if (item 1 of checkboxPosition) < (item 1 of filterLabelPosition) and ((item 1 of filterLabelPosition) - (item 1 of checkboxPosition)) <= 30 and (item 2 of checkboxPosition) >= ((item 2 of filterLabelPosition) - 10) and (item 2 of checkboxPosition) <= ((item 2 of filterLabelPosition) + 10) then
+            set candidateFilterCheckboxMatched to true
+            exit repeat
+          end if
+        end repeat
+        if candidateFilterCheckboxMatched then set end of matchedFilterCheckboxes to candidateCheckbox
       end try
     end repeat
-    if filterCheckboxCount is not 1 then error "simulation order filter checkbox is not unique"
+    if (count of matchedFilterCheckboxes) is not 1 then error "simulation order filter checkbox is not unique"
+    set cancellableOnlyCheckbox to item 1 of matchedFilterCheckboxes
     if (value of cancellableOnlyCheckbox as integer) is 1 then
       click cancellableOnlyCheckbox
       delay 0.3
@@ -888,6 +856,9 @@ tell application "System Events"
     delay 0.2
     if bundle identifier is not "{bundle}" then error "unexpected application bundle"
     if version of application file is not "{version}" then error "unsupported application version"
+    set stableFillPreflight to false
+    repeat with fillPreflightAttempt from 1 to 3
+      try
     set targetWindow to missing value
     set matchedWindowCount to 0
     set frozenWindows to {{}}
@@ -901,50 +872,55 @@ tell application "System Events"
       set w to contents of candidateWindowRef
       set ignoredWindowRole to role of w
       if subrole of w is "AXStandardWindow" then
-        if exists button "转账" of w then error "live transfer control is visible"
-        if exists button "退出" of w then error "live account exit control is visible"
-        if exists static text "账户设置" of w then error "live account settings are visible"
-        set frozenWindowStaticTexts to {{}}
-        set liveWindowStaticTexts to get (static texts of w)
-        repeat with candidateStaticTextRef in liveWindowStaticTexts
-          set end of frozenWindowStaticTexts to contents of candidateStaticTextRef
-        end repeat
-        set hasSimulationMarker to false
-        repeat with candidateStaticTextRef in frozenWindowStaticTexts
-          set s to missing value
-          set staticTextAlive to false
+        try
+          set hasSimulationMarker to exists static text "模拟练习" of w
+          set hasNestedLiveControl to (exists static text "账户设置" of w)
+          if exists button "转账" of w then set hasNestedLiveControl to true
+          if exists button "退出" of w then set hasNestedLiveControl to true
+        on error errorMessage number errorNumber
+          error errorMessage number errorNumber
+        end try
+        if not hasSimulationMarker then
+          set frozenWindowScrollAreas to {{}}
           try
-            set s to contents of candidateStaticTextRef
-            set ignoredStaticTextRole to role of s
-            set staticTextAlive to true
+            set liveWindowScrollAreas to get (scroll areas of w)
+            repeat with candidateScrollAreaRef in liveWindowScrollAreas
+              set end of frozenWindowScrollAreas to contents of candidateScrollAreaRef
+            end repeat
           on error errorMessage number errorNumber
-            if errorNumber is not -1719 and errorNumber is not -1728 then error errorMessage number errorNumber
+            error errorMessage number errorNumber
           end try
-          set markerValue to ""
-          if staticTextAlive then try
-            set markerValue to value of s as text
-          on error errorMessage number errorNumber
-            if errorNumber is -1719 or errorNumber is -1728 then set staticTextAlive to false
-            if errorNumber is not -1700 and errorNumber is not -1719 and errorNumber is not -1728 then error errorMessage number errorNumber
-          end try
-          if staticTextAlive and markerValue is "" then
+          repeat with candidateScrollAreaRef in frozenWindowScrollAreas
+            set candidateScrollArea to contents of candidateScrollAreaRef
             try
-              set markerValue to name of s as text
+              set ignoredScrollAreaRole to role of candidateScrollArea
+              set nestedSimulationMarker to exists static text "模拟练习" of candidateScrollArea
+              if exists static text "账户设置" of candidateScrollArea then set hasNestedLiveControl to true
+              if exists button "转账" of candidateScrollArea then set hasNestedLiveControl to true
+              if exists button "退出" of candidateScrollArea then set hasNestedLiveControl to true
             on error errorMessage number errorNumber
-              if errorNumber is -1719 or errorNumber is -1728 then set staticTextAlive to false
-              if errorNumber is not -1700 and errorNumber is not -1719 and errorNumber is not -1728 then error errorMessage number errorNumber
+              error errorMessage number errorNumber
             end try
-          end if
-          if staticTextAlive and markerValue is "模拟练习" then set hasSimulationMarker to true
-          if staticTextAlive and markerValue is "账户设置" then error "live account settings are visible"
-        end repeat
+            if nestedSimulationMarker then set hasSimulationMarker to true
+          end repeat
+        end if
         if hasSimulationMarker then
+          if hasNestedLiveControl then error "live account control is visible"
           set targetWindow to w
           set matchedWindowCount to matchedWindowCount + 1
         end if
       end if
     end repeat
-    if matchedWindowCount is not 1 then error "unique simulation order window not found"
+    if matchedWindowCount is 0 then error "simulation fill window is rebuilding" number -1719
+    if matchedWindowCount is greater than 1 then error "multiple simulation fill windows found"
+        set stableFillPreflight to true
+        exit repeat
+      on error errorMessage number errorNumber
+        if errorNumber is not -1719 and errorNumber is not -1728 then error errorMessage number errorNumber
+      end try
+      delay 0.2
+    end repeat
+    if not stableFillPreflight then error "stable Tonghuashun fill preflight unavailable"
     set frozenTargetButtons to {{}}
     set liveTargetButtons to get (buttons of targetWindow)
     repeat with candidateButtonRef in liveTargetButtons
@@ -958,8 +934,70 @@ tell application "System Events"
     if (count of fillButtons) is not 1 then error "simulation fill tab is not unique"
     click item 1 of fillButtons
     delay 0.3
+    -- Switching tabs rebuilds the reviewed AX hierarchy. The window identity,
+    -- table header, rows and cells must therefore be captured inside one
+    -- bounded attempt; no descendant from a failed attempt may be published.
+    set stableFillSnapshot to false
+    repeat with fillSnapshotAttempt from 1 to 3
+      try
+        set targetWindow to missing value
+        set matchedWindowCount to 0
+        set frozenWindows to {{}}
+        set liveWindowObjects to get every window
+        set liveWindowCount to count of liveWindowObjects
+        repeat with candidateWindowRef in liveWindowObjects
+          set end of frozenWindows to contents of candidateWindowRef
+        end repeat
+        if (count of frozenWindows) is not liveWindowCount then error "post-tab fill window is rebuilding" number -1719
+        repeat with candidateWindowRef in frozenWindows
+          set w to contents of candidateWindowRef
+          set ignoredWindowRole to role of w
+          if subrole of w is "AXStandardWindow" then
+            try
+              set hasSimulationMarker to exists static text "模拟练习" of w
+              set hasNestedLiveControl to (exists static text "账户设置" of w)
+              if exists button "转账" of w then set hasNestedLiveControl to true
+              if exists button "退出" of w then set hasNestedLiveControl to true
+            on error errorMessage number errorNumber
+              error errorMessage number errorNumber
+            end try
+            if not hasSimulationMarker then
+              set frozenWindowScrollAreas to {{}}
+              try
+                set liveWindowScrollAreas to get (scroll areas of w)
+                repeat with candidateScrollAreaRef in liveWindowScrollAreas
+                  set end of frozenWindowScrollAreas to contents of candidateScrollAreaRef
+                end repeat
+              on error errorMessage number errorNumber
+                error errorMessage number errorNumber
+              end try
+              repeat with candidateScrollAreaRef in frozenWindowScrollAreas
+                set candidateScrollArea to contents of candidateScrollAreaRef
+                try
+                  set ignoredScrollAreaRole to role of candidateScrollArea
+                  set nestedSimulationMarker to exists static text "模拟练习" of candidateScrollArea
+                  if exists static text "账户设置" of candidateScrollArea then set hasNestedLiveControl to true
+                  if exists button "转账" of candidateScrollArea then set hasNestedLiveControl to true
+                  if exists button "退出" of candidateScrollArea then set hasNestedLiveControl to true
+                on error errorMessage number errorNumber
+                  error errorMessage number errorNumber
+                end try
+                if nestedSimulationMarker then set hasSimulationMarker to true
+              end repeat
+            end if
+            if hasSimulationMarker then
+              if hasNestedLiveControl then error "live account control is visible"
+              set targetWindow to w
+              set matchedWindowCount to matchedWindowCount + 1
+            end if
+          end if
+        end repeat
+        if matchedWindowCount is 0 then error "post-tab simulation fill window is rebuilding" number -1719
+        if matchedWindowCount is greater than 1 then error "multiple post-tab simulation fill windows found"
     set expectedHeaders to {{"成交日期", "成交时间", "证券代码", "证券名称", "操作", "成交数量", "成交均价", "成交金额", "合同编号", "成交编号", "成交类别"}}
+    set expectedHeadersWithReportId to {{"成交日期", "成交时间", "证券代码", "证券名称", "操作", "成交数量", "成交均价", "成交金额", "合同编号", "成交编号", "申报编号", "成交类别"}}
     set matchedTable to missing value
+    set matchedHeaders to missing value
     set matchedCount to 0
     set frozenScrollAreas to {{}}
     set liveScrollAreas to get (scroll areas of targetWindow)
@@ -994,8 +1032,9 @@ tell application "System Events"
                 set headerElement to contents of headerRef
                 if role of headerElement is "AXButton" then set end of names to name of headerElement as text
               end repeat
-              if names is expectedHeaders then
+              if names is expectedHeaders or names is expectedHeadersWithReportId then
                 set matchedTable to candidate
+                set matchedHeaders to names
                 set matchedCount to matchedCount + 1
               end if
             end if
@@ -1003,9 +1042,10 @@ tell application "System Events"
         end if
       end repeat
     end repeat
-    if matchedCount is not 1 then error "simulation fill table is not unique"
+    if matchedCount is 0 then error "reviewed simulation fill table was not found"
+    if matchedCount is greater than 1 then error "simulation fill table is not unique"
     set out to {{"FILL_TABLE\t1"}}
-    repeat with headerName in expectedHeaders
+    repeat with headerName in matchedHeaders
       set end of out to "HEADER\t" & headerName
     end repeat
     set frozenRows to {{}}
@@ -1034,6 +1074,14 @@ tell application "System Events"
         end if
       end repeat
     end repeat
+        set stableFillSnapshot to true
+        exit repeat
+      on error errorMessage number errorNumber
+        if errorNumber is not -1719 and errorNumber is not -1728 then error errorMessage number errorNumber
+      end try
+      delay 0.2
+    end repeat
+    if not stableFillSnapshot then error "stable Tonghuashun fill snapshot unavailable"
     set AppleScript's text item delimiters to linefeed
     return out as text
   end tell
@@ -1169,7 +1217,7 @@ pub fn parse_fills_probe(raw: &str) -> Result<SimulationFillTable> {
     if !found {
         bail!("Tonghuashun fill table was not found");
     }
-    let expected_headers = [
+    let legacy_headers = [
         "成交日期",
         "成交时间",
         "证券代码",
@@ -1182,7 +1230,21 @@ pub fn parse_fills_probe(raw: &str) -> Result<SimulationFillTable> {
         "成交编号",
         "成交类别",
     ];
-    if headers != expected_headers {
+    let report_id_headers = [
+        "成交日期",
+        "成交时间",
+        "证券代码",
+        "证券名称",
+        "操作",
+        "成交数量",
+        "成交均价",
+        "成交金额",
+        "合同编号",
+        "成交编号",
+        "申报编号",
+        "成交类别",
+    ];
+    if headers != legacy_headers && headers != report_id_headers {
         bail!("Tonghuashun fill table headers changed");
     }
     let expected_rows = expected_rows.context("fill-table probe lacks its row count")?;
@@ -1204,7 +1266,7 @@ pub fn parse_fills_probe(raw: &str) -> Result<SimulationFillTable> {
             .into_iter()
             .map(|(_, _, value)| value)
             .collect::<Vec<_>>();
-        if cells.len() != expected_headers.len() {
+        if cells.len() != headers.len() {
             bail!("fill-table row does not contain every expected column");
         }
         rows.push(SimulationFillTableRow { cells });
@@ -1377,10 +1439,50 @@ fn parse_order_record(row: &SimulationOrderTableRow) -> Result<SimulationOrderRe
 }
 
 fn parse_fill_record(row: &SimulationFillTableRow) -> Result<SimulationFillRecord> {
-    let [fill_date, fill_time, symbol, security_name, operation, quantity, price, amount, contract_id, fill_id, fill_category] =
-        row.cells.as_slice()
-    else {
-        bail!("Tonghuashun fill row does not have eleven cells");
+    let (
+        fill_date,
+        fill_time,
+        symbol,
+        security_name,
+        operation,
+        quantity,
+        price,
+        amount,
+        contract_id,
+        fill_id,
+        fill_category,
+    ) = match row.cells.as_slice() {
+        [fill_date, fill_time, symbol, security_name, operation, quantity, price, amount, contract_id, fill_id, fill_category] => {
+            (
+                fill_date,
+                fill_time,
+                symbol,
+                security_name,
+                operation,
+                quantity,
+                price,
+                amount,
+                contract_id,
+                fill_id,
+                fill_category,
+            )
+        }
+        [fill_date, fill_time, symbol, security_name, operation, quantity, price, amount, contract_id, fill_id, _report_id, fill_category] => {
+            (
+                fill_date,
+                fill_time,
+                symbol,
+                security_name,
+                operation,
+                quantity,
+                price,
+                amount,
+                contract_id,
+                fill_id,
+                fill_category,
+            )
+        }
+        _ => bail!("Tonghuashun fill row does not have a reviewed column shape"),
     };
     if symbol.len() != 6 || !symbol.bytes().all(|byte| byte.is_ascii_digit()) {
         bail!("Tonghuashun fill row has an invalid A-share symbol");
@@ -2202,28 +2304,30 @@ tell application "System Events"
         if (value of candidateLabelRef as text) is "只显示可撤委托" then set end of filterLabels to candidateLabelRef
       end try
     end repeat
-    if (count of filterLabels) is not 1 then error "simulation order filter label is not unique"
-    set filterLabel to item 1 of filterLabels
-    set filterLabelPosition to position of filterLabel
     set frozenCheckboxes to {{}}
     set liveTargetCheckboxes to get (checkboxes of targetWindow)
     repeat with candidateCheckboxRef in liveTargetCheckboxes
       set end of frozenCheckboxes to contents of candidateCheckboxRef
     end repeat
-    set cancellableOnlyCheckbox to missing value
-    set filterCheckboxCount to 0
+    set matchedFilterCheckboxes to {{}}
     set observedCheckboxCount to count of frozenCheckboxes
     repeat with checkboxIndex from 1 to observedCheckboxCount
       try
         set candidateCheckbox to item checkboxIndex of frozenCheckboxes
         set checkboxPosition to position of candidateCheckbox
-        if (item 1 of checkboxPosition) < (item 1 of filterLabelPosition) and ((item 1 of filterLabelPosition) - (item 1 of checkboxPosition)) <= 30 and (item 2 of checkboxPosition) >= ((item 2 of filterLabelPosition) - 10) and (item 2 of checkboxPosition) <= ((item 2 of filterLabelPosition) + 10) then
-          set cancellableOnlyCheckbox to candidateCheckbox
-          set filterCheckboxCount to filterCheckboxCount + 1
-        end if
+        set candidateFilterCheckboxMatched to false
+        repeat with candidateLabelRef in filterLabels
+          set filterLabelPosition to position of (contents of candidateLabelRef)
+          if (item 1 of checkboxPosition) < (item 1 of filterLabelPosition) and ((item 1 of filterLabelPosition) - (item 1 of checkboxPosition)) <= 30 and (item 2 of checkboxPosition) >= ((item 2 of filterLabelPosition) - 10) and (item 2 of checkboxPosition) <= ((item 2 of filterLabelPosition) + 10) then
+            set candidateFilterCheckboxMatched to true
+            exit repeat
+          end if
+        end repeat
+        if candidateFilterCheckboxMatched then set end of matchedFilterCheckboxes to candidateCheckbox
       end try
     end repeat
-    if filterCheckboxCount is not 1 then error "simulation order filter checkbox is not unique"
+    if (count of matchedFilterCheckboxes) is not 1 then error "simulation order filter checkbox is not unique"
+    set cancellableOnlyCheckbox to item 1 of matchedFilterCheckboxes
     if (value of cancellableOnlyCheckbox as integer) is 0 then
       click cancellableOnlyCheckbox
       delay 0.3

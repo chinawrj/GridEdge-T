@@ -1,8 +1,9 @@
 user gridedge-publisher
 topic write gridedge/market/v1/#
-topic read gridedge/market/v1/+/+/status
+# The same LAN-only credential is used by the reviewed Rust paper-trading
+# consumer. It can read market facts but has no order, ledger, or UI topic.
+topic read gridedge/market/v1/#
 
 user gridedge-ingestor
 topic read gridedge/market/v1/#
 topic read $SYS/broker/#
-

@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>GridEdge 行情采集</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <h1>GridEdge 行情采集</h1>
+      <p id="state">正在读取状态…</p>
+      <div class="actions">
+        <button id="scan">立即采集</button>
+        <button id="flush" class="secondary">重发待确认</button>
+        <button id="export" class="secondary">导出今日回放</button>
+        <button id="options" class="secondary">设置</button>
+        <button id="reload" class="secondary">重载开发版</button>
+      </div>
+      <pre id="detail"></pre>
+    </main>
+    <script src="shared.js"></script>
+    <script src="durable.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -421,7 +421,7 @@ fn ignored_hardware_submit_cancel_gate_has_a_pre_side_effect_price_cushion() -> 
         .and_then(|suffix| suffix.split_once("\n#[test]").map(|(body, _)| body))
         .ok_or_else(|| anyhow::anyhow!("missing reviewed submit-cancel hardware smoke"))?;
 
-    assert!(smoke.contains("let smoke_limit_price = Decimal::new(320, 2);"));
+    assert!(smoke.contains("let smoke_limit_price = Decimal::new(310, 2);"));
     assert!(smoke.contains("let minimum_non_marketable_ratio = Decimal::new(105, 2);"));
     let quote = smoke
         .find("probe_current_market_quote(\"002256\")?")
@@ -555,9 +555,13 @@ fn assert_windows_are_materialized_before_indexing(script: &str) {
         "if errorNumber is not -1719 and errorNumber is not -1728 then error errorMessage number errorNumber"
     ));
     if indexed_frozen_snapshot {
-        assert!(script.contains(
+        let atomic_indexed_snapshot = script.contains(
+            "set ignoredWindowRole to role of w\n        set candidateWindowSubrole to subrole of w\n      on error errorMessage number errorNumber\n        error errorMessage number errorNumber\n      end try\n      set wIsAlive to candidateWindowSubrole is \"AXStandardWindow\""
+        );
+        let bounded_legacy_snapshot = script.contains(
             "set ignoredWindowRole to role of w\n        set candidateWindowSubrole to subrole of w\n        if candidateWindowSubrole is \"AXStandardWindow\" then set wIsAlive to true\n      on error errorMessage number errorNumber\n        if errorNumber is not -1719 and errorNumber is not -1728 then error errorMessage number errorNumber\n      end try"
-        ));
+        );
+        assert!(atomic_indexed_snapshot || bounded_legacy_snapshot);
     } else {
         assert!(script.contains("if subrole of w is \"AXStandardWindow\" then"));
         assert!(script.contains(
@@ -1638,6 +1642,22 @@ HEADER\t成交编号\n\
 HEADER\t成交类别\n\
 ROWS\t0\n";
 
+const EMPTY_FILL_TABLE_WITH_DECLARATION_ID: &str = "\
+FILL_TABLE\t1\n\
+HEADER\t成交日期\n\
+HEADER\t成交时间\n\
+HEADER\t证券代码\n\
+HEADER\t证券名称\n\
+HEADER\t操作\n\
+HEADER\t成交数量\n\
+HEADER\t成交均价\n\
+HEADER\t成交金额\n\
+HEADER\t合同编号\n\
+HEADER\t成交编号\n\
+HEADER\t申报编号\n\
+HEADER\t成交类别\n\
+ROWS\t0\n";
+
 #[test]
 fn fill_table_probe_is_read_only_schema_locked_and_materializes_exact_records() -> Result<()> {
     let mut raw = EMPTY_FILL_TABLE.replace("ROWS\t0", "ROWS\t2");
@@ -1695,6 +1715,29 @@ fn fill_table_probe_is_read_only_schema_locked_and_materializes_exact_records() 
         .find("click item 1 of fillButtons")
         .expect("one read-only fill-tab navigation");
     assert!(negative_proof < fill_tab_click);
+    let after_fill_tab = &scripts[0][fill_tab_click..];
+    let retry = after_fill_tab
+        .find("repeat with fillSnapshotAttempt from 1 to 3")
+        .expect("post-tab fill evidence needs one bounded atomic retry boundary");
+    let refreshed_windows = after_fill_tab[retry..]
+        .find("set liveWindowObjects to get every window")
+        .map(|offset| retry + offset)
+        .expect("every fill attempt must reacquire a fresh window snapshot");
+    let rows = after_fill_tab[refreshed_windows..]
+        .find("set liveRows to get (rows of matchedTable)")
+        .map(|offset| refreshed_windows + offset)
+        .expect("fill rows must belong to the same atomic attempt");
+    let publish = after_fill_tab[rows..]
+        .find("set stableFillSnapshot to true")
+        .map(|offset| rows + offset)
+        .expect("only a complete fill snapshot may be published");
+    assert!(retry < refreshed_windows && refreshed_windows < rows && rows < publish);
+    assert!(after_fill_tab.contains(
+        "if errorNumber is not -1719 and errorNumber is not -1728 then error errorMessage number errorNumber"
+    ));
+    assert!(after_fill_tab.contains(
+        "if not stableFillSnapshot then error \"stable Tonghuashun fill snapshot unavailable\""
+    ));
     assert!(!scripts[0].contains("确定买入"));
     assert!(!scripts[0].contains("确定卖出"));
     assert!(!scripts[0].contains("撤销这1笔委托"));
@@ -1720,6 +1763,238 @@ fn fill_table_probe_is_read_only_schema_locked_and_materializes_exact_records() 
 }
 
 #[test]
+fn fill_probe_post_tab_snapshot_is_atomic_and_never_swallows_unknown_marker_errors() -> Result<()> {
+    let executor = RecordingExecutor::new([EMPTY_FILL_TABLE.to_owned()]);
+    probe_fills_with(&executor)?;
+    let scripts = executor.scripts.borrow();
+    let after_tab = scripts[0]
+        .split_once("click item 1 of fillButtons")
+        .map(|(_, suffix)| suffix)
+        .expect("fill probe must navigate to the unique 成交 tab");
+
+    let ordered = [
+        "repeat with fillSnapshotAttempt from 1 to 3",
+        "set liveWindowObjects to get every window",
+        "if matchedWindowCount is 0 then error \"post-tab simulation fill window is rebuilding\" number -1719",
+        "if matchedWindowCount is greater than 1 then error \"multiple post-tab simulation fill windows found\"",
+        "set liveScrollAreas to get (scroll areas of targetWindow)",
+        "if names is expectedHeaders or names is expectedHeadersWithReportId then",
+        "set liveRows to get (rows of matchedTable)",
+        "set liveCells to get (entire contents of tableRow)",
+        "set stableFillSnapshot to true",
+        "if errorNumber is not -1719 and errorNumber is not -1728 then error errorMessage number errorNumber",
+    ];
+    let mut cursor = 0;
+    for needle in ordered {
+        let offset = after_tab[cursor..]
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing post-tab atomic evidence: {needle}"));
+        cursor += offset + needle.len();
+    }
+
+    assert!(after_tab.contains("set hasSimulationMarker to exists static text \"模拟练习\" of w"));
+    assert!(
+        after_tab.contains("set hasNestedLiveControl to (exists static text \"账户设置\" of w)")
+    );
+    assert!(after_tab.contains("if exists button \"转账\" of w then set hasNestedLiveControl"));
+    assert!(after_tab.contains("if exists button \"退出\" of w then set hasNestedLiveControl"));
+    assert!(after_tab
+        .contains("if hasNestedLiveControl then error \"live account control is visible\""));
+    assert!(after_tab.contains(
+        "if matchedCount is 0 then error \"reviewed simulation fill table was not found\""
+    ));
+    assert!(after_tab.contains(
+        "if matchedCount is greater than 1 then error \"simulation fill table is not unique\""
+    ));
+    assert!(!after_tab.contains("确定买入"));
+    assert!(!after_tab.contains("确定卖出"));
+    Ok(())
+}
+
+#[test]
+fn fill_probe_preflight_retries_only_transient_missing_simulation_window() -> Result<()> {
+    let executor = RecordingExecutor::new([EMPTY_FILL_TABLE.to_owned()]);
+    probe_fills_with(&executor)?;
+    let scripts = executor.scripts.borrow();
+    let before_tab = scripts[0]
+        .split_once("click item 1 of fillButtons")
+        .map(|(prefix, _)| prefix)
+        .expect("fill probe must navigate to the unique 成交 tab");
+    let retry = before_tab
+        .find("repeat with fillPreflightAttempt from 1 to 3")
+        .expect("fill preflight needs a bounded transient retry");
+    let attempt = &before_tab[retry..];
+    assert!(attempt.contains("set liveWindowObjects to get every window"));
+    assert!(attempt.contains(
+        "if matchedWindowCount is 0 then error \"simulation fill window is rebuilding\" number -1719"
+    ));
+    assert!(attempt.contains(
+        "if matchedWindowCount is greater than 1 then error \"multiple simulation fill windows found\""
+    ));
+    assert!(attempt.contains("set stableFillPreflight to true"));
+    assert!(attempt.contains(
+        "if errorNumber is not -1719 and errorNumber is not -1728 then error errorMessage number errorNumber"
+    ));
+    assert!(attempt.contains(
+        "if not stableFillPreflight then error \"stable Tonghuashun fill preflight unavailable\""
+    ));
+    assert!(before_tab.contains("if exists button \"转账\" of w then set hasNestedLiveControl"));
+    assert!(before_tab.contains("if exists button \"退出\" of w then set hasNestedLiveControl"));
+    assert!(
+        before_tab.contains("set hasNestedLiveControl to (exists static text \"账户设置\" of w)")
+    );
+    Ok(())
+}
+
+#[test]
+fn fill_probe_identity_ignores_unrelated_dynamic_window_texts() -> Result<()> {
+    let executor = RecordingExecutor::new([EMPTY_FILL_TABLE.to_owned()]);
+    probe_fills_with(&executor)?;
+    let scripts = executor.scripts.borrow();
+    let (before_tab, after_tab) = scripts[0]
+        .split_once("click item 1 of fillButtons")
+        .expect("fill probe must navigate to the unique 成交 tab");
+
+    for identity in [before_tab, after_tab] {
+        assert!(
+            identity.contains("set hasSimulationMarker to exists static text \"模拟练习\" of w")
+        );
+        assert!(identity.contains("set liveWindowScrollAreas to get (scroll areas of w)"));
+        assert!(identity.contains(
+            "set nestedSimulationMarker to exists static text \"模拟练习\" of candidateScrollArea"
+        ));
+        assert!(!identity.contains("static texts of w"));
+        assert!(!identity.contains("entire contents of w"));
+    }
+    Ok(())
+}
+
+#[test]
+fn reviewed_fill_declaration_id_column_is_audited_without_changing_fill_binding() -> Result<()> {
+    let mut raw = EMPTY_FILL_TABLE_WITH_DECLARATION_ID.replace("ROWS\t0", "ROWS\t1");
+    for (index, value) in [
+        "20260821",
+        "130000",
+        "002256",
+        "兆新股份",
+        "买入",
+        "100",
+        "3.32",
+        "332",
+        "6213000001",
+        "fill-130000-1",
+        "202608211300000001",
+        "普通成交",
+    ]
+    .iter()
+    .enumerate()
+    .rev()
+    {
+        raw.push_str(&format!(
+            "CELL\t1\t{}\t{}\t{value}\n",
+            index + 1,
+            100 + index * 50
+        ));
+    }
+    let executor = RecordingExecutor::new([raw.clone()]);
+
+    let table = probe_fills_with(&executor)?;
+    assert_eq!(table.headers.len(), 12);
+    assert_eq!(table.headers[8], "合同编号");
+    assert_eq!(table.headers[9], "成交编号");
+    assert_eq!(table.headers[10], "申报编号");
+    assert_eq!(table.rows[0].cells[10], "202608211300000001");
+    let records = table.records()?;
+    let [record] = records.as_slice() else {
+        panic!("one reviewed fill expected")
+    };
+    assert_eq!(record.contract_id, "6213000001");
+    assert_eq!(record.fill_id, "fill-130000-1");
+    assert_eq!(record.quantity, 100);
+
+    let script = &executor.scripts.borrow()[0];
+    assert!(script.contains("\"合同编号\", \"成交编号\", \"申报编号\", \"成交类别\""));
+    assert!(script.contains("set matchedHeaders to names"));
+    assert!(script.contains("repeat with headerName in matchedHeaders"));
+    assert!(script.contains("if matchedCount is greater than 1"));
+    assert!(script.contains("set liveRows to get (rows of matchedTable)"));
+    assert!(!script.contains("确定买入"));
+    assert!(!script.contains("确定卖出"));
+    assert!(!script.contains("撤销"));
+    Ok(())
+}
+
+#[test]
+fn reviewed_fill_header_variants_and_remote_identities_remain_fail_closed() -> Result<()> {
+    let attacks = [
+        EMPTY_FILL_TABLE_WITH_DECLARATION_ID.replace("HEADER\t合同编号\n", ""),
+        EMPTY_FILL_TABLE_WITH_DECLARATION_ID
+            .replace("HEADER\t申报编号\n", "HEADER\t申报编号\nHEADER\t状态说明\n"),
+        EMPTY_FILL_TABLE_WITH_DECLARATION_ID.replace(
+            "HEADER\t成交编号\nHEADER\t申报编号\n",
+            "HEADER\t申报编号\nHEADER\t成交编号\n",
+        ),
+        EMPTY_FILL_TABLE_WITH_DECLARATION_ID.replace("HEADER\t申报编号\n", "HEADER\t报单编号\n"),
+    ];
+    for attacked in attacks {
+        assert!(
+            parse_fills_probe(&attacked).is_err(),
+            "only the two exact reviewed fill layouts may be accepted"
+        );
+    }
+
+    let make_row = |row: usize, contract: &str, fill: &str, report: &str| {
+        [
+            "20260821",
+            "130000",
+            "002256",
+            "兆新股份",
+            "买入",
+            "100",
+            "3.32",
+            "332",
+            contract,
+            fill,
+            report,
+            "普通成交",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            format!(
+                "CELL\t{row}\t{}\t{}\t{value}\n",
+                index + 1,
+                100 + index * 50
+            )
+        })
+        .collect::<String>()
+    };
+
+    for (contract, fill) in [("", "fill-1"), ("contract-1", "")] {
+        let mut raw = EMPTY_FILL_TABLE_WITH_DECLARATION_ID.replace("ROWS\t0", "ROWS\t1");
+        raw.push_str(&make_row(1, contract, fill, "valid-report-id"));
+        assert!(
+            parse_fills_probe(&raw)?.records().is_err(),
+            "a valid declaration ID must never replace an invalid contract or fill ID"
+        );
+    }
+
+    let mut duplicate_fill = EMPTY_FILL_TABLE_WITH_DECLARATION_ID.replace("ROWS\t0", "ROWS\t2");
+    duplicate_fill.push_str(&make_row(1, "contract-1", "fill-1", "report-1"));
+    duplicate_fill.push_str(&make_row(2, "contract-1", "fill-1", "report-2"));
+    assert!(
+        parse_fills_probe(&duplicate_fill)?.records().is_err(),
+        "different declaration IDs must not make one duplicate fill ID unique"
+    );
+
+    let mut shared_report = EMPTY_FILL_TABLE_WITH_DECLARATION_ID.replace("ROWS\t0", "ROWS\t2");
+    shared_report.push_str(&make_row(1, "contract-1", "fill-1", "report-1"));
+    shared_report.push_str(&make_row(2, "contract-1", "fill-2", "report-1"));
+    assert_eq!(parse_fills_probe(&shared_report)?.records()?.len(), 2);
+    Ok(())
+}
+
+#[test]
 fn order_table_probe_is_schema_locked_and_read_only() -> Result<()> {
     let executor = RecordingExecutor::new([EMPTY_ORDER_TABLE.to_owned()]);
 
@@ -1740,6 +2015,118 @@ fn order_table_probe_is_schema_locked_and_read_only() -> Result<()> {
     assert!(scripts[0].contains("if (value of cancellableOnlyCheckbox as integer) is 1"));
     assert!(!scripts[0].contains("click button \"确定买入\""));
     assert!(!scripts[0].contains("click button \"确定卖出\""));
+    Ok(())
+}
+
+#[test]
+fn order_probe_preflight_retries_only_transient_window_rebuilds_before_tab_click() -> Result<()> {
+    let executor = RecordingExecutor::new([EMPTY_ORDER_TABLE.to_owned()]);
+    probe_orders_with(&executor)?;
+    let scripts = executor.scripts.borrow();
+    let before_tab = scripts[0]
+        .split_once("click commissionButton")
+        .map(|(prefix, _)| prefix)
+        .expect("orders probe must navigate to the unique 委托 tab");
+    let retry = before_tab
+        .find("repeat with orderPreflightAttempt from 1 to 5")
+        .expect("orders preflight needs a bounded transient retry");
+    let attempt = &before_tab[retry..];
+    for required in [
+        "set liveWindowObjects to get every window",
+        "if matchedWindowCount is 0 then error \"simulation order window is rebuilding\" number -1719",
+        "if matchedWindowCount is greater than 1 then error \"multiple simulation order windows found\"",
+        "if exists button \"转账\" of targetWindow then error",
+        "if exists button \"退出\" of targetWindow then error",
+        "if exists static text \"账户设置\" of targetWindow then error",
+        "if (count of commissionButtons) is not 1 then error \"simulation commission tab is not unique\"",
+        "set stableOrderPreflight to true",
+        "if errorNumber is not -1719 and errorNumber is not -1728 then error errorMessage number errorNumber",
+    ] {
+        assert!(attempt.contains(required), "missing order preflight evidence: {required}");
+    }
+    // Every object that contributes to the uniqueness proof must be readable
+    // in the same attempt.  A transient AX failure may retry the whole
+    // preflight, but it must never silently omit a second window, a live
+    // account marker, or another 委托 button.
+    for partial_evidence_handler in [
+        "set wIsAlive to false\n      try",
+        "set accountLabel to value of s as text\n        end try",
+        "set accountLabel to name of s as text\n          end try",
+        "if (name of candidateButton as text) is \"委托\" then set end of commissionButtons to candidateButton\n      end try",
+    ] {
+        assert!(
+            !attempt.contains(partial_evidence_handler),
+            "order preflight must not publish partial AX evidence: {partial_evidence_handler}"
+        );
+    }
+    for atomic_read in [
+        "set ignoredWindowRole to role of w\n        set candidateWindowSubrole to subrole of w\n      on error errorMessage number errorNumber\n        error errorMessage number errorNumber",
+        "set hasSimulationMarker to exists static text \"模拟练习\" of w\n        set hasNestedLiveControl to (exists static text \"账户设置\" of w)",
+        "if exists button \"退出\" of w then set hasNestedLiveControl to true\n      on error errorMessage number errorNumber\n        error errorMessage number errorNumber",
+        "set candidateButtonName to name of candidateButton as text\n      on error errorMessage number errorNumber",
+    ] {
+        assert!(
+            attempt.contains(atomic_read),
+            "order preflight is missing an atomic AX read: {atomic_read}"
+        );
+    }
+    assert!(before_tab.contains("set lastOrderPreflightError to \"not attempted\""));
+    assert!(attempt
+        .contains("set lastOrderPreflightError to errorMessage & \" [\" & errorNumber & \"]\""));
+    assert!(attempt.contains(
+        "if not stableOrderPreflight then error \"stable Tonghuashun order preflight unavailable: \" & lastOrderPreflightError"
+    ));
+    Ok(())
+}
+
+#[test]
+fn order_probe_identity_preflight_ignores_unrelated_dynamic_window_texts() -> Result<()> {
+    let executor = RecordingExecutor::new([EMPTY_ORDER_TABLE.to_owned()]);
+    probe_orders_with(&executor)?;
+    let scripts = executor.scripts.borrow();
+    let before_tab = scripts[0]
+        .split_once("click commissionButton")
+        .map(|(prefix, _)| prefix)
+        .expect("orders probe must navigate to the unique 委托 tab");
+
+    assert!(before_tab.contains("set hasSimulationMarker to exists static text \"模拟练习\" of w"));
+    assert!(
+        before_tab.contains("set hasNestedLiveControl to (exists static text \"账户设置\" of w)")
+    );
+    assert!(before_tab.contains("if exists button \"转账\" of w then"));
+    assert!(before_tab.contains("if exists button \"退出\" of w then"));
+    assert!(
+        !before_tab.contains("static texts of w"),
+        "the identity proof must not freeze unrelated dynamic texts such as the ticking CN clock"
+    );
+    assert!(
+        !before_tab.contains("entire contents of w"),
+        "the identity proof must not traverse unrelated dynamic descendants"
+    );
+    Ok(())
+}
+
+#[test]
+fn order_probe_post_tab_identity_ignores_unrelated_dynamic_window_texts() -> Result<()> {
+    let executor = RecordingExecutor::new([EMPTY_ORDER_TABLE.to_owned()]);
+    probe_orders_with(&executor)?;
+    let scripts = executor.scripts.borrow();
+    let after_tab = scripts[0]
+        .split_once("click commissionButton")
+        .map(|(_, suffix)| suffix)
+        .expect("orders probe must navigate to the unique 委托 tab");
+    let identity = after_tab
+        .split_once("set frozenFilterStaticTexts to {}")
+        .map(|(prefix, _)| prefix)
+        .expect("post-tab identity must precede the reviewed order filter");
+
+    assert!(identity.contains("set hasSimulationMarker to exists static text \"模拟练习\" of w"));
+    assert!(identity.contains("set liveWindowScrollAreas to get (scroll areas of w)"));
+    assert!(identity.contains(
+        "set nestedSimulationMarker to exists static text \"模拟练习\" of candidateScrollArea"
+    ));
+    assert!(!identity.contains("static texts of w"));
+    assert!(!identity.contains("entire contents of w"));
     Ok(())
 }
 
@@ -1827,7 +2214,7 @@ fn reviewed_order_header_variants_reject_missing_duplicate_reordered_or_unknown_
 }
 
 #[test]
-fn order_filter_is_bound_to_its_label_instead_of_other_window_checkboxes() -> Result<()> {
+fn order_filter_is_bound_to_one_checkbox_even_when_ax_duplicates_the_visible_label() -> Result<()> {
     let probe_executor = RecordingExecutor::new([EMPTY_ORDER_TABLE.to_owned()]);
     probe_orders_with(&probe_executor)?;
     let probe_scripts = probe_executor.scripts.borrow();
@@ -1863,12 +2250,18 @@ fn order_filter_is_bound_to_its_label_instead_of_other_window_checkboxes() -> Re
         assert!(script.contains(frozen_labels));
         assert!(script.contains(append_label));
         assert!(script.contains(iterate_labels));
-        assert!(script.contains("if (count of filterLabels) is not 1"));
+        assert!(script.contains("set matchedFilterCheckboxes to {}"));
+        assert!(script.contains("set candidateFilterCheckboxMatched to false"));
+        assert!(script.contains("set candidateFilterCheckboxMatched to true"));
+        assert!(script.contains(
+            "if candidateFilterCheckboxMatched then set end of matchedFilterCheckboxes to candidateCheckbox"
+        ));
+        assert!(script.contains("if (count of matchedFilterCheckboxes) is not 1"));
+        assert!(!script.contains("if (count of filterLabels) is not 1"));
         assert!(script.contains("set frozenCheckboxes to {}"));
         assert!(script.contains(live_checkboxes));
         assert!(script.contains(append_checkbox));
         assert!(script.contains("set observedCheckboxCount to count of frozenCheckboxes"));
-        assert!(script.contains("if filterCheckboxCount is not 1"));
         assert!(script.contains("item 1 of filterLabelPosition"));
         assert!(script.contains("item 2 of filterLabelPosition"));
         assert!(!script.contains("if (count of checkboxes of targetWindow) is not 1"));

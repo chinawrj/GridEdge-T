@@ -223,7 +223,12 @@ final probe 只用来复核 bundle、版本、唯一模拟身份与代码回读�
 时间倒退与重复冲突，以及失败重启不能刷新 stale 宽限。行情 freshness 以每次完整安全取证的
 `observed_at` 严格推进为准，而不是以成交价是否变化为准：同一价格持续数分钟但取证时间持续推进仍是
 新鲜行情；完全重复、倒退或不推进的证据即使价格变化也必须 fail closed。重启只恢复最后一个已接受的
-证据边界，不能把旧证据重新解释为新采样。
+证据边界，不能把旧证据重新解释为新采样。离散 `last_price` 样本无论频率多高都不能证明采样间没有
+触格交易，测试必须以两个均为 3.36 的合法样本和样本间真实 3.30 极值的不可区分反例，拒绝发布平坦
+OHLC。可接受的修复边界只有同一已审页面直接提供带桶身份的 OHLC，或成交明细具有稳定游标、分页
+无重漏与完成水位并可确定性重建。收盘还须逐字核对所有五分钟 bar 的末 close、全日 max(high) 和
+min(low) 与同页权威日内 last/high/low；不一致、缺字段或无法唯一归桶一律零行情写入。外部网页行情
+不得被测试 fixture 偷换为策略输入，只能作为独立诊断证据。
 未知合同仅允许明确的全成/全撤终态，其余“未报/已报/待报/未成交/部分成交”和未知文案全部阻断；
 durable CANCELLED 与页面仍开放等状态矛盾也必须阻断。旧 v4 前缀在未激活新政策前仍按历史
 10 万元现金门禁只读重放；新政策激活必须以唯一事实绑定当前平台、初始部署、Paper 快照、outbox
@@ -523,3 +528,10 @@ LaunchAgent 路径。
 type 只进入 rejection。重启 broker、ingestor 与 PostgreSQL 后重复同一原字节，unique event 数不得
 变化。匿名 publish 必须失败，宿主 5432 不得监听局域网。Mac shadow 端到端测试必须以本地 durable
 outbox 人为恢复一条未确认消息，群晖最终只能增加 duplicate，且 source cursor 不倒退。
+
+Chrome 网页逐笔扩展的普通门禁必须锁定：默认禁用、provider/host/CSP 白名单、本地固定版本 MQTT.js、
+后台二次 schema/证据哈希校验、IndexedDB source sequence、完全重复幂等、同 row identity 异证据冲突、
+PUBACK 前 PENDING、ACK 丢失或 service worker 重启后重投，以及内容脚本无法读取 MQTT 凭据。扩展不得
+依赖 loopback companion；Chrome/标签页停止时不采集，恢复只补发已持久 PENDING。群晖 WebSocket E2E
+必须用独立 certification source 经 MQTT 5/QoS 1 发布 fixture，并在 PostgreSQL 查询每个精确 event_id。
+重建 Mosquitto 后安装流程必须强制重建 ingestor，防止旧容器健康但已失去订阅；该顺序需普通自动测试。

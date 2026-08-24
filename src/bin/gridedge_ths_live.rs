@@ -8,11 +8,10 @@ use gridedge_t::{
     domain::{Direction, Fill},
     event::EventType,
     journal::{EventReader, SqliteStore},
+    market_mqtt::{MarketMqttClient, MarketMqttMessage},
     service::GridAutomationService,
-    ths_market::ThsQuoteBarBuilder,
     ths_sim::{
-        probe_current_market_quote, probe_current_orders, RemoteFilledEvidence,
-        SimulationMarketQuote, SimulationOrderRecord,
+        probe_current_orders, RemoteFilledEvidence, SimulationMarketQuote, SimulationOrderRecord,
     },
     ths_sim_execution::{
         reconcile_ambiguous_terminal_fills, run_automation_cycle, MacOsSimulationUiDriver,
@@ -20,17 +19,18 @@ use gridedge_t::{
     ths_sim_outbox::{
         StagedCancelState, StagedIntent, StagedIntentState, StagedTerminalResolution, ThsSimOutbox,
     },
+    web_market::{SourceCompletionKind, WebTradeBarBuilder},
 };
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    thread,
     time::Duration as StdDuration,
 };
 
+#[allow(dead_code)]
 const QUOTE_PROBE_BUDGET_SECONDS: i64 = 20;
 
 #[derive(Debug, Parser)]
@@ -49,6 +49,18 @@ struct Args {
     quote_log: PathBuf,
     #[arg(long)]
     bar_log: PathBuf,
+    #[arg(long)]
+    market_event_log: PathBuf,
+    #[arg(long, default_value = "192.168.1.201")]
+    market_mqtt_host: String,
+    #[arg(long, default_value_t = 8883)]
+    market_mqtt_port: u16,
+    #[arg(long, default_value = "gridedge-publisher")]
+    market_mqtt_username: String,
+    #[arg(long)]
+    market_mqtt_password_file: PathBuf,
+    #[arg(long)]
+    market_mqtt_ca_file: PathBuf,
     #[arg(long, default_value_t = 5)]
     interval_minutes: u32,
     #[arg(long, default_value_t = 5)]
@@ -84,51 +96,39 @@ fn run() -> Result<()> {
 
     let config = Config::load(&args.config)?;
     config.validate()?;
-    let mut builder = ThsQuoteBarBuilder::new(config.symbol.clone(), args.interval_minutes)?;
+    if args.activate_platform_upgrade_only {
+        activate_authorized_platform_upgrade(&args, &config)?;
+        return Ok(());
+    }
+    let recovery_started_at = Local::now().naive_local();
+    let mut builder = WebTradeBarBuilder::new(config.symbol.clone(), args.interval_minutes)?;
     ensure_parent(&args.quote_log)?;
     ensure_parent(&args.bar_log)?;
+    ensure_parent(&args.market_event_log)?;
     ensure_parent(Path::new(&config.database))?;
     ensure_parent(&args.outbox)?;
 
     let mut bars = load_unique_bars(&args.bar_log, &config.symbol)?;
-    let last_bar_timestamp = bars.keys().next_back().copied();
-    let historical_quotes = load_validated_quotes(&args.quote_log, builder.quote_symbol())?;
-    let pending_quotes = historical_quotes
-        .iter()
-        .filter(|quote| last_bar_timestamp.is_none_or(|timestamp| quote.observed_at >= timestamp))
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut freshness = PriceFreshness::default();
-    for quote in &pending_quotes {
-        freshness.observe(
-            quote,
-            chrono::Duration::seconds(args.maximum_unchanged_seconds),
-        )?;
-    }
-    let mut recovered_completed_bars = Vec::new();
-    for quote in pending_quotes
-        .into_iter()
-        .filter(|quote| last_bar_timestamp.is_none_or(|timestamp| quote.observed_at >= timestamp))
-    {
-        if let Some(bar) = builder.push(quote)? {
-            recovered_completed_bars.push(bar);
-        }
-    }
-    if let Some(bar) = builder.flush_through(Local::now().naive_local())? {
-        recovered_completed_bars.push(bar);
-    }
+    validate_recovery_bars_not_future(bars.values(), recovery_started_at)?;
+    let recovered_completed_bars = replay_market_messages(
+        &mut builder,
+        load_market_messages(&args.market_event_log)?,
+        recovery_started_at,
+    )?;
 
+    let quote_symbol = config
+        .symbol
+        .strip_suffix(".SZ")
+        .or_else(|| config.symbol.strip_suffix(".SH"))
+        .context("market symbol lacks a reviewed suffix")?;
+    let venue = if config.symbol.ends_with(".SZ") {
+        "XSHE"
+    } else {
+        "XSHG"
+    };
     let mut store = SqliteStore::open(&config.database)?;
     store.migrate()?;
     let exists = store.run_ids()?.iter().any(|run_id| run_id == &args.run_id);
-    if args.activate_platform_upgrade_only
-        && (!exists
-            || gridedge_t::run_context::RunContext::load(&store, &args.run_id)?
-                .and_then(|context| context.pending_platform_upgrade)
-                .is_none())
-    {
-        bail!("activate-only requires one pending durable platform authorization")
-    }
     let mut service = if exists {
         GridAutomationService::recover_with_algorithm(
             config.clone(),
@@ -144,72 +144,117 @@ fn run() -> Result<()> {
             Some(args.run_id.clone()),
         )?
     };
-    if args.activate_platform_upgrade_only {
-        let verify = SqliteStore::open_existing_read_only(&config.database)?;
-        let context = gridedge_t::run_context::RunContext::load(&verify, &args.run_id)?
-            .context("activated run context disappeared")?;
-        let current_platform_sha256 = gridedge_t::decision::current_platform_sha256();
-        if context.pending_platform_upgrade.is_some()
-            || context.effective_platform_sha256.as_deref()
-                != Some(current_platform_sha256.as_str())
-        {
-            bail!("platform upgrade activation did not reach the target identity")
-        }
-        return Ok(());
-    }
-    for bar in bars.values() {
-        service.on_bar(bar)?;
-    }
-
     let mut driver = MacOsSimulationUiDriver::default();
     let mut initial_after_sequence = if ThsSimOutbox::open(&args.outbox)?.has_binding()? {
         None
     } else {
         Some(0)
     };
-    for bar in recovered_completed_bars {
-        reconcile_and_process_bar(
-            &args,
-            Path::new(&config.database),
-            &mut initial_after_sequence,
-            bar.timestamp,
-            &mut driver,
-            &mut bars,
-            &mut service,
-            bar,
-        )?;
+    service.enter_market_data_recovery("EASTMONEY_SESSION_HISTORY_BACKFILL")?;
+    for bar in bars.values() {
+        service.on_bar(bar)?;
     }
-    let mut settled_lunch_date = None;
+    for bar in recovered_completed_bars {
+        process_market_recovery_bar(&args.bar_log, &mut bars, &mut service, bar)?;
+    }
+
+    let mut market = MarketMqttClient::connect(
+        &args.market_mqtt_host,
+        args.market_mqtt_port,
+        &args.market_mqtt_username,
+        &args.market_mqtt_password_file,
+        &args.market_mqtt_ca_file,
+        &format!("gridedge-paper-{quote_symbol}"),
+        venue,
+        quote_symbol,
+    )?;
+    market.await_ready(StdDuration::from_secs(10))?;
     loop {
-        let now = Local::now().naive_local();
-        if is_after_daily_window(now) {
-            if let Some(bar) = builder.flush_through(now)? {
-                reconcile_and_process_bar(
-                    &args,
-                    Path::new(&config.database),
-                    &mut initial_after_sequence,
-                    now,
-                    &mut driver,
-                    &mut bars,
-                    &mut service,
-                    bar,
-                )?;
-            }
+        if is_after_daily_window(Local::now().naive_local()) {
             reconcile_terminal_boundary(
                 &args,
                 Path::new(&config.database),
                 &mut initial_after_sequence,
-                now,
+                Local::now().naive_local(),
                 &mut driver,
             )?;
             return Ok(());
         }
-        if is_lunch_settlement_window(now) {
-            if settled_lunch_date == Some(now.date()) {
-                thread::sleep(StdDuration::from_secs(15));
-                continue;
+        let Some(message) = market.receive(StdDuration::from_secs(args.poll_seconds))? else {
+            continue;
+        };
+        append_json_line(
+            &args.market_event_log,
+            &DurableMarketMessage::from(&message),
+        )?;
+        let now = Local::now().naive_local();
+        let receipt = builder.ingest_with_receipt_at(&message.topic, &message.payload, now)?;
+        if let Some(reason) = &receipt.quarantine_reason {
+            eprintln!(
+                "quarantined market event timestamp_us={} reason={reason}",
+                receipt.event_timestamp_us
+            );
+        }
+        market_timestamp_not_future(receipt.event_timestamp_us, now, "market event")?;
+        market_timestamp_not_future(receipt.received_timestamp_us, now, "market receipt")?;
+        let date = now.date();
+        let released_bar_count = receipt.bars.len();
+        let completion_current = receipt
+            .completion
+            .map(|completion| {
+                market_watermark_is_current(
+                    Some(completion.covered_through_us),
+                    now,
+                    args.maximum_unchanged_seconds,
+                )
+                .map(|current| (completion, current))
+            })
+            .transpose()?;
+        let completion_gate = completion_current
+            .map(|(completion, current)| {
+                let previous_current = market_watermarks_are_contiguous(
+                    completion.previous_covered_through_us,
+                    completion.covered_through_us,
+                    args.maximum_unchanged_seconds,
+                )?;
+                let released_bars_current = receipt
+                    .bars
+                    .iter()
+                    .map(|bar| {
+                        market_bar_is_current(bar.timestamp, now, args.maximum_unchanged_seconds)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .all(std::convert::identity);
+                Ok::<_, anyhow::Error>((
+                    completion,
+                    current,
+                    previous_current,
+                    released_bars_current,
+                ))
+            })
+            .transpose()?;
+        if let Some((completion, current, previous_current, released_bars_current)) =
+            completion_gate
+        {
+            if completion_requires_recovery(
+                service.state.mode,
+                completion.kind == SourceCompletionKind::LiveContiguous,
+                current,
+                previous_current,
+                completion.session_date == date,
+                released_bar_count,
+                released_bars_current,
+            ) {
+                service.enter_market_data_recovery("EASTMONEY_LIVE_WATERMARK_CATCHUP")?;
             }
-            if let Some(bar) = builder.flush_through(now)? {
+        }
+        for bar in receipt.bars {
+            if service.state.mode == gridedge_t::domain::ServiceMode::Running {
+                if !is_executable_strategy_bar(&bar) {
+                    store_bar_if_new(&args.bar_log, &mut bars, bar)?;
+                    continue;
+                }
                 reconcile_and_process_bar(
                     &args,
                     Path::new(&config.database),
@@ -220,59 +265,153 @@ fn run() -> Result<()> {
                     &mut service,
                     bar,
                 )?;
+            } else {
+                process_market_recovery_bar(&args.bar_log, &mut bars, &mut service, bar)?;
             }
-            reconcile_terminal_boundary(
-                &args,
-                Path::new(&config.database),
-                &mut initial_after_sequence,
-                now,
-                &mut driver,
-            )?;
-            settled_lunch_date = Some(now.date());
-            thread::sleep(StdDuration::from_secs(15));
-            continue;
         }
-        if is_market_session(now) {
-            if let Some(delay) = quote_probe_boundary_delay(now, args.interval_minutes)? {
-                thread::sleep(delay);
-                continue;
-            }
-            let quote = probe_current_market_quote(builder.quote_symbol())?;
-            freshness.observe(
-                &quote,
-                chrono::Duration::seconds(args.maximum_unchanged_seconds),
-            )?;
-            append_json_line(&args.quote_log, &quote)?;
-            let evidence_time = quote.observed_at;
-            if let Some(bar) = builder.push(quote)? {
-                reconcile_and_process_bar(
+        if let Some((completion, current, previous_current, released_bars_current)) =
+            completion_gate
+        {
+            if completion_allows_resume(
+                service.state.mode,
+                completion.kind == SourceCompletionKind::LiveContiguous,
+                current,
+                previous_current,
+                completion.session_date == date,
+                released_bar_count,
+                released_bars_current,
+            ) && builder.has_complete_session(date)
+                && is_market_session(now)
+            {
+                resume_after_market_data_recovery(
                     &args,
                     Path::new(&config.database),
                     &mut initial_after_sequence,
-                    evidence_time,
+                    now,
                     &mut driver,
-                    &mut bars,
                     &mut service,
-                    bar,
                 )?;
             }
-            if let Some(bar) = builder.flush_through(evidence_time)? {
-                reconcile_and_process_bar(
-                    &args,
-                    Path::new(&config.database),
-                    &mut initial_after_sequence,
-                    evidence_time,
-                    &mut driver,
-                    &mut bars,
-                    &mut service,
-                    bar,
-                )?;
-            }
-            thread::sleep(StdDuration::from_secs(args.poll_seconds));
-        } else {
-            thread::sleep(StdDuration::from_secs(15));
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableMarketMessage {
+    topic: String,
+    payload: Vec<u8>,
+}
+
+impl From<&MarketMqttMessage> for DurableMarketMessage {
+    fn from(value: &MarketMqttMessage) -> Self {
+        Self {
+            topic: value.topic.clone(),
+            payload: value.payload.clone(),
+        }
+    }
+}
+
+fn activate_authorized_platform_upgrade(args: &Args, config: &Config) -> Result<()> {
+    ensure_parent(Path::new(&config.database))?;
+    let mut store = SqliteStore::open(&config.database)?;
+    store.migrate()?;
+    let exists = store.run_ids()?.iter().any(|run_id| run_id == &args.run_id);
+    if !exists
+        || gridedge_t::run_context::RunContext::load(&store, &args.run_id)?
+            .and_then(|context| context.pending_platform_upgrade)
+            .is_none()
+    {
+        bail!("activate-only requires one pending durable platform authorization")
+    }
+    let service = GridAutomationService::recover_with_algorithm(
+        config.clone(),
+        store,
+        algorithm_from_config(config)?,
+        args.run_id.clone(),
+    )?;
+    drop(service);
+
+    let verify = SqliteStore::open_existing_read_only(&config.database)?;
+    let context = gridedge_t::run_context::RunContext::load(&verify, &args.run_id)?
+        .context("activated run context disappeared")?;
+    let current_platform_sha256 = gridedge_t::decision::current_platform_sha256();
+    if context.pending_platform_upgrade.is_some()
+        || context.effective_platform_sha256.as_deref() != Some(current_platform_sha256.as_str())
+    {
+        bail!("platform upgrade activation did not reach the target identity")
+    }
+    Ok(())
+}
+
+fn load_market_messages(path: &Path) -> Result<Vec<DurableMarketMessage>> {
+    load_json_lines(path)
+}
+
+fn replay_market_messages(
+    builder: &mut WebTradeBarBuilder,
+    messages: Vec<DurableMarketMessage>,
+    recovery_started_at: NaiveDateTime,
+) -> Result<Vec<MarketBar>> {
+    let mut recovered = Vec::new();
+    for message in messages {
+        let receipt = builder.ingest_with_receipt_at(
+            &message.topic,
+            &message.payload,
+            recovery_started_at,
+        )?;
+        market_timestamp_not_future(
+            receipt.event_timestamp_us,
+            recovery_started_at,
+            "replayed market event",
+        )?;
+        market_timestamp_not_future(
+            receipt.received_timestamp_us,
+            recovery_started_at,
+            "replayed market receipt",
+        )?;
+        if let Some(completion) = receipt.completion {
+            market_timestamp_not_future(
+                completion.covered_through_us,
+                recovery_started_at,
+                "replayed market completion watermark",
+            )?;
+        }
+        validate_recovery_bars_not_future(receipt.bars.iter(), recovery_started_at)?;
+        recovered.extend(receipt.bars);
+    }
+    Ok(recovered)
+}
+
+fn validate_recovery_bars_not_future<'a>(
+    bars: impl IntoIterator<Item = &'a MarketBar>,
+    recovery_started_at: NaiveDateTime,
+) -> Result<()> {
+    for bar in bars {
+        if bar.timestamp > recovery_started_at {
+            bail!(
+                "replayed completed market bar {} is later than recovery start {}",
+                bar.timestamp,
+                recovery_started_at
+            )
+        }
+    }
+    Ok(())
+}
+
+fn market_timestamp_not_future(
+    timestamp_us: u64,
+    now: NaiveDateTime,
+    evidence: &str,
+) -> Result<()> {
+    let timestamp = i64::try_from(timestamp_us)
+        .with_context(|| format!("{evidence} exceeds the supported clock"))?;
+    let timestamp_utc = chrono::DateTime::from_timestamp_micros(timestamp)
+        .with_context(|| format!("{evidence} timestamp is invalid"))?;
+    let timestamp_local = (timestamp_utc + chrono::Duration::hours(8)).naive_utc();
+    if timestamp_local > now {
+        bail!("{evidence} is in the future")
+    }
+    Ok(())
 }
 
 fn probe_remote_orders() -> Result<Vec<SimulationOrderRecord>> {
@@ -351,6 +490,24 @@ fn reconcile_terminal_boundary(
     }
     remote_terminal_permit(&remote_records, source_database, &args.run_id, &args.outbox)?;
     Ok(())
+}
+
+fn resume_after_market_data_recovery(
+    args: &Args,
+    source_database: &Path,
+    initial_after_sequence: &mut Option<i64>,
+    now: NaiveDateTime,
+    driver: &mut MacOsSimulationUiDriver,
+    service: &mut GridAutomationService,
+) -> Result<()> {
+    reconcile_terminal_boundary(args, source_database, initial_after_sequence, now, driver)?;
+    let reconciliation = service.reconcile()?;
+    if !reconciliation.matched {
+        bail!("market-data recovery cannot resume before Paper reconciliation matches")
+    }
+    service.resume_after_reconciliation(
+        "Eastmoney complete source watermark and Paper/remote terminal audit matched",
+    )
 }
 
 #[cfg(test)]
@@ -700,12 +857,14 @@ fn remote_order_matches_intent(record: &SimulationOrderRecord, intent: &StagedIn
         && record.order_price == intent.order.limit_price
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
 struct PriceFreshness {
     session: Option<(NaiveDate, u8)>,
     last_observed_at: Option<NaiveDateTime>,
 }
 
+#[allow(dead_code)]
 impl PriceFreshness {
     fn observe(
         &mut self,
@@ -738,6 +897,7 @@ impl PriceFreshness {
     }
 }
 
+#[allow(dead_code)]
 fn market_session_key(value: NaiveDateTime) -> Option<(NaiveDate, u8)> {
     if value.weekday().number_from_monday() > 5 {
         return None;
@@ -761,6 +921,109 @@ fn process_bar(
 ) -> Result<()> {
     store_bar_if_new(&args.bar_log, bars, bar.clone())?;
     service.on_bar(&bar)
+}
+
+fn process_market_recovery_bar(
+    bar_log: &Path,
+    bars: &mut BTreeMap<NaiveDateTime, MarketBar>,
+    service: &mut GridAutomationService,
+    bar: MarketBar,
+) -> Result<()> {
+    if service.state.mode != gridedge_t::domain::ServiceMode::ReadOnly {
+        bail!("market recovery bar cannot be applied while the service is RUNNING")
+    }
+    let already_durable = bars.contains_key(&bar.timestamp);
+    store_bar_if_new(bar_log, bars, bar.clone())?;
+    if is_executable_strategy_bar(&bar) && !already_durable {
+        service.on_bar(&bar)?;
+    }
+    Ok(())
+}
+
+fn market_watermark_is_current(
+    covered_through_us: Option<u64>,
+    now: NaiveDateTime,
+    maximum_age_seconds: i64,
+) -> Result<bool> {
+    let Some(covered_through_us) = covered_through_us else {
+        return Ok(false);
+    };
+    let timestamp = i64::try_from(covered_through_us)
+        .context("market completion watermark exceeds the supported clock")?;
+    let covered_utc = chrono::DateTime::from_timestamp_micros(timestamp)
+        .context("market completion watermark is invalid")?;
+    let covered = (covered_utc + chrono::Duration::hours(8)).naive_utc();
+    let age = now - covered;
+    if age < chrono::Duration::zero() {
+        bail!("market completion watermark is in the future")
+    }
+    Ok(age <= chrono::Duration::seconds(maximum_age_seconds))
+}
+
+fn market_watermarks_are_contiguous(
+    previous_covered_through_us: Option<u64>,
+    covered_through_us: u64,
+    maximum_gap_seconds: i64,
+) -> Result<bool> {
+    let Some(previous_covered_through_us) = previous_covered_through_us else {
+        return Ok(false);
+    };
+    let gap_us = covered_through_us
+        .checked_sub(previous_covered_through_us)
+        .context("market completion watermark moved backwards")?;
+    let maximum_gap_us = u64::try_from(maximum_gap_seconds)
+        .context("market maximum gap must be non-negative")?
+        .checked_mul(1_000_000)
+        .context("market maximum gap overflow")?;
+    Ok(gap_us <= maximum_gap_us)
+}
+
+fn market_bar_is_current(
+    bar_timestamp: NaiveDateTime,
+    now: NaiveDateTime,
+    maximum_age_seconds: i64,
+) -> Result<bool> {
+    let age = now - bar_timestamp;
+    if age < chrono::Duration::zero() {
+        bail!("completed market bar is in the future")
+    }
+    Ok(age <= chrono::Duration::seconds(maximum_age_seconds))
+}
+
+fn completion_requires_recovery(
+    mode: gridedge_t::domain::ServiceMode,
+    completion_is_live: bool,
+    completion_is_current: bool,
+    previous_completion_is_current: bool,
+    session_matches_today: bool,
+    released_bar_count: usize,
+    released_bars_are_current: bool,
+) -> bool {
+    mode == gridedge_t::domain::ServiceMode::Running
+        && (!completion_is_live
+            || !completion_is_current
+            || !previous_completion_is_current
+            || !session_matches_today
+            || released_bar_count > 1
+            || !released_bars_are_current)
+}
+
+fn completion_allows_resume(
+    mode: gridedge_t::domain::ServiceMode,
+    completion_is_live: bool,
+    completion_is_current: bool,
+    previous_completion_is_current: bool,
+    session_matches_today: bool,
+    released_bar_count: usize,
+    released_bars_are_current: bool,
+) -> bool {
+    mode == gridedge_t::domain::ServiceMode::ReadOnly
+        && completion_is_live
+        && completion_is_current
+        && previous_completion_is_current
+        && session_matches_today
+        && released_bar_count <= 1
+        && released_bars_are_current
 }
 
 fn run_outbox(
@@ -858,6 +1121,7 @@ fn load_unique_bars(
     Ok(bars)
 }
 
+#[allow(dead_code)]
 fn load_validated_quotes(path: &Path, expected_symbol: &str) -> Result<Vec<SimulationMarketQuote>> {
     let quotes = load_json_lines::<SimulationMarketQuote>(path)?;
     let mut previous = None;
@@ -881,6 +1145,7 @@ fn ensure_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn is_market_session(now: NaiveDateTime) -> bool {
     if now.weekday().number_from_monday() > 5 {
         return false;
@@ -889,6 +1154,7 @@ fn is_market_session(now: NaiveDateTime) -> bool {
     (at(9, 30)..at(11, 30)).contains(&time) || (at(13, 0)..at(15, 0)).contains(&time)
 }
 
+#[allow(dead_code)]
 fn quote_probe_boundary_delay(
     now: NaiveDateTime,
     interval_minutes: u32,
@@ -925,9 +1191,15 @@ fn quote_probe_boundary_delay(
 }
 
 fn is_after_daily_window(now: NaiveDateTime) -> bool {
-    now.weekday().number_from_monday() <= 5 && now.time() >= at(14, 55)
+    now.weekday().number_from_monday() <= 5 && now.time() >= at(15, 5)
 }
 
+fn is_executable_strategy_bar(bar: &MarketBar) -> bool {
+    let time = bar.timestamp.time();
+    (at(9, 35)..=at(11, 25)).contains(&time) || (at(13, 5)..=at(14, 55)).contains(&time)
+}
+
+#[allow(dead_code)]
 fn is_lunch_settlement_window(now: NaiveDateTime) -> bool {
     now.weekday().number_from_monday() <= 5 && (at(11, 25)..at(13, 0)).contains(&now.time())
 }

@@ -21,6 +21,7 @@ use gridedge_t::{
 use rusqlite::{params, Connection};
 use rust_decimal::Decimal;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use tempfile::tempdir;
 
@@ -122,6 +123,93 @@ mod live_subject {
             is_after_daily_window(now),
         )
     }
+
+    pub(super) fn watermark_is_current(
+        covered_through_us: Option<u64>,
+        now: chrono::NaiveDateTime,
+        maximum_age_seconds: i64,
+    ) -> anyhow::Result<bool> {
+        market_watermark_is_current(covered_through_us, now, maximum_age_seconds)
+    }
+
+    pub(super) fn bar_is_current(
+        bar_timestamp: chrono::NaiveDateTime,
+        now: chrono::NaiveDateTime,
+        maximum_age_seconds: i64,
+    ) -> anyhow::Result<bool> {
+        market_bar_is_current(bar_timestamp, now, maximum_age_seconds)
+    }
+
+    pub(super) fn watermarks_are_contiguous(
+        previous_covered_through_us: Option<u64>,
+        covered_through_us: u64,
+        maximum_gap_seconds: i64,
+    ) -> anyhow::Result<bool> {
+        market_watermarks_are_contiguous(
+            previous_covered_through_us,
+            covered_through_us,
+            maximum_gap_seconds,
+        )
+    }
+
+    pub(super) fn recovery_decision(
+        mode: gridedge_t::domain::ServiceMode,
+        completion_is_live: bool,
+        completion_is_current: bool,
+        previous_completion_is_current: bool,
+        session_matches_today: bool,
+        released_bar_count: usize,
+        released_bars_are_current: bool,
+    ) -> (bool, bool) {
+        let enter_recovery = completion_requires_recovery(
+            mode,
+            completion_is_live,
+            completion_is_current,
+            previous_completion_is_current,
+            session_matches_today,
+            released_bar_count,
+            released_bars_are_current,
+        );
+        let mode_after_precheck = if enter_recovery {
+            gridedge_t::domain::ServiceMode::ReadOnly
+        } else {
+            mode
+        };
+        (
+            enter_recovery,
+            completion_allows_resume(
+                mode_after_precheck,
+                completion_is_live,
+                completion_is_current,
+                previous_completion_is_current,
+                session_matches_today,
+                released_bar_count,
+                released_bars_are_current,
+            ),
+        )
+    }
+
+    pub(super) fn replay_market_messages_at(
+        messages: Vec<(&str, Vec<u8>)>,
+        now: chrono::NaiveDateTime,
+    ) -> anyhow::Result<usize> {
+        let durable = messages
+            .into_iter()
+            .map(|(topic, payload)| DurableMarketMessage {
+                topic: topic.to_owned(),
+                payload,
+            })
+            .collect();
+        let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
+        Ok(replay_market_messages(&mut builder, durable, now)?.len())
+    }
+
+    pub(super) fn validate_recovery_bars_at(
+        bars: &[MarketBar],
+        now: chrono::NaiveDateTime,
+    ) -> anyhow::Result<()> {
+        validate_recovery_bars_not_future(bars.iter(), now)
+    }
 }
 
 #[test]
@@ -194,6 +282,17 @@ fn launch_agent_starts_only_weekdays_at_0925_and_restarts_only_failures() {
     assert!(plist.contains(&format!(
         "{deployment_root}/runtime/002256-opening-v1-bars.jsonl"
     )));
+    assert!(plist.contains(&format!(
+        "{deployment_root}/runtime/002256-opening-v1-market-mqtt.jsonl"
+    )));
+    assert!(plist.contains("--market-mqtt-host"));
+    assert!(plist.contains("<string>192.168.1.201</string>"));
+    assert!(plist.contains("--market-mqtt-port"));
+    assert!(plist.contains("<string>8883</string>"));
+    assert!(plist.contains("--market-mqtt-password-file"));
+    assert!(plist.contains(&format!("{deployment_root}/market-mqtt/publisher.password")));
+    assert!(plist.contains("--market-mqtt-ca-file"));
+    assert!(plist.contains(&format!("{deployment_root}/market-mqtt/ca.crt")));
     assert!(plist.contains(&format!("{deployment_root}/logs/worker.stdout.log")));
     assert!(plist.contains(&format!("{deployment_root}/logs/worker.stderr.log")));
     assert!(!plist.contains("/Documents/"));
@@ -1422,33 +1521,41 @@ fn terminal_permit_rejects_duplicate_rows_for_the_same_remote_contract() -> Resu
 }
 
 #[test]
-fn five_second_quote_path_defers_all_order_reconciliation_until_a_completed_bar() {
+fn mqtt_tick_path_persists_raw_events_and_defers_order_reconciliation_until_completed_bars() {
     let source = std::fs::read_to_string("src/bin/gridedge_ths_live.rs")
         .expect("reviewed deployment orchestrator source");
     let market_branch = source
-        .split_once("if is_market_session(now) {")
-        .expect("market branch")
+        .split_once("let Some(message) = market.receive")
+        .expect("MQTT receive branch")
         .1
-        .split_once("} else {")
-        .expect("market branch end")
+        .split_once("fn probe_remote_orders")
+        .expect("MQTT receive branch end")
         .0;
-    let quote = market_branch
-        .find("let quote = probe_current_market_quote")
-        .expect("read-only quote probe");
+    let receive = 0;
     let append = market_branch
-        .find("append_json_line(&args.quote_log, &quote)?")
-        .expect("durable quote evidence");
-    let push = market_branch
-        .find("if let Some(bar) = builder.push(quote)? {")
+        .find("append_json_line(")
+        .expect("durable MQTT append");
+    let append_end = market_branch[append..]
+        .find("DurableMarketMessage::from(&message)")
+        .map(|offset| append + offset)
+        .expect("durable MQTT evidence");
+    let ingest = market_branch
+        .find("builder.ingest_with_receipt_at(&message.topic, &message.payload, now)")
+        .expect("source-sequenced trade builder");
+    let completed = market_branch
+        .find("for bar in receipt.bars")
         .expect("completed-bar boundary");
-    let flush = market_branch
-        .find("if let Some(bar) = builder.flush_through(evidence_time)? {")
-        .expect("completed-bar flush boundary");
-    assert!(quote < append && append < push && push < flush);
-    assert_eq!(
-        market_branch.matches("reconcile_and_process_bar(").count(),
-        2
+    let reconcile = market_branch
+        .find("reconcile_and_process_bar(")
+        .expect("permit-gated completed bar");
+    assert!(
+        receive < append
+            && append <= append_end
+            && append_end < ingest
+            && ingest < completed
+            && completed < reconcile
     );
+    let raw_receipt = &market_branch[..completed];
     for forbidden in [
         "probe_remote_orders(",
         "verify_remote_contracts(",
@@ -1459,53 +1566,380 @@ fn five_second_quote_path_defers_all_order_reconciliation_until_a_completed_bar(
         "service.on_bar(",
     ] {
         assert!(
-            !market_branch.contains(forbidden),
-            "a quote-only poll must not perform {forbidden}"
+            !raw_receipt.contains(forbidden),
+            "raw MQTT receipt must not directly perform {forbidden}"
         );
     }
     assert!(source.contains("_permit: &RemoteTerminalPermit"));
 }
 
 #[test]
-fn quote_probe_does_not_start_inside_the_reviewed_twenty_second_boundary_guard() {
-    const REVIEWED_QUOTE_PROBE_BUDGET_SECONDS: i64 = 20;
-
-    fn expected_delay(timestamp: &str) -> Option<i64> {
-        let now = at(timestamp);
-        let seconds = now.and_utc().timestamp().rem_euclid(5 * 60);
-        let until_boundary = 5 * 60 - seconds;
-        (until_boundary <= REVIEWED_QUOTE_PROBE_BUDGET_SECONDS).then_some(until_boundary)
-    }
-
-    assert_eq!(expected_delay("2026-08-18 09:34:39"), None);
-    assert_eq!(expected_delay("2026-08-18 09:34:40"), Some(20));
-    assert_eq!(expected_delay("2026-08-18 09:34:59"), Some(1));
-    assert_eq!(expected_delay("2026-08-18 09:35:00"), None);
-
+fn production_loop_uses_complete_mqtt_ticks_and_never_the_discrete_quote_probe() {
     let source = std::fs::read_to_string("src/bin/gridedge_ths_live.rs")
         .expect("reviewed deployment orchestrator source");
-    assert!(source.contains("const QUOTE_PROBE_BUDGET_SECONDS: i64 = 20;"));
-    let market_branch = source
-        .split_once("if is_market_session(now) {")
-        .expect("market branch")
+    let production = source
+        .split_once("fn run() -> Result<()> {")
+        .expect("production run")
         .1
-        .split_once("} else {")
-        .expect("market branch end")
+        .split_once("fn probe_remote_orders")
+        .expect("production run end")
         .0;
-    let guard = market_branch
-        .find("if let Some(delay) = quote_probe_boundary_delay(now, args.interval_minutes)? {")
-        .expect("bounded quote-probe start guard");
-    let quote = market_branch
-        .find("let quote = probe_current_market_quote")
-        .expect("read-only quote probe");
-    assert!(guard < quote);
-    let guard_body = &market_branch[guard..quote];
-    assert!(guard_body.contains("thread::sleep(delay);"));
-    assert!(guard_body.contains("continue;"));
+    assert!(production.contains("MarketMqttClient::connect("));
+    assert!(production
+        .contains("builder.ingest_with_receipt_at(&message.topic, &message.payload, now)"));
+    assert!(production.contains("builder.has_complete_session(date)"));
+    assert!(!production.contains("probe_current_market_quote"));
 }
 
 #[test]
-fn completed_and_reconstructed_bars_share_one_permit_gated_processing_path() {
+fn startup_backfill_stays_read_only_without_ui_until_the_live_watermark_is_current() {
+    let source = std::fs::read_to_string("src/bin/gridedge_ths_live.rs")
+        .expect("reviewed deployment orchestrator source");
+    let production = source
+        .split_once("fn run() -> Result<()> {")
+        .expect("production run")
+        .1
+        .split_once("fn probe_remote_orders")
+        .expect("production run end")
+        .0;
+    let recovered_start = production
+        .find("for bar in recovered_completed_bars {")
+        .expect("startup market backfill");
+    let receive = production
+        .find("let Some(message) = market.receive")
+        .expect("live MQTT receive loop");
+    let recovered = &production[recovered_start..receive];
+
+    assert!(recovered.contains("process_market_recovery_bar("));
+    assert!(!recovered.contains("reconcile_and_process_bar("));
+    assert!(!recovered.contains("probe_remote_orders("));
+
+    let connect = production
+        .find("MarketMqttClient::connect(")
+        .expect("MQTT connection");
+    assert!(
+        recovered_start < connect,
+        "the MQTT keepalive must not start before local backfill finishes"
+    );
+
+    assert!(!recovered.contains("resume_after_market_data_recovery("));
+
+    let live = &production[receive..];
+    let current = live
+        .find("market_watermark_is_current(")
+        .expect("fresh completion watermark gate");
+    let precheck = live
+        .find("completion_requires_recovery(")
+        .expect("pre-bar recovery decision");
+    let completed_bars = live
+        .find("for bar in receipt.bars")
+        .expect("completion-bound bars");
+    let resume = live
+        .find("resume_after_market_data_recovery(")
+        .expect("single remote reconciliation before RUNNING");
+    assert!(current < precheck && precheck < completed_bars && completed_bars < resume);
+
+    let receive_now = live
+        .find("let now = Local::now().naive_local();")
+        .expect("post-receive local clock sample");
+    assert!(receive_now < current);
+
+    let startup_recovery = production
+        .find("service.enter_market_data_recovery(\"EASTMONEY_SESSION_HISTORY_BACKFILL\")")
+        .expect("startup recovery mode");
+    let durable_replay = production
+        .find("for bar in bars.values()")
+        .expect("durable bar replay");
+    assert!(startup_recovery < durable_replay);
+
+    let frozen_clock = production
+        .find("let recovery_started_at = Local::now().naive_local()")
+        .expect("one frozen restart clock");
+    let load_bars = production
+        .find("load_unique_bars(&args.bar_log")
+        .expect("durable bar load");
+    let validate_bars = production
+        .find("validate_recovery_bars_not_future(bars.values(), recovery_started_at)")
+        .expect("future durable bar gate");
+    let replay_raw = production
+        .find("let recovered_completed_bars = replay_market_messages(")
+        .expect("future raw-event replay gate");
+    let open_ledger = production
+        .find("let mut store = SqliteStore::open(&config.database)")
+        .expect("ledger open");
+    assert!(
+        frozen_clock < load_bars
+            && load_bars < validate_bars
+            && validate_bars < replay_raw
+            && replay_raw < open_ledger,
+        "all restart evidence must pass the frozen-clock gate before the ledger can be opened"
+    );
+
+    let live_event_gate = live
+        .find("market_timestamp_not_future(receipt.event_timestamp_us, now")
+        .expect("future live-event gate");
+    assert!(receive_now < live_event_gate && live_event_gate < current);
+}
+
+#[test]
+fn recovery_watermark_rejects_stale_and_future_completion() -> Result<()> {
+    let now = at("2026-08-21 13:30:00");
+    let to_us = |timestamp: NaiveDateTime| {
+        u64::try_from(
+            (timestamp - chrono::Duration::hours(8))
+                .and_utc()
+                .timestamp_micros(),
+        )
+        .expect("positive reviewed timestamp")
+    };
+
+    assert!(live_subject::watermark_is_current(
+        Some(to_us(at("2026-08-21 13:29:00"))),
+        now,
+        60,
+    )?);
+    assert!(!live_subject::watermark_is_current(
+        Some(to_us(at("2026-08-21 13:28:59"))),
+        now,
+        60,
+    )?);
+    assert!(!live_subject::watermark_is_current(None, now, 60)?);
+    assert!(
+        live_subject::watermark_is_current(Some(to_us(at("2026-08-21 13:30:01"))), now, 60,)
+            .is_err()
+    );
+    assert!(live_subject::bar_is_current(
+        at("2026-08-21 13:29:00"),
+        now,
+        60,
+    )?);
+    assert!(!live_subject::bar_is_current(
+        at("2026-08-21 13:05:00"),
+        now,
+        60,
+    )?);
+    assert!(live_subject::bar_is_current(at("2026-08-21 13:30:01"), now, 60,).is_err());
+
+    assert!(live_subject::watermarks_are_contiguous(
+        Some(to_us(at("2026-08-21 13:29:00"))),
+        to_us(at("2026-08-21 13:29:30")),
+        60,
+    )?);
+    assert!(
+        !live_subject::watermarks_are_contiguous(
+            Some(to_us(at("2026-08-21 13:28:00"))),
+            to_us(at("2026-08-21 13:29:30")),
+            60,
+        )?,
+        "a real source-watermark gap must enter recovery"
+    );
+    assert!(
+        live_subject::watermarks_are_contiguous(None, to_us(at("2026-08-21 13:29:30")), 60,)
+            .is_ok_and(|contiguous| !contiguous)
+    );
+    assert!(live_subject::watermarks_are_contiguous(
+        Some(to_us(at("2026-08-21 13:30:00"))),
+        to_us(at("2026-08-21 13:29:30")),
+        60,
+    )
+    .is_err());
+    Ok(())
+}
+
+#[test]
+fn ui_delay_does_not_reclassify_a_contiguous_previous_source_watermark_as_stale() -> Result<()> {
+    let now_after_ui = at("2026-08-21 14:36:18");
+    let previous = at("2026-08-21 14:35:00");
+    let current = at("2026-08-21 14:35:30");
+    let to_us = |timestamp: NaiveDateTime| {
+        u64::try_from(
+            (timestamp - chrono::Duration::hours(8))
+                .and_utc()
+                .timestamp_micros(),
+        )
+        .unwrap()
+    };
+
+    assert!(live_subject::watermark_is_current(
+        Some(to_us(current)),
+        now_after_ui,
+        60,
+    )?);
+    assert!(!live_subject::watermark_is_current(
+        Some(to_us(previous)),
+        now_after_ui,
+        60,
+    )?);
+    assert!(live_subject::watermarks_are_contiguous(
+        Some(to_us(previous)),
+        to_us(current),
+        60,
+    )?);
+
+    let source = std::fs::read_to_string("src/bin/gridedge_ths_live.rs")?;
+    let production = source
+        .split_once("fn run() -> Result<()> {")
+        .expect("production run")
+        .1
+        .split_once("fn probe_remote_orders")
+        .expect("production run end")
+        .0;
+    assert!(production.contains("market_watermarks_are_contiguous("));
+    assert!(!production.contains(
+        "market_watermark_is_current(\n                completion.previous_covered_through_us"
+    ));
+    Ok(())
+}
+
+#[test]
+fn restart_replay_rejects_future_raw_evidence_and_future_durable_bars_before_use() -> Result<()> {
+    const TRADE_TOPIC: &str = "gridedge/market/v1/XSHE/002256/trade";
+    const STATUS_TOPIC: &str = "gridedge/market/v1/XSHE/002256/status";
+    let frozen_start = at("2026-08-21 14:00:00");
+
+    let future_trade = market_event(
+        1,
+        "TRADE_TICK",
+        "2026-08-22 09:31:00",
+        json!({
+            "price": {"mantissa": 333, "scale": 2},
+            "quantity": 100,
+            "unit": "SHARE",
+            "side": "UNKNOWN",
+            "source_row_key": "future-trade",
+            "source_page": 1
+        }),
+    );
+    assert!(live_subject::replay_market_messages_at(
+        vec![(TRADE_TOPIC, future_trade)],
+        frozen_start,
+    )
+    .is_err());
+
+    let future_status = market_event(
+        1,
+        "SOURCE_STATUS",
+        "2026-08-22 09:35:01",
+        json!({
+            "status": "LIVE_CONTIGUOUS",
+            "session_date": "2026-08-22",
+            "covered_through_us": market_timestamp_us("2026-08-22 09:35:01"),
+            "capture_sha256": "c".repeat(64)
+        }),
+    );
+    assert!(live_subject::replay_market_messages_at(
+        vec![(STATUS_TOPIC, future_status)],
+        frozen_start,
+    )
+    .is_err());
+
+    let future_bar = MarketBar {
+        timestamp: at("2026-08-22 09:35:00"),
+        symbol: "002256.SZ".to_owned(),
+        open: Decimal::new(333, 2),
+        high: Decimal::new(333, 2),
+        low: Decimal::new(333, 2),
+        close: Decimal::new(333, 2),
+        volume: 100,
+        amount: Some(Decimal::new(33300, 2)),
+    };
+    assert!(live_subject::validate_recovery_bars_at(&[future_bar], frozen_start).is_err());
+    Ok(())
+}
+
+#[test]
+fn completion_receipts_choose_read_only_catchup_before_any_live_execution() {
+    use gridedge_t::domain::ServiceMode;
+
+    assert_eq!(
+        live_subject::recovery_decision(ServiceMode::Running, true, true, true, true, 1, true),
+        (false, false),
+        "one current live bar remains executable"
+    );
+    assert_eq!(
+        live_subject::recovery_decision(ServiceMode::Running, true, false, false, true, 1, true),
+        (true, false),
+        "a stale completion enters recovery and cannot resume"
+    );
+    assert_eq!(
+        live_subject::recovery_decision(ServiceMode::Running, true, true, true, true, 2, true),
+        (true, false),
+        "a multi-bucket release remains read-only until a later contiguous live receipt"
+    );
+    assert_eq!(
+        live_subject::recovery_decision(ServiceMode::ReadOnly, true, true, false, true, 0, true),
+        (false, false),
+        "a current receipt cannot resume until its previous watermark is also current"
+    );
+    assert_eq!(
+        live_subject::recovery_decision(ServiceMode::ReadOnly, true, true, true, true, 0, true),
+        (false, true),
+        "a second contiguous current live receipt releases startup recovery once"
+    );
+    assert_eq!(
+        live_subject::recovery_decision(ServiceMode::ReadOnly, false, true, false, true, 0, true),
+        (false, false),
+        "history completion alone never releases startup recovery"
+    );
+    assert_eq!(
+        live_subject::recovery_decision(ServiceMode::Running, true, true, true, false, 1, true),
+        (true, false),
+        "a prior-session receipt remains read-only"
+    );
+    assert_eq!(
+        live_subject::recovery_decision(ServiceMode::Running, false, true, true, true, 1, true),
+        (true, false),
+        "history completion always enters recovery before its bar"
+    );
+    assert_eq!(
+        live_subject::recovery_decision(ServiceMode::Running, true, true, false, true, 1, true),
+        (true, false),
+        "a stale previous watermark remains read-only through the whole catch-up episode"
+    );
+    assert_eq!(
+        live_subject::recovery_decision(ServiceMode::Running, true, true, true, true, 1, false),
+        (true, false),
+        "one stale released bar cannot immediately resume after read-only processing"
+    );
+}
+
+#[test]
+fn platform_upgrade_activation_exits_before_market_or_outbox_initialization() {
+    let source = std::fs::read_to_string("src/bin/gridedge_ths_live.rs")
+        .expect("reviewed deployment orchestrator source");
+    let production = source
+        .split_once("fn run() -> Result<()> {")
+        .expect("production run")
+        .1
+        .split_once("fn probe_remote_orders")
+        .expect("production run end")
+        .0;
+    let activation = production
+        .find("activate_authorized_platform_upgrade(&args, &config)?")
+        .expect("dedicated activation-only path");
+    let activation_return = production[activation..]
+        .find("return Ok(())")
+        .map(|offset| activation + offset)
+        .expect("activation-only early return");
+    for later_initialization in [
+        "WebTradeBarBuilder::new",
+        "load_market_messages(",
+        "MarketMqttClient::connect(",
+        "ThsSimOutbox::open(",
+        "MacOsSimulationUiDriver::default()",
+    ] {
+        let index = production
+            .find(later_initialization)
+            .unwrap_or_else(|| panic!("missing production initialization {later_initialization}"));
+        assert!(
+            activation_return < index,
+            "activation-only must return before {later_initialization}"
+        );
+    }
+}
+
+#[test]
+fn live_completed_bars_use_one_permit_path_and_recovery_bars_never_touch_ui() {
     let source = std::fs::read_to_string("src/bin/gridedge_ths_live.rs")
         .expect("reviewed deployment orchestrator source");
     let helper = source
@@ -1560,12 +1994,12 @@ fn completed_and_reconstructed_bars_share_one_permit_gated_processing_path() {
         .split_once("for bar in recovered_completed_bars {")
         .expect("reconstructed completed bars")
         .1
-        .split_once("let mut settled_lunch_date")
+        .split_once("loop {")
         .expect("reconstructed completed-bar loop end")
         .0;
-    assert_eq!(recovered.matches("reconcile_and_process_bar(").count(), 1);
-    assert!(!recovered.contains("store_bar_if_new("));
-    assert!(!recovered.contains("service.on_bar("));
+    assert_eq!(recovered.matches("process_market_recovery_bar(").count(), 1);
+    assert!(!recovered.contains("reconcile_and_process_bar("));
+    assert!(!recovered.contains("probe_remote_orders("));
 }
 
 #[test]
@@ -1604,37 +2038,25 @@ fn lunch_and_daily_cutoffs_reserve_a_full_five_minutes_for_final_orders() {
     );
     assert_eq!(
         live_subject::settlement_windows(at("2026-08-18 14:55:00")),
-        (true, false, true)
+        (true, false, false)
+    );
+    assert_eq!(
+        live_subject::settlement_windows(at("2026-08-18 15:05:00")),
+        (false, false, true)
     );
 
     let source = std::fs::read_to_string("src/bin/gridedge_ths_live.rs")
         .expect("reviewed deployment orchestrator source");
-    let day = source.find("if is_after_daily_window(now)").unwrap();
-    let lunch = source.find("if is_lunch_settlement_window(now)").unwrap();
-    let market = source.find("if is_market_session(now)").unwrap();
-    assert!(day < lunch && lunch < market);
-    let day_branch = &source[day..lunch];
+    let day = source
+        .find("if is_after_daily_window(Local::now().naive_local())")
+        .unwrap();
+    let receive = source.find("let Some(message) = market.receive").unwrap();
+    assert!(day < receive);
+    let day_branch = &source[day..receive];
     assert!(day_branch.contains("return Ok(())"));
-    let lunch_branch = &source[lunch..market];
-    assert!(lunch_branch.contains("continue"));
-    let latch = lunch_branch
-        .find("if settled_lunch_date == Some(now.date())")
-        .expect("daily lunch reconciliation latch");
-    let early_continue = lunch_branch[latch..]
-        .find("continue;")
-        .map(|index| latch + index)
-        .expect("latched lunch polls must exit early");
-    let terminal = lunch_branch
-        .find("reconcile_terminal_boundary(")
-        .expect("one lunch terminal reconciliation");
-    let remember = lunch_branch
-        .find("settled_lunch_date = Some(now.date())")
-        .expect("successful lunch settlement latch update");
-    assert!(latch < early_continue && early_continue < terminal && terminal < remember);
-    assert_eq!(
-        lunch_branch.matches("reconcile_terminal_boundary(").count(),
-        1
-    );
+    assert!(source.contains("fn is_executable_strategy_bar"));
+    assert!(source.contains("(at(9, 35)..=at(11, 25)).contains(&time)"));
+    assert!(source.contains("(at(13, 5)..=at(14, 55)).contains(&time)"));
 }
 
 fn remote_order(
@@ -1657,6 +2079,56 @@ fn remote_order(
         contract_id: contract_id.to_owned(),
         order_attribute: "0".to_owned(),
     }
+}
+
+fn market_event(
+    sequence: u64,
+    event_type: &str,
+    timestamp: &str,
+    payload: serde_json::Value,
+) -> Vec<u8> {
+    let timestamp_us = market_timestamp_us(timestamp);
+    let mut event = json!({
+        "spec": "gridedge.market",
+        "schema_version": 1,
+        "event_type": event_type,
+        "source": {
+            "source_id": "eastmoney-web-time-sales",
+            "source_instance_id": "0198d8f2-6a70-7f3d-a3fc-8a53a460d599",
+            "source_type": "WEB_UI",
+            "provider": "eastmoney",
+            "provider_version": "eastmoney-time-sales-dom-v6"
+        },
+        "instrument": {
+            "venue": "XSHE",
+            "symbol": "002256",
+            "asset_class": "EQUITY",
+            "currency": "CNY"
+        },
+        "source_sequence": sequence,
+        "ts_us": timestamp_us,
+        "recv_us": timestamp_us + 1_000_000,
+        "payload": payload,
+        "evidence_sha256": "e".repeat(64)
+    });
+    event["payload"]["source_captured_at_us"] = json!(timestamp_us + 1_000_000);
+    let mut identity = event.clone();
+    identity.as_object_mut().unwrap().remove("recv_us");
+    event["event_id"] = serde_json::Value::String(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&identity).unwrap())
+    ));
+    serde_json::to_vec(&event).unwrap()
+}
+
+fn market_timestamp_us(timestamp: &str) -> u64 {
+    let datetime = NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%d %H:%M:%S").unwrap();
+    u64::try_from(
+        (datetime - chrono::Duration::hours(8))
+            .and_utc()
+            .timestamp_micros(),
+    )
+    .unwrap()
 }
 
 fn remote_order_with_quantity_and_price(

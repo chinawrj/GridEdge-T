@@ -20,7 +20,7 @@ use tempfile::tempdir;
 #[test]
 #[ignore = "requires the reviewed Tonghuashun 5.3.2 模拟练习 account and creates then cancels one 100-share simulation order"]
 fn current_simulation_account_submits_reconciles_and_cancels_one_contract() -> Result<()> {
-    let smoke_limit_price = Decimal::new(320, 2);
+    let smoke_limit_price = Decimal::new(310, 2);
     let minimum_non_marketable_ratio = Decimal::new(105, 2);
     let observed_quote = probe_current_market_quote("002256")?;
     ensure!(

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>GridEdge 行情采集设置</title>
+    <style>
+      body { max-width: 720px; margin: 36px auto; padding: 0 20px; font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; color: #132033; }
+      label { display: block; margin: 18px 0; font-weight: 700; }
+      input[type="url"], input[type="text"], input[type="password"] { display: block; width: 100%; box-sizing: border-box; margin-top: 7px; padding: 10px; border: 1px solid #cbd3dc; border-radius: 7px; }
+      button { border: 0; border-radius: 7px; padding: 10px 16px; background: #f36b35; color: white; font-weight: 700; }
+      small { color: #6a7687; }
+      #result { margin-left: 10px; }
+    </style>
+  </head>
+  <body>
+    <h1>GridEdge 网页行情采集</h1>
+    <p>扩展独立采集、持久化并通过 MQTT 5 WebSocket 直接发布到群晖。</p>
+    <label><input id="enabled" type="checkbox" /> 启用采集</label>
+    <label>MQTT WebSocket 地址<input id="mqtt-url" type="url" required /></label>
+    <label>MQTT 用户名<input id="mqtt-username" type="text" required /></label>
+    <label>MQTT 密码<input id="mqtt-password" type="password" autocomplete="off" /></label>
+    <button id="save">保存</button><span id="result"></span>
+    <p><small>密码保存在本机 Chrome 扩展存储中。Chrome 或行情页停止运行时不会采集；恢复后只重发已采到但未获 PUBACK 的记录。</small></p>
+    <script src="options.js"></script>
+  </body>
+</html>

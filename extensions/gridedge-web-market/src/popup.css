@@ -1,0 +1,10 @@
+:root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; }
+body { margin: 0; min-width: 340px; background: #f5f6f8; color: #132033; }
+main { padding: 16px; }
+h1 { margin: 0 0 8px; font-size: 17px; }
+p { margin: 0 0 14px; color: #5e6b7d; }
+.actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+button { border: 0; border-radius: 7px; padding: 9px 10px; background: #f36b35; color: white; font-weight: 700; cursor: pointer; }
+button.secondary { background: #203146; }
+#reload { grid-column: 1 / -1; }
+pre { white-space: pre-wrap; word-break: break-word; font-size: 10px; background: white; border: 1px solid #dfe4ea; border-radius: 7px; padding: 9px; max-height: 180px; overflow: auto; }

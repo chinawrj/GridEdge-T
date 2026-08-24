@@ -163,7 +163,10 @@ for migration in "$MARKET_ROOT"/app/postgres/migrations/*.sql; do
   fi
 done
 
-"$REMOTE_DOCKER" compose up -d --build ingestor
+# The ingestor uses a deliberately explicit paho loop and does not silently
+# reconnect after a broker process replacement. Recreate it after MQTT so a
+# healthy-but-unsubscribed old container cannot acknowledge no market data.
+"$REMOTE_DOCKER" compose up -d --build --force-recreate ingestor
 
 attempt=0
 while [ "$attempt" -lt 30 ]; do

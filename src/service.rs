@@ -2335,6 +2335,34 @@ impl GridAutomationService {
         self.apply_execution_report(&order.intent, requested_at, &correlation, report)
     }
 
+    pub fn enter_market_data_recovery(&mut self, reason: &str) -> Result<()> {
+        if reason.trim().is_empty() {
+            anyhow::bail!("market-data recovery reason is required")
+        }
+        if self.state.mode == ServiceMode::ReadOnly {
+            return Ok(());
+        }
+        if self.state.mode != ServiceMode::Running {
+            anyhow::bail!("only a RUNNING service can enter market-data recovery")
+        }
+        let event = self.event(
+            EventType::ServiceModeChanged,
+            chrono::Utc::now().naive_utc(),
+            "market-data-recovery",
+            format!(
+                "market-data-recovery:{}:{}",
+                self.state.run_id, self.last_sequence
+            ),
+            json!({
+                "mode": ServiceMode::ReadOnly,
+                "reason": reason,
+                "previous_mode": self.state.mode
+            }),
+        );
+        self.record(event)?;
+        Ok(())
+    }
+
     pub fn resume_after_reconciliation(&mut self, reason: &str) -> Result<()> {
         if reason.trim().is_empty() {
             anyhow::bail!("operator resume reason is required")

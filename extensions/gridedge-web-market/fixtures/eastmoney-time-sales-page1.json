@@ -1,0 +1,43 @@
+{
+  "url": "https://quote.eastmoney.com/f1.html?newcode=0.002256",
+  "title": "兆新股份_分时成交_最新价格_行情_走势图—东方财富网",
+  "bodyText": "时间 成交价 手数 1/19页",
+  "capturedAtUs": 1787189408000000,
+  "sessionDate": "2026-08-20",
+  "tables": [
+    [
+      [
+        {"text": "时间", "class_name": ""},
+        {"text": "成交价", "class_name": ""},
+        {"text": "手数", "class_name": ""}
+      ],
+      [
+        {"text": "09:30:00", "class_name": ""},
+        {"text": "3.33", "class_name": ""},
+        {"text": "586", "class_name": ""}
+      ],
+      [
+        {"text": "09:30:03", "class_name": ""},
+        {"text": "3.34", "class_name": ""},
+        {"text": "2,439", "class_name": ""}
+      ],
+      [
+        {"text": "09:30:03", "class_name": ""},
+        {"text": "3.34", "class_name": ""},
+        {"text": "2,439", "class_name": ""}
+      ]
+    ],
+    [
+      [
+        {"text": "时间", "class_name": ""},
+        {"text": "成交价", "class_name": ""},
+        {"text": "手数", "class_name": ""}
+      ],
+      [
+        {"text": "09:30:06", "class_name": ""},
+        {"text": "3.35", "class_name": ""},
+        {"text": "100", "class_name": ""}
+      ]
+    ]
+  ]
+}

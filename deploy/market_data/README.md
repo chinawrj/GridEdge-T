@@ -17,6 +17,13 @@ and local MQTT outbox, and has no command-line or filesystem path for orders.
 It deliberately uses the simulation marker only as a local admission check;
 `account_marker` is not market data and is not transmitted in the event.
 
+The Chrome-based multi-provider collector lives in
+`extensions/gridedge-web-market`. It is self-contained: IndexedDB owns raw page
+evidence, deduplication, source sequence and the QoS 1 outbox; MQTT.js publishes
+directly to the NAS WebSocket listener. It has no database or trading permission.
+When Chrome or the source page is stopped, collection also stops; the browser
+outbox only retries facts that were already captured.
+
 ## Host layout
 
 The installer copies this directory to:
@@ -34,8 +41,9 @@ Persistent state remains outside the application copy:
 /volume1/Projects/GridEdge-Market/secrets
 ```
 
-PostgreSQL is reachable only on the private Compose network. MQTT is exposed
-as TLS on port `8883`; anonymous access and plain-text port `1883` are disabled.
+PostgreSQL is reachable only on the private Compose network. MQTT is exposed as
+TLS on port `8883` for native clients and as authenticated WebSocket on trusted-LAN
+port `9001` for the Chrome collector; anonymous access and port `1883` are disabled.
 
 ## Market event v1
 

@@ -188,7 +188,13 @@ macOS 同花顺连接只允许控制客户端内明确标记为“模拟练习�
 `observed_at` 严格推进，而不是要求价格发生变化：持续数分钟同价但证据时间推进仍是新行情；重复、
 倒退或不推进的旧证据即使价格变化也必须停机，并从 append-only 历史恢复最后已接受证据边界，失败
 重启不能重新获得宽限期。quote/bar 日志中的时间倒退、重复或同时间内容冲突必须在服务/下单前
-fail closed。首日部署以 `minimum_free_cash` 作为一次性硬边界，至少保留
+fail closed。只含离散 `last_price` 的页面快照不是完整 OHLC 证据：两个采样点之间可能存在触格极值，
+不得把采样最大/最小值冒充五分钟 high/low，更不得据此宣称“未触格”。策略使用的每根五分钟 bar
+必须来自同一已审只读页面的带时间桶 OHLC，或由具有稳定游标、无重漏和明确完成边界的完整成交明细
+重建；页面日内 high/low/last 只能用于收盘交叉核验，不能单独把极值分配给某个五分钟桶。任一缺失、
+跨源不一致或收盘聚合与同页日内 high/low/last 不一致都必须在写行情事件前 fail closed。东方财富、
+腾讯、新浪等外部页面只可作为人工诊断，未接入且未审计的数据绝不能代替同花顺事实进入策略。
+首日部署以 `minimum_free_cash` 作为一次性硬边界，至少保留
 一半初始模拟现金；初始部署完成并追加唯一、完整绑定平台/初始部署/Paper/outbox 前缀的
 `ONGOING_RESOURCE_POLICY_ACTIVATED` 后，`minimum_free_cash` 只作为报告指标，不再阻断持续 BUY。
 持续 BUY 使用全部可用现金，只有足以覆盖一整份 `Q` 及费用才获批；持续 SELL 只由合格可卖库存决定，
@@ -291,6 +297,13 @@ MQTT 5 接入、原始事件持久化、精确重投去重和身份冲突留痕�
 订单 outbox 或任何下单/撤单能力。Mac 旁路发布器只能读取已经落盘并通过现有身份检查的行情
 JSONL，自身使用 durable source sequence 与发送 outbox；网络失败或 ACK 丢失只能导致原始字节
 重投，不能改变交易工作流。
+
+Chrome 网页逐笔采集器必须可以独立运行，不依赖本机 companion。扩展自己的 IndexedDB 是原始网页
+证据、去重冲突、source instance/sequence 与 MQTT outbox 的唯一浏览器持久边界；同一事务先形成
+canonical event 与 PENDING outbox，只有 MQTT 5 QoS 1 PUBACK 才可标记 ACKNOWLEDGED。Chrome、源网页
+或电脑停止运行时采集也明确停止；恢复后只允许重发已经采到的 PENDING 事件，不得伪造或补猜离线
+行情。MQTT publisher 密码可存于本机扩展存储，但内容脚本不得取得密码，扩展不得取得数据库或交易
+权限。MV3 禁止远程代码，MQTT WebSocket 客户端必须固定版本并随扩展本地打包。
 
 行情公共模型必须按 `venue + symbol + source_id + source_instance_id + source_sequence` 保存来源事实，
 同一证券、同一时刻来自网页逐笔、同花顺页面和未来商业数据源的记录可以并存，绝不能按证券代码

@@ -1,7 +1,4 @@
-use crate::{
-    data::{validate_bar, MarketBar},
-    ths_sim::SimulationMarketQuote,
-};
+use crate::{data::MarketBar, ths_sim::SimulationMarketQuote};
 use anyhow::{bail, Context, Result};
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime};
 use rust_decimal::Decimal;
@@ -9,7 +6,6 @@ use rust_decimal::Decimal;
 #[derive(Debug, Clone)]
 struct PendingBar {
     end: NaiveDateTime,
-    open: Decimal,
     high: Decimal,
     low: Decimal,
     close: Decimal,
@@ -21,7 +17,6 @@ struct PendingBar {
 /// volume or missing bars are invented.
 #[derive(Debug, Clone)]
 pub struct ThsQuoteBarBuilder {
-    symbol: String,
     quote_symbol: String,
     interval_minutes: u32,
     pending: Option<PendingBar>,
@@ -43,7 +38,6 @@ impl ThsQuoteBarBuilder {
             bail!("quote bar interval must divide the 120-minute A-share session");
         }
         Ok(Self {
-            symbol,
             quote_symbol,
             interval_minutes,
             pending: None,
@@ -83,9 +77,7 @@ impl ThsQuoteBarBuilder {
                 bail!("Tonghuashun quote moved into an earlier market bucket")
             }
             Some(_) => {
-                let completed = self.take_completed()?;
-                self.pending = Some(PendingBar::from_quote(end, quote.last_price));
-                Some(completed)
+                bail!("discrete last-price samples cannot complete an OHLC market bar")
             }
             None => {
                 self.pending = Some(PendingBar::from_quote(end, quote.last_price));
@@ -102,28 +94,9 @@ impl ThsQuoteBarBuilder {
             .as_ref()
             .is_some_and(|pending| pending.end <= now)
         {
-            return self.take_completed().map(Some);
+            bail!("discrete last-price samples cannot complete an OHLC market bar");
         }
         Ok(None)
-    }
-
-    fn take_completed(&mut self) -> Result<MarketBar> {
-        let pending = self.pending.take().context("no quote bar is pending")?;
-        if pending.samples == 0 {
-            bail!("cannot complete an empty quote bar");
-        }
-        let bar = MarketBar {
-            timestamp: pending.end,
-            symbol: self.symbol.clone(),
-            open: pending.open,
-            high: pending.high,
-            low: pending.low,
-            close: pending.close,
-            volume: 0,
-            amount: None,
-        };
-        validate_bar(&bar, &self.symbol)?;
-        Ok(bar)
     }
 }
 
@@ -131,7 +104,6 @@ impl PendingBar {
     fn from_quote(end: NaiveDateTime, price: Decimal) -> Self {
         Self {
             end,
-            open: price,
             high: price,
             low: price,
             close: price,

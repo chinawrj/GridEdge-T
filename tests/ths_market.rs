@@ -13,7 +13,7 @@ use rust_decimal::Decimal;
 use std::str::FromStr;
 
 #[test]
-fn simulation_quotes_form_completed_five_minute_ohlc_without_synthetic_volume() -> Result<()> {
+fn simulation_last_price_samples_never_form_completed_ohlc() -> Result<()> {
     let mut builder = ThsQuoteBarBuilder::new("002256.SZ", 5)?;
     assert_eq!(builder.quote_symbol(), "002256");
 
@@ -26,25 +26,31 @@ fn simulation_quotes_form_completed_five_minute_ohlc_without_synthetic_volume() 
     assert!(builder
         .push(quote("2026-08-18 09:34:59", "3.57"))?
         .is_none());
-    let first = builder
-        .push(quote("2026-08-18 09:35:01", "3.56"))?
-        .expect("the prior bucket must close");
+    assert!(builder.push(quote("2026-08-18 09:35:01", "3.56")).is_err());
+    assert!(builder.flush_through(at("2026-08-18 09:40:00")).is_err());
+    Ok(())
+}
 
-    assert_eq!(first.timestamp, at("2026-08-18 09:35:00"));
-    assert_eq!(first.symbol, "002256.SZ");
-    assert_eq!(first.open, Decimal::from_str("3.55")?);
-    assert_eq!(first.high, Decimal::from_str("3.57")?);
-    assert_eq!(first.low, Decimal::from_str("3.50")?);
-    assert_eq!(first.close, Decimal::from_str("3.57")?);
-    assert_eq!(first.volume, 0);
-    assert_eq!(first.amount, None);
+#[test]
+fn last_price_samples_cannot_claim_complete_ohlc_or_prove_that_no_grid_level_was_touched(
+) -> Result<()> {
+    let mut builder = ThsQuoteBarBuilder::new("002256.SZ", 5)?;
 
-    let second = builder
-        .flush_through(at("2026-08-18 09:40:00"))?
-        .expect("the live bucket must close at its end");
-    assert_eq!(second.timestamp, at("2026-08-18 09:40:00"));
-    assert_eq!(second.open, Decimal::from_str("3.56")?);
-    assert_eq!(second.close, Decimal::from_str("3.56")?);
+    // These are valid reviewed snapshots, but they contain only last_price.
+    // A real trade at 3.30 between the samples is observationally
+    // indistinguishable from a flat 3.36 interval to the current DTO.  The
+    // builder must not publish a complete OHLC bar (and thereby claim no
+    // crossing) until same-page bucket OHLC or a complete, cursor-bounded
+    // transaction reconstruction proves the high and low.
+    builder.push(quote("2026-08-20 14:55:05", "3.36"))?;
+    builder.push(quote("2026-08-20 14:59:55", "3.36"))?;
+
+    assert!(
+        builder
+            .flush_through(at("2026-08-20 15:00:00"))
+            .is_err(),
+        "last-price sampling must fail closed instead of emitting a flat OHLC bar that can hide an intrabar 3.30 touch"
+    );
     Ok(())
 }
 
@@ -52,14 +58,16 @@ fn simulation_quotes_form_completed_five_minute_ohlc_without_synthetic_volume() 
 fn quote_builder_never_invents_lunch_bars_or_accepts_future_reordering() -> Result<()> {
     let mut builder = ThsQuoteBarBuilder::new("002256.SZ", 5)?;
     builder.push(quote("2026-08-18 11:29:59", "3.55"))?;
-    let final_morning = builder
-        .flush_through(at("2026-08-18 11:30:00"))?
-        .expect("the final morning bucket must close");
-    assert_eq!(final_morning.timestamp, at("2026-08-18 11:30:00"));
+    assert!(builder.flush_through(at("2026-08-18 11:30:00")).is_err());
     assert!(builder.push(quote("2026-08-18 12:00:00", "3.56")).is_err());
-    builder.push(quote("2026-08-18 13:00:01", "3.56"))?;
-    assert!(builder.push(quote("2026-08-18 13:00:01", "3.57")).is_err());
-    assert!(builder.push(quote("2026-08-18 12:59:59", "3.57")).is_err());
+    let mut afternoon = ThsQuoteBarBuilder::new("002256.SZ", 5)?;
+    afternoon.push(quote("2026-08-18 13:00:01", "3.56"))?;
+    assert!(afternoon
+        .push(quote("2026-08-18 13:00:01", "3.57"))
+        .is_err());
+    assert!(afternoon
+        .push(quote("2026-08-18 12:59:59", "3.57"))
+        .is_err());
     Ok(())
 }
 
@@ -98,11 +106,7 @@ fn persisted_quote_identity_and_price_are_validated_before_mutating_a_bar() -> R
         let mut builder = ThsQuoteBarBuilder::new("002256.SZ", 5)?;
         assert!(builder.push(invalid).is_err());
         assert!(builder.push(baseline.clone())?.is_none());
-        let completed = builder
-            .flush_through(at("2026-08-18 09:35:00"))?
-            .expect("valid quote remains usable after an atomic rejection");
-        assert_eq!(completed.open, Decimal::from_str("3.55")?);
-        assert_eq!(completed.close, Decimal::from_str("3.55")?);
+        assert!(builder.flush_through(at("2026-08-18 09:35:00")).is_err());
     }
     Ok(())
 }
@@ -113,13 +117,7 @@ fn current_bucket_is_never_flushed_before_its_exact_end() -> Result<()> {
     builder.push(quote("2026-08-18 09:30:01", "3.55"))?;
 
     assert!(builder.flush_through(at("2026-08-18 09:34:59"))?.is_none());
-    assert_eq!(
-        builder
-            .flush_through(at("2026-08-18 09:35:00"))?
-            .expect("bar closes only at the exact boundary")
-            .timestamp,
-        at("2026-08-18 09:35:00")
-    );
+    assert!(builder.flush_through(at("2026-08-18 09:35:00")).is_err());
     Ok(())
 }
 
@@ -133,11 +131,7 @@ fn quote_evidence_that_crosses_a_five_minute_boundary_is_rejected_atomically() -
     assert!(builder
         .push(quote("2026-08-18 09:35:02", "3.57"))?
         .is_none());
-    let completed = builder
-        .flush_through(at("2026-08-18 09:40:00"))?
-        .expect("a rejected cross-boundary quote cannot poison the next bucket");
-    assert_eq!(completed.open, Decimal::from_str("3.57")?);
-    assert_eq!(completed.close, Decimal::from_str("3.57")?);
+    assert!(builder.flush_through(at("2026-08-18 09:40:00")).is_err());
     Ok(())
 }
 

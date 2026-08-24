@@ -124,17 +124,20 @@ struct NestedScrollAreaSimulationMarkerRegression;
 impl AppleScriptExecutor for NestedScrollAreaSimulationMarkerRegression {
     fn run(&self, source: &str) -> Result<String> {
         let discovery = source
-            .split_once("if matchedWindowCount is not 1")
+            .split_once("click commissionButton")
             .map(|(prefix, _)| prefix)
             .ok_or_else(|| anyhow::anyhow!("window uniqueness guard is missing"))?;
-        if !discovery.contains("entire contents of w") {
+        if !discovery.contains("set liveWindowScrollAreas to get (scroll areas of w)") {
             bail!(
                 "fixture: 模拟练习 is an AXStaticText inside a nested AXScrollArea, not a direct static text of the AXStandardWindow"
             );
         }
-        assert!(discovery.contains("AXStaticText"));
-        assert!(discovery.contains("模拟练习"));
-        assert!(source.contains("if matchedWindowCount is not 1"));
+        assert!(discovery.contains(
+            "set nestedSimulationMarker to exists static text \"模拟练习\" of candidateScrollArea"
+        ));
+        assert!(!discovery.contains("entire contents of w"));
+        assert!(source.contains("if matchedWindowCount is 0 then error"));
+        assert!(source.contains("if matchedWindowCount is greater than 1 then error"));
         assert!(!source.contains("set matchedWindowCount to 1"));
         Ok(EMPTY_ORDER_TABLE.to_owned())
     }

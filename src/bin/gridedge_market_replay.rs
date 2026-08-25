@@ -1,7 +1,10 @@
 use anyhow::{bail, Context, Result};
 use chrono::NaiveDate;
 use clap::Parser;
-use gridedge_t::{data::MarketBar, web_market::WebTradeBarBuilder};
+use gridedge_t::{
+    data::MarketBar,
+    web_market::{SourceCompletionKind, WebTradeBarBuilder},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -23,6 +26,11 @@ struct Args {
     interval_minutes: u32,
     #[arg(long)]
     session_date: NaiveDate,
+    /// Permit an explicitly-audited partial-session boundary. Only bars strictly
+    /// after that boundary are emitted, and a later contiguous LIVE watermark
+    /// must make the partial session safe.
+    #[arg(long)]
+    allow_partial_session_resume_boundary: bool,
     /// Optional canonical CSV for feeding the exact rebuilt bars into the strategy replay.
     #[arg(long)]
     bars_csv_output: Option<PathBuf>,
@@ -56,6 +64,7 @@ struct ReplayAudit {
     symbol: String,
     session_date: NaiveDate,
     interval_minutes: u32,
+    history_mode: &'static str,
     input_event_count: usize,
     covered_through_us: u64,
     bar_count: usize,
@@ -78,7 +87,17 @@ fn main() -> Result<()> {
         let record: WireRecord = serde_json::from_str(&line)
             .with_context(|| format!("invalid market replay line {}", line_index + 1))?;
         let (topic, payload) = record.payload_bytes(line_index + 1)?;
-        bars.extend(builder.ingest(&topic, &payload)?);
+        let receipt = builder.ingest_with_receipt(&topic, &payload)?;
+        if receipt.completion.as_ref().is_some_and(|completion| {
+            completion.session_date == args.session_date
+                && completion.kind == SourceCompletionKind::SessionResumeBoundary
+        }) {
+            // A partial-session boundary makes every bar released before it
+            // audit-only. Clear the replay's local accumulation atomically;
+            // the builder independently rejects trades in the unsafe bucket.
+            bars.clear();
+        }
+        bars.extend(receipt.bars);
         input_event_count = input_event_count
             .checked_add(1)
             .context("market replay event count overflow")?;
@@ -86,8 +105,24 @@ fn main() -> Result<()> {
     if input_event_count == 0 || bars.is_empty() {
         bail!("market replay produced no auditable bars")
     }
-    if !builder.has_complete_session(args.session_date) {
-        bail!("market replay lacks a complete-session watermark")
+    let history_mode = if builder.has_complete_session(args.session_date) {
+        "COMPLETE_SESSION"
+    } else if args.allow_partial_session_resume_boundary
+        && builder.has_resume_boundary(args.session_date)
+        && builder.partial_session_resume_is_safe(args.session_date)
+    {
+        if bars.is_empty() {
+            bail!("safe partial-session replay produced no post-boundary bars")
+        }
+        "PARTIAL_SESSION_SAFE_AFTER_BOUNDARY"
+    } else {
+        bail!("market replay lacks an authorized complete or safe partial-session watermark")
+    };
+    if bars
+        .iter()
+        .any(|bar| bar.timestamp.date() != args.session_date)
+    {
+        bail!("market replay produced a strategy bar outside requested session")
     }
     if bars
         .windows(2)
@@ -104,6 +139,7 @@ fn main() -> Result<()> {
         symbol: args.symbol,
         session_date: args.session_date,
         interval_minutes: args.interval_minutes,
+        history_mode,
         input_event_count,
         covered_through_us,
         bar_count: bars.len(),

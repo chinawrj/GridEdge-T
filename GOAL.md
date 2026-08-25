@@ -213,6 +213,24 @@ fail closed。只含离散 `last_price` 的页面快照不是完整 OHLC 证据�
 重建；页面日内 high/low/last 只能用于收盘交叉核验，不能单独把极值分配给某个五分钟桶。任一缺失、
 跨源不一致或收盘聚合与同页日内 high/low/last 不一致都必须在写行情事件前 fail closed。东方财富、
 腾讯、新浪等外部页面只可作为人工诊断，未接入且未审计的数据绝不能代替同花顺事实进入策略。
+
+当日完整历史因网页分页故障已经客观不可恢复时，Paper 模拟盘允许采用显式的
+`SESSION_RESUME_BOUNDARY` 从当前事实继续，但该边界绝不等同于“历史完整”。它必须来自同一受审
+东方财富 v6 页面的一次稳定、当前、第一页捕获，完整绑定 `covered_from/covered_through`、页码、
+行数、捕获哈希和固定策略标识，并同时要求正式 worker 的独立 CLI 授权。边界以前的行情只能审计，
+不得追补订单；边界所在五分钟桶及其残留成交必须全部丢弃，绝不能形成或污染 MarketBar。只有边界
+之后从桶起点开始完整采集、由严格递增且前后水位精确衔接的 `LIVE_CONTIGUOUS` 收口的第一根完整
+五分钟 bar，才可在 READ_ONLY 中处理；完成远端终态对账后才允许恢复 RUNNING。缺少任一字段、
+序列复用、前水位不等、零推进、未来/陈旧水位或首根完整桶证明时继续 fail closed。该例外只缩短
+停机窗口，不改变不得使用未来数据、不得伪造完整性及不得用旧行情补单的原则。
+
+网页采集器的持久 outbox 不能把 MQTT broker 的 QoS 1 PUBACK 解释为行情已经入库；PUBACK 只证明
+broker 接收。只有群晖 ingestor 在 PostgreSQL 事务提交后，用独立只读 ACK topic 回发且与
+`event_id/source_id/source_instance_id/source_sequence` 完全一致的 `COMMITTED` 回执，浏览器才可
+把对应事件标为已确认。入库冲突、拒绝、超时、伪造或错序 ACK 一律保留 PENDING 并 fail closed。
+浏览器存储代际升级必须保留旧库作只读取证；已由正式 PostgreSQL 证明的固定前缀可以用不可变
+source instance 和下一连续序列显式引导新库，绝不能凭旧浏览器 PUBACK 计数猜测或跳过序列。
+
 首日部署以 `minimum_free_cash` 作为一次性硬边界，至少保留
 一半初始模拟现金；初始部署完成并追加唯一、完整绑定平台/初始部署/Paper/outbox 前缀的
 `ONGOING_RESOURCE_POLICY_ACTIVATED` 后，`minimum_free_cash` 只作为报告指标，不再阻断持续 BUY。
@@ -319,10 +337,12 @@ JSONL，自身使用 durable source sequence 与发送 outbox；网络失败或 
 
 Chrome 网页逐笔采集器必须可以独立运行，不依赖本机 companion。扩展自己的 IndexedDB 是原始网页
 证据、去重冲突、source instance/sequence 与 MQTT outbox 的唯一浏览器持久边界；同一事务先形成
-canonical event 与 PENDING outbox，只有 MQTT 5 QoS 1 PUBACK 才可标记 ACKNOWLEDGED。Chrome、源网页
-或电脑停止运行时采集也明确停止；恢复后只允许重发已经采到的 PENDING 事件，不得伪造或补猜离线
-行情。MQTT publisher 密码可存于本机扩展存储，但内容脚本不得取得密码，扩展不得取得数据库或交易
-权限。MV3 禁止远程代码，MQTT WebSocket 客户端必须固定版本并随扩展本地打包。
+canonical event 与 PENDING outbox。MQTT 5 QoS 1 PUBACK 只证明 broker 已收到传输，不能把记录标记为
+ACKNOWLEDGED；只有 ingestor 在 PostgreSQL 事务提交后返回与事件身份完全一致的 `COMMITTED` 应用回执，
+才可结束 PENDING。PUBACK 或应用回执丢失、超时及 service worker 重启都必须保持 PENDING 并幂等重发。
+Chrome、源网页或电脑停止运行时采集也明确停止；恢复后只允许重发已经采到的 PENDING 事件，不得伪造
+或补猜离线行情。MQTT publisher 密码可存于本机扩展存储，但内容脚本不得取得密码，扩展不得取得数据
+库或交易权限。MV3 禁止远程代码，MQTT WebSocket 客户端必须固定版本并随扩展本地打包。
 
 行情公共模型必须按 `venue + symbol + source_id + source_instance_id + source_sequence` 保存来源事实，
 同一证券、同一时刻来自网页逐笔、同花顺页面和未来商业数据源的记录可以并存，绝不能按证券代码

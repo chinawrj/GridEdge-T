@@ -31,11 +31,19 @@ class DeploymentContractTest(unittest.TestCase):
         )[0]
         self.assertIn("topic write gridedge/market/v1/#", publisher)
         self.assertIn("topic read gridedge/market/v1/#", publisher)
+        self.assertIn("topic read gridedge/market-ack/v1/#", publisher)
+        self.assertNotIn("topic write gridedge/market-ack/v1/#", publisher)
         topic_lines = "\n".join(
             line for line in publisher.splitlines() if line.startswith("topic ")
         )
         self.assertNotIn("order", topic_lines.lower())
         self.assertNotIn("ledger", topic_lines.lower())
+
+    def test_only_ingestor_can_publish_database_commit_acknowledgements(self) -> None:
+        acl = (ROOT / "deploy/market_data/mosquitto/acl").read_text()
+        ingestor = acl.split("user gridedge-ingestor", 1)[1]
+        self.assertIn("topic read gridedge/market/v1/#", ingestor)
+        self.assertIn("topic write gridedge/market-ack/v1/#", ingestor)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,12 @@
 "use strict";
 
-importScripts("../vendor/mqtt.min.js", "shared.js", "durable.js");
+importScripts(
+  "../vendor/mqtt.min.js",
+  "shared.js",
+  "durable.js",
+  "mqtt_ack.js",
+  "outbox_delivery.js",
+);
 
 const DEFAULT_SETTINGS = Object.freeze({
   enabled: false,
@@ -17,7 +23,13 @@ async function settings() {
 }
 
 async function setStatus(status) {
-  await chrome.storage.local.set({ last_status: { ...status, at: Date.now() } });
+  await chrome.storage.local.set({
+    last_status: {
+      ...status,
+      store_generation: GridEdgeDurable.DATABASE_NAME,
+      at: Date.now(),
+    },
+  });
 }
 
 function allowedSender(sender) {
@@ -57,8 +69,14 @@ function connectMqtt(current) {
     });
     let settled = false;
     client.once("connect", () => {
-      settled = true;
-      resolve(client);
+      void GridEdgeMqttAck.subscribe(client).then(() => {
+        settled = true;
+        resolve(client);
+      }).catch((error) => {
+        settled = true;
+        client.end(true);
+        reject(error);
+      });
     });
     client.once("error", (error) => {
       if (!settled) {
@@ -96,21 +114,20 @@ async function doFlushOutbox() {
     return { ok: true, published: 0, store: await GridEdgeDurable.status(database) };
   }
   const client = await connectMqtt(current);
-  let published = 0;
+  let published;
   try {
-    while (pending.length > 0) {
-      for (const event of pending) {
-        await publishWithPuback(client, event);
-        await GridEdgeDurable.acknowledge(database, event.event_id);
-        published += 1;
-      }
-      pending = await GridEdgeDurable.pendingEvents(database);
-    }
+    published = await GridEdgeOutboxDelivery.flushPending({
+      database,
+      client,
+      durable: GridEdgeDurable,
+      mqttAck: GridEdgeMqttAck,
+      publishWithPuback,
+    });
   } finally {
     client.end(true);
   }
   const store = await GridEdgeDurable.status(database);
-  await setStatus({ ok: true, kind: "MQTT_PUBACK", published, store });
+  await setStatus({ ok: true, kind: "DATABASE_COMMIT_ACK", published, store });
   return { ok: true, published, store };
 }
 
@@ -121,13 +138,19 @@ function flushOutbox() {
   return flushInFlight;
 }
 
-async function deliverCapture(message, sender) {
+async function deliverCapture(message, sender, resumeBoundary = false) {
   if (!allowedSender(sender)) throw new Error("capture sender is outside the reviewed page allowlist");
   const current = await settings();
   if (!current.enabled) return { ok: false, reason: "COLLECTOR_DISABLED" };
   validateMqttSettings(current);
   const database = await GridEdgeDurable.openDatabase();
-  const stored = await GridEdgeDurable.ingestCapture(database, message.capture, message.capture_sha256);
+  const stored = resumeBoundary
+    ? await GridEdgeDurable.ingestResumeBoundary(
+      database,
+      message.capture,
+      message.capture_sha256,
+    )
+    : await GridEdgeDurable.ingestCapture(database, message.capture, message.capture_sha256);
   try {
     const delivery = await flushOutbox();
     return { ok: true, stored, delivery };
@@ -166,6 +189,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const run = async () => {
     switch (message?.type) {
       case "GRIDEDGE_CAPTURE_BATCH": return await deliverCapture(message, sender);
+      case "GRIDEDGE_RESUME_BOUNDARY": return await deliverCapture(message, sender, true);
       case "GRIDEDGE_CAPTURE_ERROR":
         await setStatus({ ok: false, kind: "CAPTURE_ERROR", provider: message.provider, page_url: message.page_url, error: message.message });
         return { ok: true };
@@ -173,7 +197,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const current = await settings();
         const { last_status: lastStatus = null } = await chrome.storage.local.get("last_status");
         const database = await GridEdgeDurable.openDatabase();
-        return { settings: { ...current, mqtt_password: current.mqtt_password ? "***" : "" }, store: await GridEdgeDurable.status(database), last_status: lastStatus };
+        const effectiveStatus = lastStatus?.store_generation === GridEdgeDurable.DATABASE_NAME
+          ? lastStatus
+          : { ok: false, kind: "STORE_GENERATION_CHANGED", store_generation: GridEdgeDurable.DATABASE_NAME };
+        return { settings: { ...current, mqtt_password: current.mqtt_password ? "***" : "" }, store: await GridEdgeDurable.status(database), last_status: effectiveStatus };
       }
       case "GRIDEDGE_GET_CAPTURE_STATE": {
         if (!allowedSender(sender)) throw new Error("capture-state sender is outside the reviewed page allowlist");

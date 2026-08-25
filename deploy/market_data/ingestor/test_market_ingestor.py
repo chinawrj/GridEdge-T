@@ -46,7 +46,164 @@ def event(source_id="ths-web-tick", source_sequence=1, price=3530):
     return market_ingestor.canonical_json(document)
 
 
+class FakeProperties:
+    def __init__(self, content_type="application/json"):
+        self.ContentType = content_type
+
+
+class FakeMessage:
+    def __init__(self, payload, content_type="application/json"):
+        self.payload = payload
+        self.topic = "gridedge/market/v1/XSHE/002256/trade"
+        self.qos = 1
+        self.retain = False
+        self.dup = False
+        self.mid = 42
+        self.properties = FakeProperties(content_type)
+
+
 class MarketEventValidationTest(unittest.TestCase):
+    def test_message_handler_publishes_commit_receipt_before_acknowledging_insert_or_duplicate(self):
+        validated = market_ingestor.validate_document(
+            event(), "gridedge/market/v1/XSHE/002256/trade"
+        )
+        for result in ("inserted", "duplicate"):
+            actions = []
+
+            class Store:
+                def ingest(self, received, topic, qos, duplicate_flag):
+                    self.assertions = (received, topic, qos, duplicate_flag)
+                    actions.append("database-committed")
+                    return result
+
+                def reject(self, *_args):
+                    raise AssertionError("valid event must not be rejected")
+
+            message = FakeMessage(event())
+
+            def publish(topic, payload):
+                self.assertEqual(
+                    (topic, payload), market_ingestor.application_ack(validated, result)
+                )
+                actions.append("application-ack-published")
+
+            market_ingestor.process_market_message(
+                Store(), message, publish, lambda mid, qos: actions.append(("mqtt-ack", mid, qos))
+            )
+            self.assertEqual(
+                actions,
+                [
+                    "database-committed",
+                    "application-ack-published",
+                    ("mqtt-ack", message.mid, message.qos),
+                ],
+            )
+
+    def test_message_handler_never_publishes_committed_for_conflict_or_rejection(self):
+        published = []
+        acknowledged = []
+
+        class ConflictStore:
+            def ingest(self, *_args):
+                return "conflict"
+
+            def reject(self, *_args):
+                raise AssertionError("validated conflict must not enter rejection storage")
+
+        message = FakeMessage(event())
+        result = market_ingestor.process_market_message(
+            ConflictStore(),
+            message,
+            lambda *args: published.append(args),
+            lambda mid, qos: acknowledged.append((mid, qos)),
+        )
+        self.assertEqual(result, "conflict")
+        self.assertEqual(published, [])
+        self.assertEqual(acknowledged, [(message.mid, message.qos)])
+
+        class RejectStore:
+            def ingest(self, *_args):
+                raise AssertionError("invalid delivery must be rejected before ingest")
+
+            def reject(self, topic, raw, reason):
+                self.rejected = (topic, raw, reason)
+
+        rejected_message = FakeMessage(event(), content_type="application/octet-stream")
+        result = market_ingestor.process_market_message(
+            RejectStore(),
+            rejected_message,
+            lambda *args: published.append(args),
+            lambda mid, qos: acknowledged.append((mid, qos)),
+        )
+        self.assertEqual(result, "rejected")
+        self.assertEqual(published, [])
+        self.assertEqual(acknowledged[-1], (rejected_message.mid, rejected_message.qos))
+
+    def test_message_handler_does_not_ack_original_when_database_or_commit_receipt_publish_fails(self):
+        acknowledged = []
+
+        class FailingStore:
+            def ingest(self, *_args):
+                raise RuntimeError("database unavailable")
+
+            def reject(self, *_args):
+                raise AssertionError("valid event must not be rejected")
+
+        with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+            market_ingestor.process_market_message(
+                FailingStore(),
+                FakeMessage(event()),
+                lambda *_args: None,
+                lambda mid, qos: acknowledged.append((mid, qos)),
+            )
+        self.assertEqual(acknowledged, [])
+
+        class InsertStore:
+            def ingest(self, *_args):
+                return "inserted"
+
+            def reject(self, *_args):
+                raise AssertionError("valid event must not be rejected")
+
+        with self.assertRaisesRegex(RuntimeError, "ACK broker unavailable"):
+            market_ingestor.process_market_message(
+                InsertStore(),
+                FakeMessage(event()),
+                lambda *_args: (_ for _ in ()).throw(RuntimeError("ACK broker unavailable")),
+                lambda mid, qos: acknowledged.append((mid, qos)),
+            )
+        self.assertEqual(acknowledged, [])
+
+    def test_application_ack_is_canonical_and_binds_the_committed_event(self):
+        validated = market_ingestor.validate_document(
+            event(), "gridedge/market/v1/XSHE/002256/trade"
+        )
+        topic, payload = market_ingestor.application_ack(validated, "inserted")
+        self.assertEqual(
+            topic,
+            f"gridedge/market-ack/v1/{validated.event_id.hex()}",
+        )
+        self.assertEqual(market_ingestor.canonical_json(json.loads(payload)), payload)
+        self.assertEqual(
+            json.loads(payload),
+            {
+                "event_id": validated.event_id.hex(),
+                "result": "COMMITTED",
+                "schema_version": 1,
+                "source_id": validated.source_id,
+                "source_instance_id": str(validated.source_instance_id),
+                "source_sequence": validated.source_sequence,
+                "spec": "gridedge.market.ack",
+            },
+        )
+        duplicate_topic, duplicate_payload = market_ingestor.application_ack(
+            validated, "duplicate"
+        )
+        self.assertEqual(duplicate_topic, topic)
+        self.assertEqual(duplicate_payload, payload)
+        with self.assertRaisesRegex(ValueError, "committed or duplicate"):
+            market_ingestor.application_ack(validated, "conflict")
+
     def test_mqtt5_delivery_contract_is_qos1_nonretained_json(self):
         market_ingestor.validate_delivery("application/json", 1, False)
         for content_type, qos, retained in (

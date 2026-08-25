@@ -4,6 +4,7 @@
   "bodyText": "时间 成交价 手数 1/19页",
   "capturedAtUs": 1787189408000000,
   "sessionDate": "2026-08-20",
+  "rowOrder": "EARLIEST_FIRST",
   "tables": [
     [
       [

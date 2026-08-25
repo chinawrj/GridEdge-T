@@ -7,9 +7,12 @@
 })(typeof globalThis === "object" ? globalThis : this, function buildDurable(core) {
   "use strict";
 
-  const DB_NAME = "gridedge-web-market-v5";
+  const DB_NAME = "gridedge-web-market-v6";
   const DB_VERSION = 1;
   const SOURCE_ID = "eastmoney-web-time-sales";
+  const AUDITED_LEGACY_SOURCE_KEY = `${SOURCE_ID}|XSHE|002256`;
+  const AUDITED_LEGACY_SOURCE_INSTANCE = "8101d65c-bdba-4de3-83e0-8983506f159e";
+  const AUDITED_LEGACY_NEXT_SEQUENCE = 2764;
   let writerTail = Promise.resolve();
 
   function request(requestObject) {
@@ -31,7 +34,15 @@
     const opening = indexedDb.open(name, DB_VERSION);
     opening.onupgradeneeded = () => {
       const database = opening.result;
-      database.createObjectStore("source_state", { keyPath: "key" });
+      const sourceState = database.createObjectStore("source_state", { keyPath: "key" });
+      if (name === DB_NAME) {
+        sourceState.add({
+          key: AUDITED_LEGACY_SOURCE_KEY,
+          source_instance_id: AUDITED_LEGACY_SOURCE_INSTANCE,
+          next_sequence: AUDITED_LEGACY_NEXT_SEQUENCE,
+          bootstrap: "DATABASE_COMMITTED_PREFIX_V1",
+        });
+      }
       database.createObjectStore("capture_batches", { keyPath: "capture_sha256" });
       database.createObjectStore("web_rows", { keyPath: "identity" });
       database.createObjectStore("capture_conflicts", { keyPath: "id", autoIncrement: true });
@@ -71,7 +82,7 @@
     if (!Number.isSafeInteger(capture.captured_at_us) || capture.captured_at_us < 0 ||
         !/^\d{4}-\d{2}-\d{2}$/.test(capture.session_date) ||
         ![true, false].includes(capture.completeness?.session_complete) ||
-        capture.completeness?.identity_policy !== "DOM_VALUE_OCCURRENCE_V1" ||
+        capture.completeness?.identity_policy !== "DOM_CHRONOLOGICAL_ORDER_V2" ||
         capture.completeness?.row_count !== capture.rows?.length ||
         !Array.isArray(capture.rows) || capture.rows.length < 1 || capture.rows.length > 5000) {
       throw new Error("capture completeness or timestamp is invalid");
@@ -107,6 +118,8 @@
       core.priceParts(row.price);
       if (!Number.isSafeInteger(row.quantity) || row.quantity <= 0 ||
           !Number.isSafeInteger(row.quantity_hands) || row.quantity_hands <= 0 ||
+          !Number.isSafeInteger(row.source_same_second_ordinal) ||
+          row.source_same_second_ordinal < 1 ||
           row.quantity !== row.quantity_hands * 100 || row.unit !== "SHARE" ||
           !["BUY", "SELL", "UNKNOWN"].includes(row.side) ||
           !Array.isArray(row.raw_cells) || !row.raw_cells.every((cell) => typeof cell === "string")) {
@@ -122,10 +135,31 @@
     return capture;
   }
 
+  function shanghaiSecondOfDay(timestampUs) {
+    if (!Number.isSafeInteger(timestampUs) || timestampUs < 0) return null;
+    const parts = new Intl.DateTimeFormat("en-GB", {
+      timeZone: "Asia/Shanghai",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(new Date(timestampUs / 1000));
+    const value = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    return Number(value.hour) * 3600 + Number(value.minute) * 60 + Number(value.second);
+  }
+
+  function isReviewedAshareSaleTimestamp(timestampUs) {
+    const secondOfDay = shanghaiSecondOfDay(timestampUs);
+    return secondOfDay !== null &&
+      ((secondOfDay >= 9 * 3600 + 25 * 60 && secondOfDay <= 11 * 3600 + 30 * 60) ||
+       (secondOfDay >= 13 * 3600 && secondOfDay <= 15 * 3600));
+  }
+
   function stableRowEvidence(row) {
     const {
       source_table_ordinal: _sourceTableOrdinal,
       source_row_ordinal: _sourceRowOrdinal,
+      source_same_second_ordinal: _sourceSameSecondOrdinal,
       raw_cells: _rawCells,
       ...evidence
     } = row;
@@ -296,7 +330,85 @@
     };
   }
 
-  async function ingestCaptureImpl(database, captureValue, claimedCaptureSha256) {
+  async function canonicalResumeBoundaryEvent(
+    captureValue,
+    claimedCaptureSha256,
+    sourceInstanceId,
+    sourceSequence,
+    sourceId = SOURCE_ID,
+  ) {
+    const capture = validateCapture(captureValue);
+    if (capture.completeness.session_complete || capture.completeness.page_index !== 1) {
+      throw new Error("session resume boundary requires one partial Eastmoney page-one capture");
+    }
+    const captureSha256 = await core.sha256Hex(core.canonicalJson(capture));
+    if (captureSha256 !== claimedCaptureSha256) {
+      throw new Error("session resume boundary capture SHA-256 is invalid");
+    }
+    const timestamps = capture.rows.map((row) =>
+      core.eventTimeUs(capture.session_date, row.source_trade_time));
+    const coveredFromUs = Math.min(...timestamps);
+    const coveredThroughUs = Math.max(...timestamps);
+    if (!isReviewedAshareSaleTimestamp(coveredFromUs) ||
+        !isReviewedAshareSaleTimestamp(coveredThroughUs)) {
+      throw new Error("session resume boundary rows are outside the reviewed time-sales bucket window");
+    }
+    const payload = {
+      status: "SESSION_RESUME_BOUNDARY",
+      session_date: capture.session_date,
+      covered_from_us: coveredFromUs,
+      covered_through_us: coveredThroughUs,
+      page_index: capture.completeness.page_index,
+      page_count: capture.completeness.page_count,
+      row_count: capture.rows.length,
+      capture_sha256: captureSha256,
+      source_captured_at_us: capture.captured_at_us,
+      policy: "INCOMPLETE_EASTMONEY_HISTORY_EXPLICIT_POLICY_V1",
+    };
+    const document = {
+      spec: "gridedge.market",
+      schema_version: 1,
+      event_type: "SOURCE_STATUS",
+      source: {
+        source_id: sourceId,
+        source_instance_id: sourceInstanceId,
+        source_type: "WEB_UI",
+        provider: capture.provider,
+        provider_version: capture.provider_version,
+      },
+      instrument: capture.instrument,
+      source_sequence: sourceSequence,
+      ts_us: payload.covered_through_us,
+      recv_us: capture.captured_at_us,
+      payload,
+      evidence_sha256: await core.sha256Hex(core.canonicalJson({
+        provider: capture.provider,
+        provider_version: capture.provider_version,
+        source_url: capture.source_url,
+        payload,
+      })),
+    };
+    const { recv_us: _receivedAt, ...identity } = document;
+    const eventId = await core.sha256Hex(core.canonicalJson(identity));
+    document.event_id = eventId;
+    return {
+      event_id: eventId,
+      source_key: `${sourceId}|${capture.instrument.venue}|${capture.instrument.symbol}`,
+      source_sequence: sourceSequence,
+      mqtt_topic: `gridedge/market/v1/${capture.instrument.venue}/${capture.instrument.symbol}/status`,
+      payload: core.canonicalJson(document),
+      state: "PENDING",
+      attempts: 0,
+      created_at_us: core.unixMicrosNow(),
+    };
+  }
+
+  async function ingestCaptureImpl(
+    database,
+    captureValue,
+    claimedCaptureSha256,
+    createResumeBoundary = false,
+  ) {
     const capture = validateCapture(captureValue);
     const canonicalCapture = core.canonicalJson(capture);
     const captureSha256 = await core.sha256Hex(canonicalCapture);
@@ -343,8 +455,17 @@
       const previousCoveredThroughUs = state.covered_through_us;
       let livePageOverlap = 0;
       let liveCoveredThroughUs = null;
-      if (state.complete_session_date && !capture.completeness.session_complete) {
-        if (capture.session_date !== state.complete_session_date) {
+      const activeSessionDate = state.complete_session_date ?? state.resume_boundary_session_date;
+      if (capture.completeness.session_complete && activeSessionDate) {
+        if (capture.session_date < activeSessionDate ||
+            (capture.session_date === activeSessionDate &&
+             previousCoveredThroughUs !== undefined &&
+             capture.completeness.covered_through_us < previousCoveredThroughUs)) {
+          throw new Error("complete history capture moved behind the durable market watermark");
+        }
+      }
+      if (activeSessionDate && !capture.completeness.session_complete && !createResumeBoundary) {
+        if (capture.session_date !== activeSessionDate) {
           throw new Error("a new session requires a complete history capture before live ingestion");
         }
         if (capture.completeness.page_index !== 1) {
@@ -380,7 +501,36 @@
         state.next_sequence += 1;
         state.complete_capture_sha256 = captureSha256;
         state.complete_session_date = capture.session_date;
+        delete state.resume_boundary_capture_sha256;
+        delete state.resume_boundary_session_date;
         state.covered_through_us = capture.completeness.covered_through_us;
+      } else if (createResumeBoundary) {
+        if (capture.completeness.session_complete || capture.completeness.page_index !== 1) {
+          throw new Error("session resume boundary requires a partial Eastmoney page-one capture");
+        }
+        if (state.complete_session_date === capture.session_date) {
+          throw new Error("a complete session cannot be replaced by a partial resume boundary");
+        }
+        if (state.resume_boundary_capture_sha256 !== captureSha256) {
+          const boundaryCoveredThroughUs = Math.max(...capture.rows.map((row) =>
+            core.eventTimeUs(capture.session_date, row.source_trade_time)));
+          if (previousCoveredThroughUs !== undefined &&
+              boundaryCoveredThroughUs <= previousCoveredThroughUs) {
+            throw new Error("session resume boundary must strictly advance its durable watermark");
+          }
+          statusEvents.push(await canonicalResumeBoundaryEvent(
+            capture,
+            captureSha256,
+            state.source_instance_id,
+            state.next_sequence,
+          ));
+          state.next_sequence += 1;
+          state.resume_boundary_capture_sha256 = captureSha256;
+          state.resume_boundary_session_date = capture.session_date;
+          delete state.complete_capture_sha256;
+          delete state.complete_session_date;
+          state.covered_through_us = boundaryCoveredThroughUs;
+        }
       } else if (liveCoveredThroughUs !== null) {
         statusEvents.push(await canonicalLiveStatusEvent(
           capture,
@@ -455,6 +605,13 @@
     return operation;
   }
 
+  function ingestResumeBoundary(database, captureValue, claimedCaptureSha256) {
+    const operation = writerTail.then(() =>
+      ingestCaptureImpl(database, captureValue, claimedCaptureSha256, true));
+    writerTail = operation.catch(() => undefined);
+    return operation;
+  }
+
   async function sourceState(database, instrument) {
     if (!instrument || !["XSHE", "XSHG"].includes(instrument.venue) ||
         !/^\d{6}$/.test(instrument.symbol ?? "") || instrument.asset_class !== "EQUITY" ||
@@ -478,14 +635,18 @@
     ).slice(0, limit);
   }
 
-  async function acknowledge(database, eventId) {
+  async function acknowledge(database, eventId, authority) {
+    if (!["DB_COMMIT_ACK", "TEST_ONLY"].includes(authority)) {
+      throw new Error("outbox acknowledgement lacks database commit authority");
+    }
     const tx = database.transaction("market_event_outbox", "readwrite", { durability: "strict" });
     const store = tx.objectStore("market_event_outbox");
     const event = await request(store.get(eventId));
-    if (!event || event.state !== "PENDING") throw new Error("PUBACK does not match one pending event");
+    if (!event || event.state !== "PENDING") throw new Error("database ACK does not match one pending event");
     event.state = "ACKNOWLEDGED";
     event.attempts += 1;
     event.acknowledged_at_us = core.unixMicrosNow();
+    event.acknowledgement_authority = authority;
     store.put(event);
     await transactionDone(tx);
   }
@@ -586,8 +747,26 @@
     } else {
       if (document.payload?.session_date !== sessionDate ||
           document.payload?.covered_through_us !== document.ts_us ||
-          !["SESSION_HISTORY_COMPLETE", "LIVE_CONTIGUOUS"].includes(document.payload?.status)) {
+          !["SESSION_HISTORY_COMPLETE", "SESSION_RESUME_BOUNDARY", "LIVE_CONTIGUOUS"]
+            .includes(document.payload?.status)) {
         throw new Error("stored replay status session date or watermark is invalid");
+      }
+      if (document.payload.status === "SESSION_RESUME_BOUNDARY" &&
+          (source.provider_version !== "eastmoney-time-sales-dom-v6" ||
+           !Number.isSafeInteger(document.payload.covered_from_us) ||
+           document.payload.covered_from_us > document.payload.covered_through_us ||
+           shanghaiSessionDate(document.payload.covered_from_us) !== sessionDate ||
+           !isReviewedAshareSaleTimestamp(document.payload.covered_from_us) ||
+           document.payload.page_index !== 1 ||
+           !Number.isSafeInteger(document.payload.page_count) || document.payload.page_count < 1 ||
+           !Number.isSafeInteger(document.payload.row_count) || document.payload.row_count < 1 ||
+           document.payload.policy !== "INCOMPLETE_EASTMONEY_HISTORY_EXPLICIT_POLICY_V1")) {
+        throw new Error("stored replay partial boundary proof is invalid");
+      }
+      if (document.payload.status === "LIVE_CONTIGUOUS" &&
+          (!Number.isSafeInteger(document.payload.previous_covered_through_us) ||
+           document.payload.previous_covered_through_us >= document.payload.covered_through_us)) {
+        throw new Error("stored replay live predecessor is invalid");
       }
     }
     if (source.provider_version === "eastmoney-time-sales-dom-v6" &&
@@ -639,5 +818,5 @@
     };
   }
 
-  return { SOURCE_ID, acknowledge, canonicalEvent, ingestCapture, openDatabase, pendingEvents, replayExport, sourceState, status, validateCapture };
+  return { DATABASE_NAME: DB_NAME, SOURCE_ID, acknowledge, canonicalEvent, canonicalResumeBoundaryEvent, ingestCapture, ingestResumeBoundary, openDatabase, pendingEvents, replayExport, sourceState, status, validateCapture };
 });

@@ -12,6 +12,7 @@ const PROVIDER_VERSION: &str = "eastmoney-time-sales-dom-v6";
 const LEGACY_PROVIDER_VERSION: &str = "eastmoney-time-sales-dom-v5";
 const LEGACY_SOURCE_INSTANCE: &str = "8101d65c-bdba-4de3-83e0-8983506f159e";
 const LEGACY_FINAL_SEQUENCE: u64 = 2_763;
+const PARTIAL_RESUME_POLICY: &str = "INCOMPLETE_EASTMONEY_HISTORY_EXPLICIT_POLICY_V1";
 
 #[derive(Debug, Clone)]
 struct TradeTick {
@@ -34,6 +35,7 @@ struct SourceStatus {
     received_us: u64,
     session_date: NaiveDate,
     status: String,
+    declared_previous_covered_through_us: Option<u64>,
     covered_through_us: u64,
     signed_legacy: bool,
 }
@@ -47,6 +49,7 @@ enum StreamEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceCompletionKind {
     SessionHistoryComplete,
+    SessionResumeBoundary,
     LiveContiguous,
 }
 
@@ -195,6 +198,8 @@ pub struct WebTradeBarBuilder {
     emitted: BTreeSet<NaiveDateTime>,
     covered_through_us: Option<u64>,
     complete_sessions: BTreeSet<NaiveDate>,
+    resume_boundary_sessions: BTreeMap<NaiveDate, NaiveDateTime>,
+    safe_resume_boundary_sessions: BTreeSet<NaiveDate>,
 }
 
 impl WebTradeBarBuilder {
@@ -228,11 +233,21 @@ impl WebTradeBarBuilder {
             emitted: BTreeSet::new(),
             covered_through_us: None,
             complete_sessions: BTreeSet::new(),
+            resume_boundary_sessions: BTreeMap::new(),
+            safe_resume_boundary_sessions: BTreeSet::new(),
         })
     }
 
     pub fn has_complete_session(&self, date: NaiveDate) -> bool {
         self.complete_sessions.contains(&date)
+    }
+
+    pub fn has_resume_boundary(&self, date: NaiveDate) -> bool {
+        self.resume_boundary_sessions.contains_key(&date)
+    }
+
+    pub fn partial_session_resume_is_safe(&self, date: NaiveDate) -> bool {
+        self.safe_resume_boundary_sessions.contains(&date)
     }
 
     pub fn covered_through_us(&self) -> Option<u64> {
@@ -328,6 +343,7 @@ impl WebTradeBarBuilder {
                 let previous_covered_through_us = self.covered_through_us;
                 let kind = match status.status.as_str() {
                     "SESSION_HISTORY_COMPLETE" => SourceCompletionKind::SessionHistoryComplete,
+                    "SESSION_RESUME_BOUNDARY" => SourceCompletionKind::SessionResumeBoundary,
                     "LIVE_CONTIGUOUS" => SourceCompletionKind::LiveContiguous,
                     _ => bail!("market source status has an invalid completion kind"),
                 };
@@ -361,6 +377,13 @@ impl WebTradeBarBuilder {
         let Some(end) = trade_bucket_end(timestamp, self.interval_minutes)? else {
             return Ok(());
         };
+        if self
+            .resume_boundary_sessions
+            .get(&timestamp.date())
+            .is_some_and(|unsafe_bucket_end| end <= *unsafe_bucket_end)
+        {
+            return Ok(());
+        }
         if self.emitted.contains(&end) {
             bail!("a trade arrived behind an already emitted market watermark")
         }
@@ -376,7 +399,7 @@ impl WebTradeBarBuilder {
         if status.timestamp_us != status.covered_through_us
             || !matches!(
                 status.status.as_str(),
-                "SESSION_HISTORY_COMPLETE" | "LIVE_CONTIGUOUS"
+                "SESSION_HISTORY_COMPLETE" | "SESSION_RESUME_BOUNDARY" | "LIVE_CONTIGUOUS"
             )
         {
             bail!("market source status has an invalid completion watermark")
@@ -387,9 +410,47 @@ impl WebTradeBarBuilder {
         {
             bail!("market source watermark moved backwards")
         }
+        if status.status == "SESSION_RESUME_BOUNDARY"
+            && self
+                .covered_through_us
+                .is_some_and(|previous| status.covered_through_us <= previous)
+        {
+            bail!("session resume boundary did not strictly advance the market watermark")
+        }
+        if status.status == "LIVE_CONTIGUOUS" {
+            match self.covered_through_us {
+                Some(previous)
+                    if status.declared_previous_covered_through_us != Some(previous)
+                        || status.covered_through_us <= previous =>
+                {
+                    bail!(
+                        "live market watermark does not strictly continue its declared predecessor"
+                    )
+                }
+                None if status.declared_previous_covered_through_us.is_some() => {
+                    bail!("first live market watermark declared a nonexistent predecessor")
+                }
+                _ => {}
+            }
+        }
         let covered = shanghai_datetime(status.covered_through_us)?;
         if covered.date() != status.session_date {
             bail!("market source watermark disagrees with its session date")
+        }
+        if status.status == "SESSION_RESUME_BOUNDARY" {
+            if self.complete_sessions.contains(&status.session_date) {
+                bail!("a complete market session cannot be replaced by a partial boundary")
+            }
+            let unsafe_bucket_end = trade_bucket_end(covered, self.interval_minutes)?
+                .context("session resume boundary is outside the reviewed time-sales window")?;
+            self.pending
+                .retain(|end, _| end.date() != status.session_date);
+            self.resume_boundary_sessions
+                .insert(status.session_date, unsafe_bucket_end);
+            self.safe_resume_boundary_sessions
+                .remove(&status.session_date);
+            self.covered_through_us = Some(status.covered_through_us);
+            return Ok(Vec::new());
         }
         let completed_ends = self
             .pending
@@ -410,6 +471,17 @@ impl WebTradeBarBuilder {
             self.pending.remove(&end);
             self.emitted.insert(end);
         }
+        if status.status == "LIVE_CONTIGUOUS"
+            && self
+                .resume_boundary_sessions
+                .get(&status.session_date)
+                .is_some_and(|unsafe_bucket_end| {
+                    bars.iter().any(|bar| bar.timestamp > *unsafe_bucket_end)
+                })
+        {
+            self.safe_resume_boundary_sessions
+                .insert(status.session_date);
+        }
         self.covered_through_us = Some(status.covered_through_us);
         if status.status == "SESSION_HISTORY_COMPLETE" {
             self.complete_sessions.insert(status.session_date);
@@ -426,7 +498,7 @@ fn validate_event_integrity_before_disposition(event: &StreamEvent) -> Result<()
         if status.timestamp_us != status.covered_through_us
             || !matches!(
                 status.status.as_str(),
-                "SESSION_HISTORY_COMPLETE" | "LIVE_CONTIGUOUS"
+                "SESSION_HISTORY_COMPLETE" | "SESSION_RESUME_BOUNDARY" | "LIVE_CONTIGUOUS"
             )
         {
             bail!("market source status has an invalid completion watermark")
@@ -608,6 +680,37 @@ fn parse_event(topic: &str, bytes: &[u8], venue: &str, symbol: &str) -> Result<S
                 NaiveDate::parse_from_str(string_field(payload, "session_date")?, "%Y-%m-%d")
                     .context("source status session date is invalid")?;
             validate_sha256(string_field(payload, "capture_sha256")?, "capture hash")?;
+            let status = string_field(payload, "status")?.to_owned();
+            let covered_through_us = u64_field(payload, "covered_through_us")?;
+            let covered_from_us = optional_u64_field(payload, "covered_from_us")?;
+            let declared_previous_covered_through_us =
+                optional_u64_field(payload, "previous_covered_through_us")?;
+            let page_index = optional_u64_field(payload, "page_index")?;
+            let page_count = optional_u64_field(payload, "page_count")?;
+            let row_count = optional_u64_field(payload, "row_count")?;
+            let policy = optional_string_field(payload, "policy")?.map(str::to_owned);
+            let covered_from_is_reviewed = covered_from_us
+                .and_then(|from| shanghai_datetime(from).ok())
+                .is_some_and(|timestamp| {
+                    timestamp.date() == session_date
+                        && is_reviewed_ashare_sale_time(timestamp.time())
+                });
+            let covered_through_has_bucket = shanghai_datetime(covered_through_us)
+                .ok()
+                .and_then(|timestamp| trade_bucket_end(timestamp, 5).ok().flatten())
+                .is_some();
+            if status == "SESSION_RESUME_BOUNDARY"
+                && (signed_legacy
+                    || covered_from_us.is_none_or(|from| from > covered_through_us)
+                    || !covered_from_is_reviewed
+                    || !covered_through_has_bucket
+                    || page_index != Some(1)
+                    || page_count.is_none_or(|count| count < 1)
+                    || row_count.is_none_or(|count| count < 1)
+                    || policy.as_deref() != Some(PARTIAL_RESUME_POLICY))
+            {
+                bail!("session resume boundary lacks its exact reviewed partial-session proof")
+            }
             Ok(StreamEvent::Status(SourceStatus {
                 sequence,
                 event_id: event_id.to_owned(),
@@ -615,8 +718,9 @@ fn parse_event(topic: &str, bytes: &[u8], venue: &str, symbol: &str) -> Result<S
                 timestamp_us,
                 received_us,
                 session_date,
-                status: string_field(payload, "status")?.to_owned(),
-                covered_through_us: u64_field(payload, "covered_through_us")?,
+                status,
+                declared_previous_covered_through_us,
+                covered_through_us,
                 signed_legacy,
             }))
         }
@@ -676,6 +780,14 @@ fn trade_bucket_end(
     bail!("trade tick is outside the continuous A-share session")
 }
 
+fn is_reviewed_ashare_sale_time(time: NaiveTime) -> bool {
+    let auction = NaiveTime::from_hms_opt(9, 25, 0).expect("valid time");
+    let morning_end = NaiveTime::from_hms_opt(11, 30, 0).expect("valid time");
+    let afternoon_start = NaiveTime::from_hms_opt(13, 0, 0).expect("valid time");
+    let afternoon_end = NaiveTime::from_hms_opt(15, 0, 0).expect("valid time");
+    (time >= auction && time <= morning_end) || (time >= afternoon_start && time <= afternoon_end)
+}
+
 fn string_field<'a>(object: &'a serde_json::Map<String, Value>, key: &str) -> Result<&'a str> {
     object
         .get(key)
@@ -688,6 +800,31 @@ fn u64_field(object: &serde_json::Map<String, Value>, key: &str) -> Result<u64> 
         .get(key)
         .and_then(Value::as_u64)
         .with_context(|| format!("market field {key} must be u64"))
+}
+
+fn optional_u64_field(object: &serde_json::Map<String, Value>, key: &str) -> Result<Option<u64>> {
+    object
+        .get(key)
+        .map(|value| {
+            value
+                .as_u64()
+                .with_context(|| format!("market field {key} must be u64"))
+        })
+        .transpose()
+}
+
+fn optional_string_field<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<&'a str>> {
+    object
+        .get(key)
+        .map(|value| {
+            value
+                .as_str()
+                .with_context(|| format!("market field {key} must be a string"))
+        })
+        .transpose()
 }
 
 fn i64_field(object: &serde_json::Map<String, Value>, key: &str) -> Result<i64> {

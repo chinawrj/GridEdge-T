@@ -37,6 +37,7 @@
     <string>60</string>
     <string>--maximum-order-age-seconds</string>
     <string>300</string>
+    <string>--allow-partial-session-resume-boundary</string>
     <string>--simulation-adapter</string>
     <string>android</string>
     <string>--android-serial</string>

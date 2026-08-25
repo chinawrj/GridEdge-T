@@ -42,6 +42,7 @@ test("Eastmoney adapter canonicalizes descending DOM rows into chronological sou
     const [header, ...rows] = table;
     table.splice(0, table.length, header, ...rows.reverse());
   }
+  descending.rowOrder = "LATEST_FIRST";
 
   const capture = eastmoney.parseSnapshot(descending);
 
@@ -49,6 +50,25 @@ test("Eastmoney adapter canonicalizes descending DOM rows into chronological sou
     capture.rows.map((row) => row.source_trade_time),
     ["09:30:00", "09:30:03", "09:30:03", "09:30:06"],
   );
+});
+
+test("Eastmoney adapter preserves reviewed DOM order among same-second trades", () => {
+  const descending = snapshotPage(1, 1, [
+    ["09:35:00", "3.36", "20"],
+    ["09:35:00", "3.34", "10"],
+    ["09:34:59", "3.35", "30"],
+  ]);
+  descending.rowOrder = "LATEST_FIRST";
+  const capture = eastmoney.parseSnapshot(descending);
+  assert.deepEqual(
+    capture.rows.map((row) => [row.source_trade_time, row.price, row.source_same_second_ordinal]),
+    [
+      ["09:34:59", "3.35", 1],
+      ["09:35:00", "3.34", 1],
+      ["09:35:00", "3.36", 2],
+    ],
+  );
+  assert.equal(capture.completeness.identity_policy, "DOM_CHRONOLOGICAL_ORDER_V2");
 });
 
 test("Eastmoney adapter reads the live pagination token when it is adjacent to 尾页", () => {
@@ -119,6 +139,7 @@ function snapshotPage(pageIndex, pageCount, rows) {
   return {
     ...structuredClone(fixture),
     bodyText: `时间 成交价 手数 ${pageIndex}/${pageCount}页`,
+    rowOrder: "LATEST_FIRST",
     tables: [[
       [
         { text: "时间", class_name: "" },
@@ -182,5 +203,60 @@ test("history assembly rejects a missing page or a first-page live-window gap", 
       ["1".repeat(64), "2".repeat(64)], "3".repeat(64),
     ),
     /live page has no overlap/,
+  );
+});
+
+test("history assembly rejects a page token that advanced before the time-sales rows", () => {
+  const staleRows = [
+    ["09:35:00", "3.34", "10"],
+    ["09:34:57", "3.33", "20"],
+  ];
+  const firstPage = eastmoney.parseSnapshot(snapshotPage(1, 2, staleRows));
+  const tokenOnlySecondPage = eastmoney.parseSnapshot(snapshotPage(2, 2, staleRows));
+
+  assert.throws(
+    () => eastmoney.assembleSessionHistory(
+      [firstPage, tokenOnlySecondPage], firstPage,
+      ["1".repeat(64), "2".repeat(64)], "3".repeat(64),
+    ),
+    /duplicate time-sales rowset/,
+  );
+});
+
+test("history assembly rejects a changing live window mislabeled as an older page", () => {
+  const firstPage = eastmoney.parseSnapshot(snapshotPage(1, 2, [
+    ["09:35:03", "3.35", "20"],
+    ["09:35:00", "3.34", "10"],
+  ]));
+  const shiftedLiveWindow = eastmoney.parseSnapshot(snapshotPage(2, 2, [
+    ["09:35:06", "3.36", "30"],
+    ["09:35:03", "3.35", "20"],
+  ]));
+
+  assert.throws(
+    () => eastmoney.assembleSessionHistory(
+      [firstPage, shiftedLiveWindow], firstPage,
+      ["1".repeat(64), "2".repeat(64)], "3".repeat(64),
+    ),
+    /does not move backward/,
+  );
+});
+
+test("history assembly fails closed when adjacent pages overlap one row identity", () => {
+  const firstPage = eastmoney.parseSnapshot(snapshotPage(1, 2, [
+    ["09:35:00", "3.34", "10"],
+    ["09:34:57", "3.33", "20"],
+  ]));
+  const secondPage = eastmoney.parseSnapshot(snapshotPage(2, 2, [
+    ["09:34:57", "3.33", "20"],
+    ["09:34:54", "3.32", "30"],
+  ]));
+
+  assert.throws(
+    () => eastmoney.assembleSessionHistory(
+      [firstPage, secondPage], firstPage,
+      ["1".repeat(64), "2".repeat(64)], "3".repeat(64),
+    ),
+    /overlap at an unprovable source row identity/,
   );
 });

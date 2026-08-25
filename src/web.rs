@@ -2265,6 +2265,17 @@ async fn completed_command_response(
     request: &ApiCommandRequest,
 ) -> Result<Option<ApiCommandResponse>, WebError> {
     let mut store = open_web_store(app)?;
+    if store
+        .web_command_receipt(&request.run_id, &request.request_id)?
+        .is_none()
+    {
+        // A brand-new command must enter the per-run lock before recovering a
+        // pending PLAY. Starting its worker here would race that command for
+        // the same lock and could make the control request time out. The
+        // locked execution path below performs recovery first, starts the
+        // worker while the lock is still held, and then evaluates the command.
+        return Ok(None);
+    }
     if let Some(control) = recover_committed_pending_receipt(app, &mut store, &request.run_id)? {
         ensure_playback_worker(Arc::clone(app), request.run_id.clone(), control).await?;
     }

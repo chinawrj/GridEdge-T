@@ -32,7 +32,10 @@ fn complete_trade_ticks_wait_for_a_source_watermark_before_forming_exact_ohlcv()
         .ingest(STATUS_TOPIC, &status(104, "09:34:59", "LIVE_CONTIGUOUS"))?
         .is_empty());
 
-    let bars = builder.ingest(STATUS_TOPIC, &status(105, "09:35:01", "LIVE_CONTIGUOUS"))?;
+    let bars = builder.ingest(
+        STATUS_TOPIC,
+        &status_with_previous(105, "09:35:01", "09:34:59"),
+    )?;
     assert_eq!(bars.len(), 1);
     let bar = &bars[0];
     assert_eq!(bar.timestamp.to_string(), "2026-08-21 09:35:00");
@@ -68,6 +71,182 @@ fn a_complete_history_watermark_releases_multiple_bars_in_time_order() -> Result
 }
 
 #[test]
+fn an_explicit_partial_session_boundary_is_auditable_but_not_complete_history() -> Result<()> {
+    let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
+    builder.ingest(TRADE_TOPIC, &tick(1, "13:40:01", 336, 2, 100))?;
+    let boundary = builder.ingest_with_receipt(
+        STATUS_TOPIC,
+        &status(2, "13:40:20", "SESSION_RESUME_BOUNDARY"),
+    )?;
+    assert_eq!(
+        boundary.completion.expect("resume boundary receipt").kind,
+        SourceCompletionKind::SessionResumeBoundary
+    );
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
+    assert!(!builder.has_complete_session(date));
+    assert!(builder.has_resume_boundary(date));
+
+    let live = builder.ingest_with_receipt(
+        STATUS_TOPIC,
+        &status_with_previous(3, "13:40:40", "13:40:20"),
+    )?;
+    assert_eq!(
+        live.completion
+            .expect("live receipt after boundary")
+            .previous_covered_through_us,
+        Some(timestamp_us("13:40:20"))
+    );
+    assert!(!builder.partial_session_resume_is_safe(date));
+    builder.ingest(TRADE_TOPIC, &tick(4, "13:44:00", 335, 2, 100))?;
+    builder.ingest(TRADE_TOPIC, &tick(5, "13:45:00", 337, 2, 200))?;
+    assert!(builder
+        .ingest(
+            STATUS_TOPIC,
+            &status_with_previous(6, "13:45:01", "13:40:40"),
+        )?
+        .is_empty());
+    assert!(!builder.partial_session_resume_is_safe(date));
+    builder.ingest(TRADE_TOPIC, &tick(7, "13:46:00", 336, 2, 100))?;
+    let safe = builder.ingest(
+        STATUS_TOPIC,
+        &status_with_previous(8, "13:50:01", "13:45:01"),
+    )?;
+    assert_eq!(safe.len(), 1);
+    assert_eq!(safe[0].timestamp.to_string(), "2026-08-21 13:50:00");
+    assert_eq!(safe[0].open, Decimal::from_str("3.37")?);
+    assert_eq!(safe[0].volume, 300);
+    assert!(builder.partial_session_resume_is_safe(date));
+    Ok(())
+}
+
+#[test]
+fn partial_boundary_schema_and_live_predecessor_are_atomic_fail_closed_gates() -> Result<()> {
+    let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
+    builder.ingest(TRADE_TOPIC, &tick(1, "13:40:01", 336, 2, 100))?;
+
+    let mut forged_boundary: Value =
+        serde_json::from_slice(&status(2, "13:40:20", "SESSION_RESUME_BOUNDARY"))?;
+    forged_boundary["payload"]["policy"] = json!("UNREVIEWED");
+    canonicalize_event_id(&mut forged_boundary);
+    assert!(builder
+        .ingest(STATUS_TOPIC, &serde_json::to_vec(&forged_boundary)?)
+        .is_err());
+    builder.ingest(
+        STATUS_TOPIC,
+        &status(2, "13:40:20", "SESSION_RESUME_BOUNDARY"),
+    )?;
+
+    assert!(builder
+        .ingest(
+            STATUS_TOPIC,
+            &status(3, "13:40:20", "SESSION_RESUME_BOUNDARY"),
+        )
+        .is_err());
+
+    let mismatched = status_with_previous(3, "13:40:40", "13:40:19");
+    let before_mismatch = format!("{builder:?}");
+    assert!(builder.ingest(STATUS_TOPIC, &mismatched).is_err());
+    assert_eq!(format!("{builder:?}"), before_mismatch);
+    builder.ingest(
+        STATUS_TOPIC,
+        &status_with_previous(3, "13:40:40", "13:40:20"),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn partial_boundary_discards_auction_through_partial_bucket_and_keeps_next_bucket_open(
+) -> Result<()> {
+    let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
+    builder.ingest(TRADE_TOPIC, &tick(1, "09:25:00", 331, 2, 100))?;
+    builder.ingest(TRADE_TOPIC, &tick(2, "09:31:00", 332, 2, 100))?;
+    builder.ingest(
+        STATUS_TOPIC,
+        &resume_boundary_with_from(3, "09:31:00", "09:25:00"),
+    )?;
+    builder.ingest(TRADE_TOPIC, &tick(4, "09:34:59", 333, 2, 100))?;
+    builder.ingest(TRADE_TOPIC, &tick(5, "09:35:00", 334, 2, 200))?;
+    let bars = builder.ingest(
+        STATUS_TOPIC,
+        &status_with_previous(6, "09:40:01", "09:31:00"),
+    )?;
+    assert_eq!(bars.len(), 1);
+    assert_eq!(bars[0].timestamp.to_string(), "2026-08-21 09:40:00");
+    assert_eq!(bars[0].open, Decimal::from_str("3.34")?);
+    assert_eq!(bars[0].volume, 200);
+    Ok(())
+}
+
+#[test]
+fn partial_boundary_discards_late_rows_in_exact_lunch_and_close_buckets() -> Result<()> {
+    for (boundary_time, next_tick, next_watermark) in [
+        ("11:30:00", "13:00:00", "13:05:01"),
+        ("15:00:00", "15:00:00", "15:00:00"),
+    ] {
+        let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
+        builder.ingest(
+            STATUS_TOPIC,
+            &resume_boundary_with_from(1, boundary_time, boundary_time),
+        )?;
+        builder.ingest(TRADE_TOPIC, &tick(2, boundary_time, 399, 2, 900))?;
+        if boundary_time == "11:30:00" {
+            builder.ingest(TRADE_TOPIC, &tick(3, next_tick, 335, 2, 100))?;
+            let bars = builder.ingest(
+                STATUS_TOPIC,
+                &status_with_previous(4, next_watermark, boundary_time),
+            )?;
+            assert_eq!(bars.len(), 1);
+            assert_eq!(bars[0].timestamp.to_string(), "2026-08-21 13:05:00");
+            assert_eq!(bars[0].open, Decimal::from_str("3.35")?);
+            assert_eq!(bars[0].volume, 100);
+        } else {
+            assert!(!format!("{builder:?}").contains("volume: 900"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_complete_session_cannot_be_replaced_by_partial_state_and_failure_is_atomic() -> Result<()> {
+    let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
+    builder.ingest(TRADE_TOPIC, &tick(1, "09:31:00", 331, 2, 100))?;
+    builder.ingest(
+        STATUS_TOPIC,
+        &status(2, "09:35:01", "SESSION_HISTORY_COMPLETE"),
+    )?;
+    builder.ingest(TRADE_TOPIC, &tick(3, "09:36:00", 332, 2, 200))?;
+    let before = format!("{builder:?}");
+    assert!(builder
+        .ingest(
+            STATUS_TOPIC,
+            &resume_boundary_with_from(4, "09:40:00", "09:36:00"),
+        )
+        .is_err());
+    assert_eq!(format!("{builder:?}"), before);
+    let bars = builder.ingest(
+        STATUS_TOPIC,
+        &status_with_previous(4, "09:40:01", "09:35:01"),
+    )?;
+    assert_eq!(bars.len(), 1);
+    assert_eq!(bars[0].open, Decimal::from_str("3.32")?);
+    Ok(())
+}
+
+#[test]
+fn source_sequence_preserves_same_second_open_and_close_at_a_bucket_boundary() -> Result<()> {
+    let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
+    builder.ingest(TRADE_TOPIC, &tick(1, "09:35:00", 334, 2, 100))?;
+    builder.ingest(TRADE_TOPIC, &tick(2, "09:35:00", 336, 2, 200))?;
+    let bars = builder.ingest(STATUS_TOPIC, &status(3, "09:40:01", "LIVE_CONTIGUOUS"))?;
+    assert_eq!(bars.len(), 1);
+    assert_eq!(bars[0].timestamp.to_string(), "2026-08-21 09:40:00");
+    assert_eq!(bars[0].open, Decimal::from_str("3.34")?);
+    assert_eq!(bars[0].close, Decimal::from_str("3.36")?);
+    assert_eq!(bars[0].volume, 300);
+    Ok(())
+}
+
+#[test]
 fn ingest_receipt_binds_released_bars_to_the_exact_completion_status() -> Result<()> {
     let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
     builder.ingest(TRADE_TOPIC, &tick(1, "09:31:00", 352, 2, 100))?;
@@ -80,8 +259,10 @@ fn ingest_receipt_binds_released_bars_to_the_exact_completion_status() -> Result
     assert_eq!(completion.previous_covered_through_us, None);
     assert_eq!(completion.covered_through_us, timestamp_us("09:35:01"));
 
-    let next =
-        builder.ingest_with_receipt(STATUS_TOPIC, &status(3, "09:35:31", "LIVE_CONTIGUOUS"))?;
+    let next = builder.ingest_with_receipt(
+        STATUS_TOPIC,
+        &status_with_previous(3, "09:35:31", "09:35:01"),
+    )?;
     assert_eq!(
         next.completion
             .expect("second completion receipt")
@@ -395,6 +576,144 @@ fn signed_legacy_boundary_allows_exact_v5_to_v6_sequence_transition_only() -> Re
 }
 
 #[test]
+fn quarantined_legacy_tail_transitions_atomically_to_v6_partial_then_safe_live() -> Result<()> {
+    let fixed_instance = "8101d65c-bdba-4de3-83e0-8983506f159e";
+    let quarantined_legacy = event_with_source(
+        2_763,
+        "TRADE_TICK",
+        "2026-08-22 10:00:00",
+        "2026-08-22 10:00:00",
+        fixed_instance,
+        "eastmoney-time-sales-dom-v5",
+        false,
+        json!({
+            "price": {"mantissa": 335, "scale": 2},
+            "quantity": 100,
+            "unit": "SHARE",
+            "side": "UNKNOWN",
+            "source_row_key": "polluted-weekend-tail",
+            "source_page": 1,
+        }),
+    );
+    let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
+    let tail = builder.ingest_with_receipt(TRADE_TOPIC, &quarantined_legacy)?;
+    assert_eq!(
+        tail.quarantine_reason.as_deref(),
+        Some("OUTSIDE_REVIEWED_A_SHARE_SESSION")
+    );
+    assert!(tail.bars.is_empty());
+    assert!(tail.completion.is_none());
+
+    let boundary_payload = json!({
+        "status": "SESSION_RESUME_BOUNDARY",
+        "session_date": "2026-08-24",
+        "covered_from_us": timestamp_us_at("2026-08-24 13:40:01"),
+        "covered_through_us": timestamp_us_at("2026-08-24 13:40:20"),
+        "page_index": 1,
+        "page_count": 13,
+        "row_count": 144,
+        "policy": "INCOMPLETE_EASTMONEY_HISTORY_EXPLICIT_POLICY_V1",
+        "capture_sha256": "c".repeat(64),
+    });
+    let wrong_instance = event_with_source(
+        2_764,
+        "SOURCE_STATUS",
+        "2026-08-24 13:40:20",
+        "2026-08-24 13:40:21",
+        "0198d8f2-6a70-7f3d-a3fc-8a53a460d599",
+        "eastmoney-time-sales-dom-v6",
+        true,
+        boundary_payload.clone(),
+    );
+    assert!(builder.ingest(STATUS_TOPIC, &wrong_instance).is_err());
+    let wrong_sequence = event_with_source(
+        2_765,
+        "SOURCE_STATUS",
+        "2026-08-24 13:40:20",
+        "2026-08-24 13:40:21",
+        fixed_instance,
+        "eastmoney-time-sales-dom-v6",
+        true,
+        boundary_payload.clone(),
+    );
+    assert!(builder.ingest(STATUS_TOPIC, &wrong_sequence).is_err());
+
+    let boundary = event_with_source(
+        2_764,
+        "SOURCE_STATUS",
+        "2026-08-24 13:40:20",
+        "2026-08-24 13:40:21",
+        fixed_instance,
+        "eastmoney-time-sales-dom-v6",
+        true,
+        boundary_payload,
+    );
+    builder.ingest(STATUS_TOPIC, &boundary)?;
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 24).unwrap();
+    assert!(builder.has_resume_boundary(date));
+    assert!(!builder.partial_session_resume_is_safe(date));
+
+    let first_live = event_with_source(
+        2_765,
+        "SOURCE_STATUS",
+        "2026-08-24 13:40:40",
+        "2026-08-24 13:40:41",
+        fixed_instance,
+        "eastmoney-time-sales-dom-v6",
+        true,
+        json!({
+            "status": "LIVE_CONTIGUOUS",
+            "session_date": "2026-08-24",
+            "previous_covered_through_us": timestamp_us_at("2026-08-24 13:40:20"),
+            "covered_through_us": timestamp_us_at("2026-08-24 13:40:40"),
+            "capture_sha256": "d".repeat(64),
+        }),
+    );
+    builder.ingest(STATUS_TOPIC, &first_live)?;
+    assert!(!builder.partial_session_resume_is_safe(date));
+
+    let trade = event_with_source(
+        2_766,
+        "TRADE_TICK",
+        "2026-08-24 13:45:00",
+        "2026-08-24 13:45:01",
+        fixed_instance,
+        "eastmoney-time-sales-dom-v6",
+        true,
+        json!({
+            "price": {"mantissa": 337, "scale": 2},
+            "quantity": 200,
+            "unit": "SHARE",
+            "side": "UNKNOWN",
+            "source_row_key": "2026-08-24|13:45:00|3.37|2|UNKNOWN|1",
+            "source_page": 1,
+        }),
+    );
+    builder.ingest(TRADE_TOPIC, &trade)?;
+    let terminal_live = event_with_source(
+        2_767,
+        "SOURCE_STATUS",
+        "2026-08-24 13:50:01",
+        "2026-08-24 13:50:02",
+        fixed_instance,
+        "eastmoney-time-sales-dom-v6",
+        true,
+        json!({
+            "status": "LIVE_CONTIGUOUS",
+            "session_date": "2026-08-24",
+            "previous_covered_through_us": timestamp_us_at("2026-08-24 13:40:40"),
+            "covered_through_us": timestamp_us_at("2026-08-24 13:50:01"),
+            "capture_sha256": "e".repeat(64),
+        }),
+    );
+    let bars = builder.ingest(STATUS_TOPIC, &terminal_live)?;
+    assert_eq!(bars.len(), 1);
+    assert_eq!(bars[0].timestamp.to_string(), "2026-08-24 13:50:00");
+    assert!(builder.partial_session_resume_is_safe(date));
+    Ok(())
+}
+
+#[test]
 fn signed_legacy_same_day_history_backfill_is_not_misclassified_as_weekend_pollution() -> Result<()>
 {
     let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
@@ -572,6 +891,206 @@ fn market_replay_cli_requires_the_terminal_watermark_and_writes_a_hashed_audit()
     Ok(())
 }
 
+#[test]
+fn market_replay_cli_requires_explicit_authority_for_a_safe_partial_session() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input_path = directory.path().join("partial-market.jsonl");
+    let output_path = directory.path().join("partial-audit.json");
+    let mut input = std::fs::File::create(&input_path)?;
+    for (topic, payload) in [
+        (
+            STATUS_TOPIC,
+            resume_boundary_with_from(1, "13:40:20", "13:40:01"),
+        ),
+        (TRADE_TOPIC, tick(2, "13:46:00", 352, 2, 200)),
+        (
+            STATUS_TOPIC,
+            status_with_previous(3, "13:50:01", "13:40:20"),
+        ),
+    ] {
+        writeln!(
+            input,
+            "{}",
+            serde_json::json!({"topic": topic, "payload_hex": hex::encode(payload)})
+        )?;
+    }
+    input.sync_all()?;
+
+    let denied = Command::new(env!("CARGO_BIN_EXE_gridedge_market_replay"))
+        .args([
+            "--input",
+            input_path.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+            "--symbol",
+            "002256.SZ",
+            "--session-date",
+            "2026-08-21",
+        ])
+        .output()?;
+    assert!(!denied.status.success());
+    assert!(!output_path.exists());
+
+    let allowed = Command::new(env!("CARGO_BIN_EXE_gridedge_market_replay"))
+        .args([
+            "--input",
+            input_path.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+            "--symbol",
+            "002256.SZ",
+            "--session-date",
+            "2026-08-21",
+            "--allow-partial-session-resume-boundary",
+        ])
+        .output()?;
+    assert!(
+        allowed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    let audit: Value = serde_json::from_slice(&std::fs::read(output_path)?)?;
+    assert_eq!(audit["history_mode"], "PARTIAL_SESSION_SAFE_AFTER_BOUNDARY");
+    assert_eq!(audit["bar_count"], 1);
+    assert_eq!(audit["bars"][0]["timestamp"], "2026-08-21 13:50:00");
+    Ok(())
+}
+
+#[test]
+fn market_replay_cli_never_exports_bars_released_before_a_partial_boundary() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input_path = directory.path().join("mixed-boundary-market.jsonl");
+    let output_path = directory.path().join("mixed-boundary-audit.json");
+    let bars_path = directory.path().join("mixed-boundary-bars.csv");
+    let mut input = std::fs::File::create(&input_path)?;
+    for (topic, payload) in [
+        (TRADE_TOPIC, tick(1, "09:31:00", 351, 2, 100)),
+        (STATUS_TOPIC, status(2, "09:35:01", "LIVE_CONTIGUOUS")),
+        (
+            STATUS_TOPIC,
+            resume_boundary_with_from(3, "13:40:20", "13:40:01"),
+        ),
+        (TRADE_TOPIC, tick(4, "13:46:00", 352, 2, 200)),
+        (
+            STATUS_TOPIC,
+            status_with_previous(5, "13:50:01", "13:40:20"),
+        ),
+    ] {
+        writeln!(
+            input,
+            "{}",
+            serde_json::json!({"topic": topic, "payload_hex": hex::encode(payload)})
+        )?;
+    }
+    input.sync_all()?;
+
+    let result = Command::new(env!("CARGO_BIN_EXE_gridedge_market_replay"))
+        .args([
+            "--input",
+            input_path.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+            "--symbol",
+            "002256.SZ",
+            "--session-date",
+            "2026-08-21",
+            "--allow-partial-session-resume-boundary",
+            "--bars-csv-output",
+            bars_path.to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let audit: Value = serde_json::from_slice(&std::fs::read(output_path)?)?;
+    assert_eq!(audit["history_mode"], "PARTIAL_SESSION_SAFE_AFTER_BOUNDARY");
+    assert_eq!(audit["bar_count"], 1);
+    assert_eq!(audit["bars"][0]["timestamp"], "2026-08-21 13:50:00");
+    let replayed = gridedge_t::data::CsvReplayFeed::load(&bars_path, "002256.SZ")?;
+    assert_eq!(replayed.bars().len(), 1);
+    assert_eq!(
+        replayed.bars()[0].timestamp.to_string(),
+        "2026-08-21 13:50:00"
+    );
+    Ok(())
+}
+
+#[test]
+fn market_replay_cli_never_exports_bars_outside_requested_complete_session() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input_path = directory.path().join("cross-session-market.jsonl");
+    let output_path = directory.path().join("cross-session-audit.json");
+    let bars_path = directory.path().join("cross-session-bars.csv");
+    let mut input = std::fs::File::create(&input_path)?;
+    for (topic, payload) in [
+        (TRADE_TOPIC, tick(1, "09:31:00", 351, 2, 100)),
+        (
+            STATUS_TOPIC,
+            status(2, "09:35:01", "SESSION_HISTORY_COMPLETE"),
+        ),
+        (
+            TRADE_TOPIC,
+            event_at(
+                3,
+                "TRADE_TICK",
+                "2026-08-24 09:31:00",
+                json!({
+                    "price": {"mantissa": 352, "scale": 2},
+                    "quantity": 200,
+                    "unit": "SHARE",
+                    "side": "UNKNOWN",
+                    "source_row_key": "2026-08-24|09:31:00|352|200|UNKNOWN|1",
+                    "source_page": 1,
+                }),
+            ),
+        ),
+        (
+            STATUS_TOPIC,
+            event_at(
+                4,
+                "SOURCE_STATUS",
+                "2026-08-24 09:35:01",
+                json!({
+                    "status": "LIVE_CONTIGUOUS",
+                    "session_date": "2026-08-24",
+                    "covered_through_us": timestamp_us_at("2026-08-24 09:35:01"),
+                    "previous_covered_through_us": timestamp_us("09:35:01"),
+                    "capture_sha256": "c".repeat(64),
+                }),
+            ),
+        ),
+    ] {
+        writeln!(
+            input,
+            "{}",
+            serde_json::json!({"topic": topic, "payload_hex": hex::encode(payload)})
+        )?;
+    }
+    input.sync_all()?;
+
+    let result = Command::new(env!("CARGO_BIN_EXE_gridedge_market_replay"))
+        .args([
+            "--input",
+            input_path.to_str().unwrap(),
+            "--output",
+            output_path.to_str().unwrap(),
+            "--symbol",
+            "002256.SZ",
+            "--session-date",
+            "2026-08-21",
+            "--bars-csv-output",
+            bars_path.to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("outside requested session"));
+    assert!(!output_path.exists());
+    assert!(!bars_path.exists());
+    Ok(())
+}
+
 fn tick(sequence: u64, time: &str, mantissa: i64, scale: u32, quantity: i64) -> Vec<u8> {
     event(
         sequence,
@@ -590,17 +1109,47 @@ fn tick(sequence: u64, time: &str, mantissa: i64, scale: u32, quantity: i64) -> 
 
 fn status(sequence: u64, time: &str, status: &str) -> Vec<u8> {
     let ts_us = timestamp_us(time);
-    event(
-        sequence,
-        "SOURCE_STATUS",
-        time,
-        json!({
-            "status": status,
-            "session_date": "2026-08-21",
-            "covered_through_us": ts_us,
-            "capture_sha256": "c".repeat(64),
-        }),
-    )
+    let mut payload = json!({
+        "status": status,
+        "session_date": "2026-08-21",
+        "covered_through_us": ts_us,
+        "capture_sha256": "c".repeat(64),
+    });
+    if status == "SESSION_RESUME_BOUNDARY" {
+        payload["covered_from_us"] = json!(timestamp_us("13:40:01"));
+        payload["page_index"] = json!(1);
+        payload["page_count"] = json!(13);
+        payload["row_count"] = json!(144);
+        payload["policy"] = json!("INCOMPLETE_EASTMONEY_HISTORY_EXPLICIT_POLICY_V1");
+    }
+    event(sequence, "SOURCE_STATUS", time, payload)
+}
+
+fn status_with_previous(sequence: u64, time: &str, previous: &str) -> Vec<u8> {
+    let mut value: Value =
+        serde_json::from_slice(&status(sequence, time, "LIVE_CONTIGUOUS")).expect("status JSON");
+    value["payload"]["previous_covered_through_us"] = json!(timestamp_us(previous));
+    canonicalize_event_id(&mut value);
+    serde_json::to_vec(&value).expect("status bytes")
+}
+
+fn resume_boundary_with_from(sequence: u64, time: &str, from: &str) -> Vec<u8> {
+    let mut value: Value =
+        serde_json::from_slice(&status(sequence, time, "SESSION_RESUME_BOUNDARY"))
+            .expect("boundary JSON");
+    value["payload"]["covered_from_us"] = json!(timestamp_us(from));
+    canonicalize_event_id(&mut value);
+    serde_json::to_vec(&value).expect("boundary bytes")
+}
+
+fn canonicalize_event_id(value: &mut Value) {
+    value.as_object_mut().unwrap().remove("event_id");
+    let mut identity = value.clone();
+    identity.as_object_mut().unwrap().remove("recv_us");
+    value["event_id"] = Value::String(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&identity).unwrap())
+    ));
 }
 
 fn event(sequence: u64, event_type: &str, time: &str, payload: Value) -> Vec<u8> {

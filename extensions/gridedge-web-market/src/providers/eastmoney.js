@@ -83,7 +83,10 @@
     return matches;
   }
 
-  function parseRows(tableMatches, sessionDate) {
+  function parseRows(tableMatches, sessionDate, rowOrder) {
+    if (!["LATEST_FIRST", "EARLIEST_FIRST"].includes(rowOrder)) {
+      throw new Error("Eastmoney capture lacks an explicit reviewed DOM row order");
+    }
     const candidates = [];
     for (const tableMatch of tableMatches) {
       const { table, tableIndex, headerIndex, columns } = tableMatch;
@@ -134,21 +137,37 @@
         });
       }
     }
-    candidates.sort((left, right) =>
-      left.source_trade_time.localeCompare(right.source_trade_time) ||
-      left.price.localeCompare(right.price) ||
-      left.quantity_hands - right.quantity_hands ||
-      left.side.localeCompare(right.side),
-    );
+    let direction = 0;
+    for (let index = 1; index < candidates.length; index += 1) {
+      const compared = candidates[index].source_trade_time.localeCompare(
+        candidates[index - 1].source_trade_time,
+      );
+      if (compared === 0) continue;
+      const nextDirection = compared > 0 ? 1 : -1;
+      if (direction !== 0 && direction !== nextDirection) {
+        throw new Error("Eastmoney time-sales DOM order is not monotonic");
+      }
+      direction = nextDirection;
+    }
+    const expectedDirection = rowOrder === "LATEST_FIRST" ? -1 : 1;
+    if (direction !== 0 && direction !== expectedDirection) {
+      throw new Error("Eastmoney time-sales DOM order disagrees with its reviewed control");
+    }
+    if (rowOrder === "LATEST_FIRST") candidates.reverse();
     const occurrences = new Map();
+    const secondOrdinals = new Map();
     return candidates.map((candidate) => {
       const identity = `${sessionDate}|${candidate.source_trade_time}|${candidate.price}|${candidate.quantity_hands}|${candidate.side}`;
       const occurrence = (occurrences.get(identity) ?? 0) + 1;
       occurrences.set(identity, occurrence);
+      const sourceSameSecondOrdinal =
+        (secondOrdinals.get(candidate.source_trade_time) ?? 0) + 1;
+      secondOrdinals.set(candidate.source_trade_time, sourceSameSecondOrdinal);
       return {
         ...candidate,
         source_row_key: `${identity}|${occurrence}`,
         occurrence,
+        source_same_second_ordinal: sourceSameSecondOrdinal,
       };
     });
   }
@@ -163,7 +182,7 @@
       throw new Error("capture lacks a valid Asia/Shanghai session date");
     }
     const pagination = pageNumber(snapshot.bodyText);
-    const rows = parseRows(locateTimeSalesTables(snapshot.tables), sessionDate);
+    const rows = parseRows(locateTimeSalesTables(snapshot.tables), sessionDate, snapshot.rowOrder);
     return {
       capture_spec: core.CAPTURE_SPEC,
       schema_version: core.CAPTURE_SCHEMA_VERSION,
@@ -172,6 +191,7 @@
       page_kind: "TIME_SALES",
       source_url: snapshot.url,
       source_title: core.normalizeText(snapshot.title),
+      source_row_order: snapshot.rowOrder,
       captured_at_us: snapshot.capturedAtUs,
       session_date: sessionDate,
       instrument,
@@ -180,7 +200,7 @@
         row_count: rows.length,
         session_complete: false,
         session_date_basis: "COLLECTOR_ASIA_SHANGHAI_DATE",
-        identity_policy: "DOM_VALUE_OCCURRENCE_V1",
+        identity_policy: "DOM_CHRONOLOGICAL_ORDER_V2",
       },
       rows,
     };
@@ -225,28 +245,60 @@
         pageCaptures.some((capture) => capture.completeness.page_count > pageCount)) {
       throw new Error("history assembly must capture every history page exactly once");
     }
+    const pageRowsets = pageCaptures.map((capture) =>
+      core.canonicalJson(capture.rows.map(stableFact)));
+    if (new Set(pageRowsets).size !== pageRowsets.length) {
+      throw new Error("history pages expose a duplicate time-sales rowset after pagination");
+    }
+    for (let index = 1; index < pageCaptures.length; index += 1) {
+      const newer = pageCaptures[index - 1].rows;
+      const older = pageCaptures[index].rows;
+      const newerFirst = newer[0].source_trade_time;
+      const newerLast = newer.at(-1).source_trade_time;
+      const olderFirst = older[0].source_trade_time;
+      const olderLast = older.at(-1).source_trade_time;
+      if (olderFirst > newerFirst || olderLast > newerLast ||
+          (olderFirst === newerFirst && olderLast === newerLast)) {
+        throw new Error("history page time range does not move backward after pagination");
+      }
+    }
+    const historicalKeys = new Set();
+    for (const capture of pageCaptures) {
+      for (const row of capture.rows) {
+        if (historicalKeys.has(row.source_row_key)) {
+          throw new Error("history pages overlap at an unprovable source row identity");
+        }
+        historicalKeys.add(row.source_row_key);
+      }
+    }
     const initialKeys = new Set(reference.rows.map((row) => row.source_row_key));
     const livePageOverlap = finalFirstPage.rows.filter((row) => initialKeys.has(row.source_row_key)).length;
     if (livePageOverlap === 0) {
       throw new Error("final live page has no overlap with the initial live page");
     }
-    const merged = new Map();
-    for (const capture of all) {
-      for (const row of capture.rows) {
-        const fact = core.canonicalJson(stableFact(row));
-        const existing = merged.get(row.source_row_key);
-        if (existing && existing.fact !== fact) {
-          throw new Error("history pages reuse one source row identity with different facts");
+    for (const row of finalFirstPage.rows) {
+      if (initialKeys.has(row.source_row_key)) {
+        const initial = reference.rows.find((candidate) =>
+          candidate.source_row_key === row.source_row_key);
+        if (core.canonicalJson(stableFact(initial)) !== core.canonicalJson(stableFact(row))) {
+          throw new Error("final live page changed an overlapping source fact");
         }
-        if (!existing) merged.set(row.source_row_key, { fact, row });
+      } else if (historicalKeys.has(row.source_row_key)) {
+        throw new Error("final live page overlaps an older history page ambiguously");
       }
     }
-    const rows = [...merged.values()].map((entry) => entry.row).sort((left, right) =>
-      left.source_trade_time.localeCompare(right.source_trade_time) ||
-      left.price.localeCompare(right.price) ||
-      left.quantity_hands - right.quantity_hands ||
-      left.source_row_key.localeCompare(right.source_row_key),
-    );
+    const rows = pageCaptures.slice().reverse().flatMap((capture) => capture.rows);
+    const newestHistoricalTime = rows.at(-1)?.source_trade_time;
+    const appendedLiveRows = finalFirstPage.rows.filter((row) => !initialKeys.has(row.source_row_key));
+    if (appendedLiveRows.some((row) => row.source_trade_time < newestHistoricalTime)) {
+      throw new Error("final live page introduced an unseen row behind captured history");
+    }
+    rows.push(...appendedLiveRows);
+    for (let index = 1; index < rows.length; index += 1) {
+      if (rows[index].source_trade_time < rows[index - 1].source_trade_time) {
+        throw new Error("assembled history is not chronological in reviewed DOM order");
+      }
+    }
     if (rows.length === 0) throw new Error("history assembly produced no market rows");
     return {
       ...finalFirstPage,

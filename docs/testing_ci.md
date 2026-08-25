@@ -531,7 +531,9 @@ outbox 人为恢复一条未确认消息，群晖最终只能增加 duplicate，
 
 Chrome 网页逐笔扩展的普通门禁必须锁定：默认禁用、provider/host/CSP 白名单、本地固定版本 MQTT.js、
 后台二次 schema/证据哈希校验、IndexedDB source sequence、完全重复幂等、同 row identity 异证据冲突、
-PUBACK 前 PENDING、ACK 丢失或 service worker 重启后重投，以及内容脚本无法读取 MQTT 凭据。扩展不得
-依赖 loopback companion；Chrome/标签页停止时不采集，恢复只补发已持久 PENDING。群晖 WebSocket E2E
-必须用独立 certification source 经 MQTT 5/QoS 1 发布 fixture，并在 PostgreSQL 查询每个精确 event_id。
+broker PUBACK 后仍 PENDING、数据库 `COMMITTED` 应用回执后才 ACKNOWLEDGED、应用回执丢失/伪造/超时
+或 service worker 重启后重投，以及内容脚本无法读取 MQTT 凭据。扩展不得依赖 loopback companion；
+Chrome/标签页停止时不采集，恢复只补发已持久 PENDING。群晖 WebSocket E2E 必须用独立 certification
+source 经 MQTT 5/QoS 1 发布 fixture，在 PostgreSQL 查询每个精确 event_id，并收到与 event/source/sequence
+完全绑定的提交回执。
 重建 Mosquitto 后安装流程必须强制重建 ingestor，防止旧容器健康但已失去订阅；该顺序需普通自动测试。

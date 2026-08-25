@@ -189,6 +189,18 @@ mod live_subject {
         )
     }
 
+    pub(super) fn session_gate(
+        has_complete_history: bool,
+        has_resume_boundary: bool,
+        allow_partial_boundary: bool,
+    ) -> bool {
+        market_session_boundary_allows_resume(
+            has_complete_history,
+            has_resume_boundary,
+            allow_partial_boundary,
+        )
+    }
+
     pub(super) fn replay_market_messages_at(
         messages: Vec<(&str, Vec<u8>)>,
         now: chrono::NaiveDateTime,
@@ -1669,6 +1681,49 @@ fn remote_execution_identity_and_read_only_preflight_block_before_service_or_mar
 }
 
 #[test]
+fn identity_only_upgrade_rechecks_platform_files_and_source_before_append() {
+    let source = std::fs::read_to_string("src/bin/gridedge_ths_live.rs")
+        .expect("reviewed deployment orchestrator source");
+    let binding = source
+        .split_once("fn bind_execution_identity_only(")
+        .expect("identity-only function")
+        .1
+        .split_once("fn verify_activated_binding_platform(")
+        .expect("identity-only function end")
+        .0;
+    let first_platform = binding
+        .find("verify_activated_binding_platform(args, config)?")
+        .expect("first platform check");
+    let first_identity = binding
+        .find("build_driver_and_execution_identity(args, quote_symbol)?")
+        .expect("first file-bound identity");
+    let preflight = binding
+        .find("driver.startup_preflight()?")
+        .expect("read-only adapter preflight");
+    let second_platform = binding[first_platform + 1..]
+        .find("verify_activated_binding_platform(args, config)?")
+        .map(|offset| first_platform + 1 + offset)
+        .expect("second platform check");
+    let second_identity = binding[first_identity + 1..]
+        .find("build_driver_and_execution_identity(args, quote_symbol)?")
+        .map(|offset| first_identity + 1 + offset)
+        .expect("second file-bound identity");
+    let identity_equal = binding
+        .find("identity_after_preflight != identity_before_preflight")
+        .expect("TOCTOU identity equality gate");
+    let source_binding = binding
+        .find("stage_from_source(")
+        .expect("ledger/outbox source identity gate");
+    let append = binding
+        .find("upgrade_execution_identity(&identity_after_preflight)")
+        .expect("append-only identity upgrade");
+    assert!(first_platform < first_identity);
+    assert!(first_identity < preflight && preflight < second_platform);
+    assert!(second_platform < second_identity && second_identity < identity_equal);
+    assert!(identity_equal < source_binding && source_binding < append);
+}
+
+#[test]
 fn startup_backfill_stays_read_only_without_ui_until_the_live_watermark_is_current() {
     let source = std::fs::read_to_string("src/bin/gridedge_ths_live.rs")
         .expect("reviewed deployment orchestrator source");
@@ -1978,6 +2033,20 @@ fn completion_receipts_choose_read_only_catchup_before_any_live_execution() {
         (true, false),
         "one stale released bar cannot immediately resume after read-only processing"
     );
+}
+
+#[test]
+fn partial_session_resume_requires_a_completed_post_boundary_bucket_and_cli_authority() {
+    assert!(!live_subject::session_gate(false, false, false));
+    assert!(live_subject::session_gate(true, false, false));
+    assert!(!live_subject::session_gate(false, true, false));
+    assert!(live_subject::session_gate(false, true, true));
+
+    let source = std::fs::read_to_string("src/bin/gridedge_ths_live.rs").unwrap();
+    let plist = std::fs::read_to_string("deploy/com.gridedge.ths-sim.plist").unwrap();
+    assert!(source.contains("allow_partial_session_resume_boundary"));
+    assert!(source.contains("builder.partial_session_resume_is_safe(date)"));
+    assert!(plist.contains("--allow-partial-session-resume-boundary"));
 }
 
 #[test]

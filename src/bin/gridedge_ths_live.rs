@@ -76,6 +76,11 @@ struct Args {
     maximum_unchanged_seconds: i64,
     #[arg(long, default_value_t = 300)]
     maximum_order_age_seconds: i64,
+    /// Permit an explicitly-audited current-session boundary to replace
+    /// unavailable earlier history. The missing prefix never generates bars
+    /// or orders, and recovery still needs a later contiguous live receipt.
+    #[arg(long, default_value_t = false)]
+    allow_partial_session_resume_boundary: bool,
     #[arg(long, value_enum, default_value_t = SimulationAdapter::Macos)]
     simulation_adapter: SimulationAdapter,
     #[arg(long, default_value = "emulator-5554")]
@@ -318,8 +323,11 @@ fn run() -> Result<()> {
                 completion.session_date == date,
                 released_bar_count,
                 released_bars_current,
-            ) && builder.has_complete_session(date)
-                && is_market_session(now)
+            ) && market_session_boundary_allows_resume(
+                builder.has_complete_session(date),
+                builder.partial_session_resume_is_safe(date),
+                args.allow_partial_session_resume_boundary,
+            ) && is_market_session(now)
             {
                 resume_after_market_data_recovery(
                     &args,
@@ -382,6 +390,35 @@ fn activate_authorized_platform_upgrade(args: &Args, config: &Config) -> Result<
 }
 
 fn bind_execution_identity_only(args: &Args, config: &Config, quote_symbol: &str) -> Result<()> {
+    verify_activated_binding_platform(args, config)?;
+    let (mut driver, identity_before_preflight) =
+        build_driver_and_execution_identity(args, quote_symbol)?;
+    driver.startup_preflight()?;
+    verify_activated_binding_platform(args, config)?;
+    let (_, identity_after_preflight) = build_driver_and_execution_identity(args, quote_symbol)?;
+    if identity_after_preflight != identity_before_preflight {
+        bail!("remote execution identity changed during startup preflight")
+    }
+    let mut outbox = ThsSimOutbox::open(&args.outbox)?;
+    let initial_after_sequence = (!outbox.has_binding()?).then_some(0);
+    drop(outbox);
+    stage_from_source(
+        &config.database,
+        &args.run_id,
+        &args.outbox,
+        initial_after_sequence,
+    )?;
+    outbox = ThsSimOutbox::open(&args.outbox)?;
+    let identity_sha256 = if outbox.has_execution_identity()? {
+        outbox.upgrade_execution_identity(&identity_after_preflight)?
+    } else {
+        outbox.bind_execution_identity_once(&identity_after_preflight)?
+    };
+    println!("bound remote simulation execution identity {identity_sha256}");
+    Ok(())
+}
+
+fn verify_activated_binding_platform(args: &Args, config: &Config) -> Result<()> {
     let store = SqliteStore::open_existing_read_only(&config.database)?;
     let context = gridedge_t::run_context::RunContext::load(&store, &args.run_id)?
         .context("execution identity binding requires an existing durable run")?;
@@ -391,16 +428,6 @@ fn bind_execution_identity_only(args: &Args, config: &Config, quote_symbol: &str
     {
         bail!("execution identity binding requires the activated platform identity")
     }
-    let (mut driver, identity) = build_driver_and_execution_identity(args, quote_symbol)?;
-    driver.startup_preflight()?;
-    let mut outbox = ThsSimOutbox::open(&args.outbox)?;
-    if !outbox.has_binding()? {
-        drop(outbox);
-        stage_from_source(&config.database, &args.run_id, &args.outbox, Some(0))?;
-        outbox = ThsSimOutbox::open(&args.outbox)?;
-    }
-    let identity_sha256 = outbox.bind_execution_identity_once(&identity)?;
-    println!("bound remote simulation execution identity {identity_sha256}");
     Ok(())
 }
 
@@ -1172,6 +1199,14 @@ fn completion_allows_resume(
         && session_matches_today
         && released_bar_count <= 1
         && released_bars_are_current
+}
+
+fn market_session_boundary_allows_resume(
+    has_complete_history: bool,
+    has_safe_resume_boundary: bool,
+    allow_partial_boundary: bool,
+) -> bool {
+    has_complete_history || (allow_partial_boundary && has_safe_resume_boundary)
 }
 
 fn run_outbox(

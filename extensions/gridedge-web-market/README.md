@@ -25,8 +25,10 @@ publisher 用户名和密码保存在本机 Chrome 扩展存储中；数据库�
 - 网页显示的每一行形成一个 `TRADE_TICK`，`手数`精确换算成股数。
 - 相同外观的网页行由 occurrence ordinal 保持为不同源事实。
 - 原始行和 canonical market event 先在同一个 IndexedDB 提交，再进入 MQTT outbox。
-- 收到 MQTT QoS 1 PUBACK 后才把 outbox 记录标记为 `ACKNOWLEDGED`。
-- PUBACK 丢失、网络断开或 service worker 重启时，记录保持 `PENDING` 并可重复发布；
+- MQTT QoS 1 PUBACK 只证明 broker 已收到传输，记录仍保持 `PENDING`。
+- 只有 ingestor 在 PostgreSQL 事务提交后返回与 `event_id`、source identity 和 sequence 完全一致的
+  `COMMITTED` 应用回执，才把 outbox 标记为 `ACKNOWLEDGED`。
+- PUBACK 或应用回执丢失、网络断开或 service worker 重启时，记录保持 `PENDING` 并可重复发布；
   PostgreSQL 以 `event_id` 和 source sequence 幂等接收。
 - 同一 source-row identity 的完全相同市场事实是 duplicate；成交时间、价格、数量等
   内容变化是 durable conflict，不覆盖已接收事实。表格位置以及价格箭头/空白属于可变
@@ -78,8 +80,9 @@ Chrome 本机扩展存储。Mosquitto ACL 只允许它读写 `gridedge/market/v1
 ## 测试边界
 
 普通测试覆盖 provider、多表页面、自动最新优先、批内时间正序、滚动展示变化、背景二次验证、
-IndexedDB 重启、duplicate/conflict、source sequence、canonical event、pending/PUBACK 状态和 MV3 权限/CSP。远端 E2E 还必须证明
-同一个 fixture 从 WebSocket MQTT 到达群晖 PostgreSQL 的精确 `event_id`。
+IndexedDB 重启、duplicate/conflict、source sequence、canonical event、broker PUBACK 后仍 pending、
+数据库 `COMMITTED` 回执、伪造/超时回执和 MV3 权限/CSP。远端 E2E 还必须证明同一个 fixture 从
+WebSocket MQTT 到达群晖 PostgreSQL，并收到绑定精确 `event_id` 和 source sequence 的应用回执。
 
 ```sh
 node scripts/certify_synology_websocket.js

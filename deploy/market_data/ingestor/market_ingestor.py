@@ -185,6 +185,22 @@ def validate_document(raw: bytes, topic: str) -> ValidatedEvent:
     )
 
 
+def application_ack(event: ValidatedEvent, result: str) -> tuple[str, bytes]:
+    if result not in {"inserted", "duplicate"}:
+        raise ValueError("application ACK requires one committed or duplicate event")
+    event_id = event.event_id.hex()
+    receipt = {
+        "event_id": event_id,
+        "result": "COMMITTED",
+        "schema_version": 1,
+        "source_id": event.source_id,
+        "source_instance_id": str(event.source_instance_id),
+        "source_sequence": event.source_sequence,
+        "spec": "gridedge.market.ack",
+    }
+    return f"gridedge/market-ack/v1/{event_id}", canonical_json(receipt)
+
+
 class EventStore:
     def __init__(self, connection_info: str):
         self.connection_info = connection_info
@@ -312,6 +328,38 @@ def read_secret(path: str) -> str:
     return value
 
 
+def process_market_message(
+    store: EventStore,
+    message: Any,
+    publish_application_ack: Any,
+    acknowledge_delivery: Any,
+) -> str:
+    """Process one MQTT delivery without hiding the commit/ACK ordering.
+
+    A valid insert or duplicate is first committed by ``store.ingest``, then
+    its exact application receipt is accepted for publication, and only then
+    is the original market delivery acknowledged.  Any exception before the
+    final step leaves the original MQTT delivery unacknowledged for retry.
+    """
+    raw = bytes(message.payload)
+    try:
+        content_type = getattr(message.properties, "ContentType", None)
+        validate_delivery(content_type, message.qos, message.retain)
+        event = validate_document(raw, message.topic)
+        result = store.ingest(event, message.topic, message.qos, message.dup)
+        if result == "conflict":
+            acknowledge_delivery(message.mid, message.qos)
+            return result
+        ack_topic, ack_payload = application_ack(event, result)
+        publish_application_ack(ack_topic, ack_payload)
+        acknowledge_delivery(message.mid, message.qos)
+        return result
+    except RejectedEvent as error:
+        store.reject(message.topic, raw, str(error))
+        acknowledge_delivery(message.mid, message.qos)
+        return "rejected"
+
+
 def main() -> int:
     if mqtt is None or psycopg is None or Jsonb is None:
         raise RuntimeError("paho-mqtt and psycopg are required to run the market ingestor")
@@ -340,20 +388,23 @@ def main() -> int:
         print("market ingestor connected with MQTT 5", flush=True)
 
     def on_message(client: mqtt.Client, _userdata: Any, message: mqtt.MQTTMessage) -> None:
+        def publish_commit_ack(ack_topic: str, ack_payload: bytes) -> None:
+            properties = mqtt.Properties(mqtt.PacketTypes.PUBLISH)
+            properties.ContentType = "application/json"
+            published = client.publish(
+                ack_topic,
+                ack_payload,
+                qos=1,
+                retain=False,
+                properties=properties,
+            )
+            if published.rc != mqtt.MQTT_ERR_SUCCESS:
+                raise RuntimeError("database commit ACK was not accepted by MQTT")
+
         try:
-            content_type = getattr(message.properties, "ContentType", None)
-            validate_delivery(content_type, message.qos, message.retain)
-            event = validate_document(bytes(message.payload), message.topic)
-            result = store.ingest(event, message.topic, message.qos, message.dup)
+            result = process_market_message(store, message, publish_commit_ack, client.ack)
             if result == "conflict":
                 print(f"market identity conflict: {message.topic}", file=sys.stderr, flush=True)
-            client.ack(message.mid, message.qos)
-        except RejectedEvent as error:
-            try:
-                store.reject(message.topic, bytes(message.payload), str(error))
-                client.ack(message.mid, message.qos)
-            except Exception as store_error:
-                print(f"failed to persist rejected market event: {store_error}", file=sys.stderr, flush=True)
         except Exception as error:
             print(f"transient market ingest failure: {error}", file=sys.stderr, flush=True)
 

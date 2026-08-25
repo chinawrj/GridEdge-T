@@ -51,13 +51,25 @@ exportButton.addEventListener("click", async () => {
   try {
     const sessionDate = shanghaiDate();
     database = await GridEdgeDurable.openDatabase();
-    const exported = await GridEdgeDurable.replayExport(database, sessionDate);
+    let exported = await GridEdgeDurable.replayExport(database, sessionDate);
+    let storeGeneration = GridEdgeDurable.DATABASE_NAME;
+    if (exported.record_count === 0) {
+      database.close();
+      database = undefined;
+      const legacyName = "gridedge-web-market-v5";
+      const databases = await indexedDB.databases();
+      if (databases.some(({ name }) => name === legacyName)) {
+        database = await GridEdgeDurable.openDatabase(indexedDB, legacyName);
+        exported = await GridEdgeDurable.replayExport(database, sessionDate);
+        storeGeneration = `${legacyName}:LOCAL_BROWSER_FORENSIC`;
+      }
+    }
     if (exported.record_count === 0) throw new Error(`${sessionDate} 没有可导出的持久行情`);
     const blob = new Blob([`${exported.records.join("\n")}\n`], { type: "application/x-ndjson" });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = `gridedge-002256-${sessionDate}-market-replay.jsonl`;
+    anchor.download = `gridedge-002256-${sessionDate}-market-replay-${storeGeneration}.jsonl`;
     anchor.hidden = true;
     document.body.append(anchor);
     anchor.click();
@@ -65,7 +77,7 @@ exportButton.addEventListener("click", async () => {
       URL.revokeObjectURL(url);
       anchor.remove();
     }, 1000);
-    detail.textContent = JSON.stringify({ ...exported, records: undefined }, null, 2);
+    detail.textContent = JSON.stringify({ ...exported, store_generation: storeGeneration, records: undefined }, null, 2);
   } catch (error) {
     detail.textContent = String(error.message ?? error);
   } finally {

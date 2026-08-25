@@ -7,12 +7,13 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use chrono::{Duration, NaiveDateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-const OUTBOX_SCHEMA_VERSION: i64 = 4;
+const OUTBOX_SCHEMA_VERSION: i64 = 5;
 const OUTBOX_SCHEMA_V3: i64 = 3;
+const OUTBOX_SCHEMA_V4: i64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -151,6 +152,86 @@ fn canonical_execution_identity(identity_json: &str) -> Result<(String, String)>
     Ok((canonical, identity_sha256))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MacOsExecutionIdentity {
+    schema: String,
+    adapter: String,
+    platform_sha256: String,
+    runner_sha256: String,
+    launch_plist_sha256: String,
+    money_actions_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AndroidExecutionIdentity {
+    schema: String,
+    adapter: String,
+    platform_sha256: String,
+    runner_sha256: String,
+    launch_plist_sha256: String,
+    adb_sha256: String,
+    serial: String,
+    avd_name_marker: String,
+    package: String,
+    tested_version: String,
+    masked_account_sha256: String,
+    confirmation_account_sha256: String,
+    expected_symbol: String,
+    expected_security_name: String,
+    money_actions_enabled: bool,
+}
+
+fn typed_execution_identity(identity_json: &str) -> Result<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(identity_json)?;
+    match value.get("adapter").and_then(serde_json::Value::as_str) {
+        Some("MACOS") => Ok(serde_json::to_value(
+            serde_json::from_value::<MacOsExecutionIdentity>(value)
+                .context("MacOS execution identity does not match its reviewed schema")?,
+        )?),
+        Some("ANDROID") => Ok(serde_json::to_value(
+            serde_json::from_value::<AndroidExecutionIdentity>(value)
+                .context("Android execution identity does not match its reviewed schema")?,
+        )?),
+        _ => bail!("execution identity has an unsupported adapter"),
+    }
+}
+
+fn validate_execution_identity_upgrade(previous_json: &str, candidate_json: &str) -> Result<()> {
+    const MUTABLE_DEPLOYMENT_FIELDS: [&str; 3] =
+        ["platform_sha256", "runner_sha256", "launch_plist_sha256"];
+    let mut previous = typed_execution_identity(previous_json)?
+        .as_object()
+        .cloned()
+        .context("stored execution identity is not an object")?;
+    let mut candidate = typed_execution_identity(candidate_json)?
+        .as_object()
+        .cloned()
+        .context("candidate execution identity is not an object")?;
+    for field in MUTABLE_DEPLOYMENT_FIELDS {
+        for identity in [&previous, &candidate] {
+            let value = identity
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .with_context(|| format!("execution identity upgrade requires {field}"))?;
+            if value.len() != 64
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                bail!("execution identity upgrade has a non-canonical {field}");
+            }
+        }
+        previous.remove(field);
+        candidate.remove(field);
+    }
+    if previous != candidate {
+        bail!("Tonghuashun stable remote execution identity changed");
+    }
+    Ok(())
+}
+
 impl ThsSimOutbox {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn =
@@ -204,6 +285,7 @@ impl ThsSimOutbox {
         )?;
         migrate_outbox_to_v3(&conn)?;
         migrate_outbox_to_v4(&conn)?;
+        migrate_outbox_to_v5(&conn)?;
         Ok(Self { conn })
     }
 
@@ -289,6 +371,7 @@ impl ThsSimOutbox {
     pub fn bind_execution_identity_once(&mut self, identity_json: &str) -> Result<String> {
         let (source_database_instance_id, run_id, _) = self.binding()?;
         let (canonical, identity_sha256) = canonical_execution_identity(identity_json)?;
+        typed_execution_identity(&canonical)?;
         let existing = self
             .conn
             .query_row(
@@ -306,6 +389,7 @@ impl ThsSimOutbox {
             )
             .optional()?;
         if let Some((stored_source, stored_run, stored_sha256, stored_json)) = existing {
+            validate_execution_identity_chain(&self.conn, &source_database_instance_id, &run_id)?;
             if stored_source != source_database_instance_id
                 || stored_run != run_id
                 || stored_sha256 != identity_sha256
@@ -315,23 +399,9 @@ impl ThsSimOutbox {
             }
             return Ok(identity_sha256);
         }
-        let status = self.status()?;
-        if status.discovered != 0
-            || status.eligible != 0
-            || status.submitting != 0
-            || status.ambiguous != 0
-            || status.cancel_requested != 0
-            || status.cancelling != 0
-            || status.cancel_ambiguous != 0
-            || self.staged_intents()?.iter().any(|intent| {
-                intent.state != StagedIntentState::Submitted
-                    || !(intent.terminal_resolution == StagedTerminalResolution::Filled
-                        || intent.cancel_state == StagedCancelState::Cancelled)
-            })
-        {
-            bail!("Tonghuashun remote execution identity requires a frozen terminal outbox");
-        }
-        self.conn.execute(
+        let transaction = self.conn.transaction()?;
+        require_frozen_terminal_outbox(&transaction)?;
+        transaction.execute(
             "INSERT INTO remote_adapter_binding(
                singleton,source_database_instance_id,run_id,identity_sha256,identity_json,bound_at
              ) VALUES(1,?1,?2,?3,?4,?5)",
@@ -343,33 +413,75 @@ impl ThsSimOutbox {
                 Utc::now().naive_utc().to_string(),
             ],
         )?;
+        transaction.execute(
+            "INSERT INTO remote_adapter_binding_history(
+               revision,source_database_instance_id,run_id,identity_sha256,identity_json,
+               previous_identity_sha256,bound_at,binding_kind
+             ) VALUES(1,?1,?2,?3,?4,NULL,?5,'GENESIS')",
+            params![
+                source_database_instance_id,
+                run_id,
+                identity_sha256,
+                canonical,
+                Utc::now().naive_utc().to_string(),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(identity_sha256)
+    }
+
+    pub fn has_execution_identity(&self) -> Result<bool> {
+        let (source_database_instance_id, run_id, _) = self.binding()?;
+        Ok(
+            validate_execution_identity_chain(&self.conn, &source_database_instance_id, &run_id)?
+                .is_some(),
+        )
+    }
+
+    pub fn upgrade_execution_identity(&mut self, identity_json: &str) -> Result<String> {
+        let (source_database_instance_id, run_id, _) = self.binding()?;
+        let (canonical, identity_sha256) = canonical_execution_identity(identity_json)?;
+        let transaction = self.conn.transaction()?;
+        let (revision, stored_source, stored_run, stored_sha256, stored_json) =
+            validate_execution_identity_chain(&transaction, &source_database_instance_id, &run_id)?
+                .context("Tonghuashun remote execution identity is not durably bound")?;
+        if stored_source != source_database_instance_id || stored_run != run_id {
+            bail!("Tonghuashun remote execution identity source changed");
+        }
+        if stored_sha256 == identity_sha256 && stored_json == canonical {
+            return Ok(identity_sha256);
+        }
+        validate_execution_identity_upgrade(&stored_json, &canonical)?;
+        require_frozen_terminal_outbox(&transaction)?;
+        transaction.execute(
+            "INSERT INTO remote_adapter_binding_history(
+               revision,source_database_instance_id,run_id,identity_sha256,identity_json,
+               previous_identity_sha256,bound_at,binding_kind
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,'PLATFORM_UPGRADE')",
+            params![
+                revision + 1,
+                source_database_instance_id,
+                run_id,
+                identity_sha256,
+                canonical,
+                stored_sha256,
+                Utc::now().naive_utc().to_string(),
+            ],
+        )?;
+        transaction.commit()?;
         Ok(identity_sha256)
     }
 
     pub fn verify_execution_identity(&self, identity_json: &str) -> Result<String> {
         let (source_database_instance_id, run_id, _) = self.binding()?;
         let (canonical, identity_sha256) = canonical_execution_identity(identity_json)?;
-        let stored = self
-            .conn
-            .query_row(
-                "SELECT source_database_instance_id,run_id,identity_sha256,identity_json
-                   FROM remote_adapter_binding WHERE singleton=1",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                },
-            )
-            .optional()?
-            .context("Tonghuashun remote execution identity is not durably bound")?;
-        if stored.0 != source_database_instance_id
-            || stored.1 != run_id
-            || stored.2 != identity_sha256
-            || stored.3 != canonical
+        let stored =
+            validate_execution_identity_chain(&self.conn, &source_database_instance_id, &run_id)?
+                .context("Tonghuashun remote execution identity is not durably bound")?;
+        if stored.1 != source_database_instance_id
+            || stored.2 != run_id
+            || stored.3 != identity_sha256
+            || stored.4 != canonical
         {
             bail!("Tonghuashun remote execution identity changed");
         }
@@ -1008,6 +1120,114 @@ fn validate_contract_ids(ids: &[String]) -> Result<()> {
     Ok(())
 }
 
+type StoredExecutionIdentity = (i64, String, String, String, String);
+
+fn validate_execution_identity_chain(
+    conn: &Connection,
+    expected_source: &str,
+    expected_run: &str,
+) -> Result<Option<StoredExecutionIdentity>> {
+    let genesis = conn
+        .query_row(
+            "SELECT source_database_instance_id,run_id,identity_sha256,identity_json
+               FROM remote_adapter_binding WHERE singleton=1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let mut statement = conn.prepare(
+        "SELECT revision,source_database_instance_id,run_id,identity_sha256,identity_json,
+                previous_identity_sha256,binding_kind
+           FROM remote_adapter_binding_history ORDER BY revision",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    match (genesis, rows.first()) {
+        (None, None) => return Ok(None),
+        (Some(_), None) | (None, Some(_)) => {
+            bail!("Tonghuashun remote execution identity genesis/history is incomplete")
+        }
+        (Some(genesis), Some(first)) => {
+            if first.0 != 1
+                || first.1 != genesis.0
+                || first.2 != genesis.1
+                || first.3 != genesis.2
+                || first.4 != genesis.3
+                || first.5.is_some()
+                || first.6 != "GENESIS"
+            {
+                bail!("Tonghuashun execution identity history does not preserve genesis");
+            }
+        }
+    }
+    let mut previous_sha: Option<String> = None;
+    let mut seen = std::collections::BTreeSet::new();
+    for (index, row) in rows.iter().enumerate() {
+        if row.0 != i64::try_from(index + 1)?
+            || row.1 != expected_source
+            || row.2 != expected_run
+            || row.5.as_deref() != previous_sha.as_deref()
+            || (index > 0 && row.6 != "PLATFORM_UPGRADE")
+        {
+            bail!("Tonghuashun execution identity revision chain is invalid");
+        }
+        let (canonical, computed_sha) = canonical_execution_identity(&row.4)?;
+        typed_execution_identity(&canonical)?;
+        if canonical != row.4 || computed_sha != row.3 || !seen.insert(row.3.clone()) {
+            bail!("Tonghuashun execution identity revision content is invalid");
+        }
+        if index > 0 {
+            validate_execution_identity_upgrade(&rows[index - 1].4, &row.4)?;
+        }
+        previous_sha = Some(row.3.clone());
+    }
+    Ok(rows.last().map(|row| {
+        (
+            row.0,
+            row.1.clone(),
+            row.2.clone(),
+            row.3.clone(),
+            row.4.clone(),
+        )
+    }))
+}
+
+fn require_frozen_terminal_outbox(conn: &Connection) -> Result<()> {
+    let unsafe_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM staged_intents s
+          WHERE s.state!='SUBMITTED'
+             OR NOT (
+               s.cancel_state='CANCELLED'
+               OR EXISTS(SELECT 1 FROM remote_execution_facts f
+                           WHERE f.intent_id=s.intent_id AND f.terminal_kind='FILLED')
+             )",
+        [],
+        |row| row.get(0),
+    )?;
+    if unsafe_count != 0 {
+        bail!("Tonghuashun remote execution identity requires a frozen terminal outbox");
+    }
+    Ok(())
+}
+
 fn migrate_outbox_to_v3(conn: &Connection) -> Result<()> {
     let mut statement = conn.prepare("PRAGMA table_info(staged_intents)")?;
     let columns = statement
@@ -1041,7 +1261,7 @@ fn migrate_outbox_to_v3(conn: &Connection) -> Result<()> {
     match stored_schema {
         None if cancellation_count == cancellation_columns.len()
             && source_cancel_count == source_cancel_columns.len() => {}
-        Some(OUTBOX_SCHEMA_V3) | Some(OUTBOX_SCHEMA_VERSION)
+        Some(OUTBOX_SCHEMA_V3) | Some(OUTBOX_SCHEMA_V4) | Some(OUTBOX_SCHEMA_VERSION)
             if cancellation_count == cancellation_columns.len()
                 && source_cancel_count == source_cancel_columns.len() => {}
         Some(1) if cancellation_count == 0 && source_cancel_count == 0 => {
@@ -1095,7 +1315,7 @@ fn migrate_outbox_to_v4(conn: &Connection) -> Result<()> {
         .optional()?;
     match stored_schema {
         None if has_fact_table => Ok(()),
-        Some(OUTBOX_SCHEMA_VERSION) if has_fact_table => Ok(()),
+        Some(OUTBOX_SCHEMA_V4) | Some(OUTBOX_SCHEMA_VERSION) if has_fact_table => Ok(()),
         Some(OUTBOX_SCHEMA_V3) if has_fact_table => {
             bail!("Tonghuashun outbox has a partial v4 remote-fill migration")
         }
@@ -1127,4 +1347,154 @@ fn migrate_outbox_to_v4(conn: &Connection) -> Result<()> {
             "Tonghuashun outbox schema {schema} does not match its physical remote-fill table"
         ),
     }
+}
+
+fn migrate_outbox_to_v5(conn: &Connection) -> Result<()> {
+    let has_history_table: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                            WHERE type='table' AND name='remote_adapter_binding_history')",
+        [],
+        |row| row.get(0),
+    )?;
+    let stored_schema = conn
+        .query_row(
+            "SELECT schema_version FROM outbox_metadata WHERE singleton=1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    match stored_schema {
+        None if has_history_table => validate_v5_execution_identity_schema(conn),
+        Some(OUTBOX_SCHEMA_VERSION) if has_history_table => {
+            validate_v5_execution_identity_schema(conn)
+        }
+        Some(OUTBOX_SCHEMA_V4) if has_history_table => {
+            bail!("Tonghuashun outbox has a partial v5 execution-identity migration")
+        }
+        Some(OUTBOX_SCHEMA_V4) | None => {
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE remote_adapter_binding_history(
+                   revision INTEGER PRIMARY KEY CHECK(revision>0),
+                   source_database_instance_id TEXT NOT NULL,
+                   run_id TEXT NOT NULL,
+                   identity_sha256 TEXT NOT NULL UNIQUE,
+                   identity_json TEXT NOT NULL,
+                   previous_identity_sha256 TEXT UNIQUE,
+                   bound_at TEXT NOT NULL,
+                   binding_kind TEXT NOT NULL CHECK(binding_kind IN ('GENESIS','PLATFORM_UPGRADE'))
+                 );
+                 CREATE TRIGGER remote_adapter_binding_history_no_update
+                 BEFORE UPDATE ON remote_adapter_binding_history
+                 BEGIN SELECT RAISE(ABORT,'remote adapter binding history is append-only'); END;
+                 CREATE TRIGGER remote_adapter_binding_history_no_delete
+                 BEFORE DELETE ON remote_adapter_binding_history
+                 BEGIN SELECT RAISE(ABORT,'remote adapter binding history is append-only'); END;
+                 INSERT INTO remote_adapter_binding_history(
+                   revision,source_database_instance_id,run_id,identity_sha256,identity_json,
+                   previous_identity_sha256,bound_at,binding_kind
+                 ) SELECT 1,source_database_instance_id,run_id,identity_sha256,identity_json,
+                          NULL,bound_at,'GENESIS'
+                     FROM remote_adapter_binding WHERE singleton=1;
+                 UPDATE outbox_metadata SET schema_version=5
+                   WHERE singleton=1 AND schema_version=4;
+                 COMMIT;",
+            )?;
+            validate_v5_execution_identity_schema(conn)
+        }
+        Some(schema) => bail!(
+            "Tonghuashun outbox schema {schema} does not match its physical execution-identity history"
+        ),
+    }
+}
+
+fn validate_v5_execution_identity_schema(conn: &Connection) -> Result<()> {
+    let columns = conn
+        .prepare("PRAGMA table_info(remote_adapter_binding_history)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let expected_columns = [
+        "revision",
+        "source_database_instance_id",
+        "run_id",
+        "identity_sha256",
+        "identity_json",
+        "previous_identity_sha256",
+        "bound_at",
+        "binding_kind",
+    ];
+    if columns != expected_columns {
+        bail!("Tonghuashun outbox has a partial v5 execution-identity table");
+    }
+    for (name, operation) in [
+        ("remote_adapter_binding_history_no_update", "UPDATE"),
+        ("remote_adapter_binding_history_no_delete", "DELETE"),
+    ] {
+        let sql = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                   WHERE type='trigger' AND tbl_name='remote_adapter_binding_history' AND name=?1",
+                [name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .with_context(|| format!("Tonghuashun outbox v5 is missing {name}"))?;
+        let normalized = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        let expected = format!(
+            "CREATE TRIGGER {name} BEFORE {operation} ON remote_adapter_binding_history \
+             BEGIN SELECT RAISE(ABORT,'remote adapter binding history is append-only'); END"
+        );
+        if normalized != expected {
+            bail!("Tonghuashun outbox v5 has an unreviewed {name}");
+        }
+    }
+    conn.execute_batch("SAVEPOINT gridedge_v5_trigger_probe")?;
+    let probe_result = (|| -> Result<()> {
+        let revision = conn
+            .query_row(
+                "SELECT revision FROM remote_adapter_binding_history ORDER BY revision LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(1);
+        if conn.query_row(
+            "SELECT COUNT(*) FROM remote_adapter_binding_history",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? == 0
+        {
+            conn.execute(
+                "INSERT INTO remote_adapter_binding_history(
+                   revision,source_database_instance_id,run_id,identity_sha256,identity_json,
+                   previous_identity_sha256,bound_at,binding_kind
+                 ) VALUES(1,'probe','probe',?1,'{}',NULL,'probe','GENESIS')",
+                ["0".repeat(64)],
+            )?;
+        }
+        if conn
+            .execute(
+                "UPDATE remote_adapter_binding_history SET bound_at=bound_at WHERE revision=?1",
+                [revision],
+            )
+            .is_ok()
+        {
+            bail!("Tonghuashun outbox v5 UPDATE trigger is not fail-closed");
+        }
+        if conn
+            .execute(
+                "DELETE FROM remote_adapter_binding_history WHERE revision=?1",
+                [revision],
+            )
+            .is_ok()
+        {
+            bail!("Tonghuashun outbox v5 DELETE trigger is not fail-closed");
+        }
+        Ok(())
+    })();
+    conn.execute_batch(
+        "ROLLBACK TO gridedge_v5_trigger_probe; RELEASE gridedge_v5_trigger_probe;",
+    )?;
+    probe_result?;
+    Ok(())
 }

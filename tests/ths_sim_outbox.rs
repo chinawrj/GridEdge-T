@@ -13,6 +13,27 @@ use tempfile::tempdir;
 const SOURCE_A: &str = "0123456789abcdef0123456789abcdef";
 const SOURCE_B: &str = "fedcba9876543210fedcba9876543210";
 
+fn android_identity(platform: char, serial: &str) -> String {
+    json!({
+        "schema": "gridedge.ths-remote-execution-identity.v1",
+        "adapter": "ANDROID",
+        "platform_sha256": platform.to_string().repeat(64),
+        "runner_sha256": "1".repeat(64),
+        "launch_plist_sha256": "2".repeat(64),
+        "adb_sha256": "3".repeat(64),
+        "serial": serial,
+        "avd_name_marker": "THSP_API_32",
+        "package": "com.hexin.plat.android.supremacy",
+        "tested_version": "10.94.09",
+        "masked_account_sha256": "4".repeat(64),
+        "confirmation_account_sha256": "5".repeat(64),
+        "expected_symbol": "002256",
+        "expected_security_name": "兆新股份",
+        "money_actions_enabled": true,
+    })
+    .to_string()
+}
+
 #[test]
 fn outbox_requires_an_explicit_history_boundary_and_immutable_source() -> Result<()> {
     let directory = tempdir()?;
@@ -35,16 +56,8 @@ fn remote_execution_identity_is_durable_immutable_and_bound_to_run_platform_and_
     let path = directory.path().join("ths-remote-identity.db");
     let mut outbox = ThsSimOutbox::open(&path)?;
     outbox.bind_or_verify(SOURCE_A, "run-a", Some(0))?;
-    let android_a = json!({
-        "schema": "gridedge.ths-remote-execution-identity.v1",
-        "adapter": "ANDROID",
-        "platform_sha256": "a".repeat(64),
-        "serial": "emulator-5554",
-        "account_sha256": "b".repeat(64),
-        "money_actions_enabled": true,
-    })
-    .to_string();
-    let android_b = android_a.replace("emulator-5554", "emulator-5556");
+    let android_a = android_identity('a', "emulator-5554");
+    let android_b = android_identity('a', "emulator-5556");
 
     let identity_sha = outbox.bind_execution_identity_once(&android_a)?;
     assert_eq!(identity_sha.len(), 64);
@@ -69,6 +82,278 @@ fn remote_execution_identity_is_durable_immutable_and_bound_to_run_platform_and_
     assert!(connection
         .execute("DELETE FROM remote_adapter_binding WHERE singleton=1", [])
         .is_err());
+    Ok(())
+}
+
+#[test]
+fn execution_identity_platform_upgrade_is_append_only_chained_idempotent_and_stable() -> Result<()>
+{
+    let directory = tempdir()?;
+    let path = directory.path().join("ths-remote-identity-upgrade.db");
+    let mut outbox = ThsSimOutbox::open(&path)?;
+    outbox.bind_or_verify(SOURCE_A, "run-a", Some(0))?;
+    let identity_a = android_identity('a', "emulator-5554");
+    let identity_b = android_identity('b', "emulator-5554");
+    let identity_changed_account = identity_b.replace(&"5".repeat(64), &"6".repeat(64));
+    let sha_a = outbox.bind_execution_identity_once(&identity_a)?;
+    assert!(outbox.verify_execution_identity(&identity_b).is_err());
+    let sha_b = outbox.upgrade_execution_identity(&identity_b)?;
+    assert_ne!(sha_a, sha_b);
+    assert_eq!(outbox.verify_execution_identity(&identity_b)?, sha_b);
+    assert!(outbox.verify_execution_identity(&identity_a).is_err());
+    assert_eq!(outbox.upgrade_execution_identity(&identity_b)?, sha_b);
+    assert!(outbox
+        .upgrade_execution_identity(&identity_changed_account)
+        .is_err());
+    assert!(outbox.upgrade_execution_identity(&identity_a).is_err());
+    drop(outbox);
+
+    let connection = Connection::open(&path)?;
+    let revisions: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM remote_adapter_binding_history",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(revisions, 2);
+    let previous: String = connection.query_row(
+        "SELECT previous_identity_sha256 FROM remote_adapter_binding_history WHERE revision=2",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(previous, sha_a);
+    assert!(connection
+        .execute(
+            "UPDATE remote_adapter_binding_history SET identity_sha256=?1 WHERE revision=2",
+            ["f".repeat(64)],
+        )
+        .is_err());
+    assert!(connection
+        .execute(
+            "DELETE FROM remote_adapter_binding_history WHERE revision=2",
+            [],
+        )
+        .is_err());
+    Ok(())
+}
+
+#[test]
+fn execution_identity_upgrade_requires_a_frozen_terminal_outbox() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("ths-identity-upgrade-frozen.db");
+    let mut outbox = ThsSimOutbox::open(&path)?;
+    outbox.bind_or_verify(SOURCE_A, "run-a", Some(0))?;
+    outbox.bind_execution_identity_once(&android_identity('a', "emulator-5554"))?;
+    outbox.ingest(&[intent_event(1, "intent-1", "order-1", 100)])?;
+    assert!(outbox
+        .upgrade_execution_identity(&android_identity('b', "emulator-5554"))
+        .is_err());
+    let connection = Connection::open(&path)?;
+    let revisions: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM remote_adapter_binding_history",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(revisions, 1);
+    Ok(())
+}
+
+#[test]
+fn physical_v4_identity_binding_migrates_atomically_and_preserves_genesis_bytes() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("ths-identity-v4.db");
+    let identity = android_identity('a', "emulator-5554");
+    let mut outbox = ThsSimOutbox::open(&path)?;
+    outbox.bind_or_verify(SOURCE_A, "run-a", Some(0))?;
+    let identity_sha = outbox.bind_execution_identity_once(&identity)?;
+    drop(outbox);
+
+    let connection = Connection::open(&path)?;
+    connection.execute("DROP TRIGGER remote_adapter_binding_history_no_update", [])?;
+    connection.execute("DROP TRIGGER remote_adapter_binding_history_no_delete", [])?;
+    connection.execute("DROP TABLE remote_adapter_binding_history", [])?;
+    connection.execute(
+        "UPDATE outbox_metadata SET schema_version=4 WHERE singleton=1",
+        [],
+    )?;
+    connection.execute_batch(
+        "CREATE TRIGGER block_outbox_v5
+         BEFORE UPDATE OF schema_version ON outbox_metadata
+         WHEN NEW.schema_version=5
+         BEGIN SELECT RAISE(ABORT,'blocked v5 migration'); END;",
+    )?;
+    drop(connection);
+
+    assert!(ThsSimOutbox::open(&path).is_err());
+    let connection = Connection::open(&path)?;
+    let schema: i64 = connection.query_row(
+        "SELECT schema_version FROM outbox_metadata WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(schema, 4);
+    let history_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='remote_adapter_binding_history'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(history_count, 0);
+    connection.execute("DROP TRIGGER block_outbox_v5", [])?;
+    drop(connection);
+
+    let reopened = ThsSimOutbox::open(&path)?;
+    assert_eq!(reopened.verify_execution_identity(&identity)?, identity_sha);
+    drop(reopened);
+    let connection = Connection::open(&path)?;
+    let genesis: (String, String) = connection.query_row(
+        "SELECT identity_sha256,identity_json FROM remote_adapter_binding WHERE singleton=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let history: (String, String, Option<String>) = connection.query_row(
+        "SELECT identity_sha256,identity_json,previous_identity_sha256
+           FROM remote_adapter_binding_history WHERE revision=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!(genesis.0, identity_sha);
+    assert_eq!(genesis.0, history.0);
+    assert_eq!(genesis.1, history.1);
+    assert_eq!(history.2, None);
+    Ok(())
+}
+
+#[test]
+fn execution_identity_chain_tampering_fails_closed() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("ths-identity-chain-tamper.db");
+    let identity_a = android_identity('a', "emulator-5554");
+    let identity_b = android_identity('b', "emulator-5554");
+    let mut outbox = ThsSimOutbox::open(&path)?;
+    outbox.bind_or_verify(SOURCE_A, "run-a", Some(0))?;
+    outbox.bind_execution_identity_once(&identity_a)?;
+    outbox.upgrade_execution_identity(&identity_b)?;
+    drop(outbox);
+    let connection = Connection::open(&path)?;
+    connection.execute("DROP TRIGGER remote_adapter_binding_history_no_update", [])?;
+    connection.execute("DROP TRIGGER remote_adapter_binding_history_no_delete", [])?;
+    connection.execute(
+        "UPDATE remote_adapter_binding_history SET previous_identity_sha256=?1 WHERE revision=2",
+        ["f".repeat(64)],
+    )?;
+    connection.execute_batch(
+        "CREATE TRIGGER remote_adapter_binding_history_no_update
+         BEFORE UPDATE ON remote_adapter_binding_history
+         BEGIN SELECT RAISE(ABORT,'remote adapter binding history is append-only'); END;
+         CREATE TRIGGER remote_adapter_binding_history_no_delete
+         BEFORE DELETE ON remote_adapter_binding_history
+         BEGIN SELECT RAISE(ABORT,'remote adapter binding history is append-only'); END;",
+    )?;
+    drop(connection);
+    let mut reopened = ThsSimOutbox::open(&path)?;
+    assert!(reopened.verify_execution_identity(&identity_b).is_err());
+    assert!(reopened
+        .upgrade_execution_identity(&android_identity('c', "emulator-5554"))
+        .is_err());
+    Ok(())
+}
+
+#[test]
+fn execution_identity_upgrade_rejects_wrong_source_or_run_before_any_revision() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("ths-identity-wrong-ledger.db");
+    let mut outbox = ThsSimOutbox::open(&path)?;
+    outbox.bind_or_verify(SOURCE_A, "run-a", Some(0))?;
+    outbox.bind_execution_identity_once(&android_identity('a', "emulator-5554"))?;
+    assert!(outbox.bind_or_verify(SOURCE_B, "run-a", None).is_err());
+    assert!(outbox.bind_or_verify(SOURCE_A, "run-b", None).is_err());
+    drop(outbox);
+    let connection = Connection::open(&path)?;
+    let revisions: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM remote_adapter_binding_history",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(revisions, 1);
+    Ok(())
+}
+
+#[test]
+fn schema_v5_rejects_missing_append_only_trigger() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("ths-identity-missing-trigger.db");
+    let mut outbox = ThsSimOutbox::open(&path)?;
+    outbox.bind_or_verify(SOURCE_A, "run-a", Some(0))?;
+    outbox.bind_execution_identity_once(&android_identity('a', "emulator-5554"))?;
+    drop(outbox);
+    let connection = Connection::open(&path)?;
+    connection.execute("DROP TRIGGER remote_adapter_binding_history_no_update", [])?;
+    drop(connection);
+    assert!(ThsSimOutbox::open(&path).is_err());
+    Ok(())
+}
+
+#[test]
+fn schema_v5_rejects_named_but_behaviorally_inert_append_only_triggers() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("ths-identity-noop-trigger.db");
+    let mut outbox = ThsSimOutbox::open(&path)?;
+    outbox.bind_or_verify(SOURCE_A, "run-a", Some(0))?;
+    outbox.bind_execution_identity_once(&android_identity('a', "emulator-5554"))?;
+    drop(outbox);
+    let connection = Connection::open(&path)?;
+    connection.execute("DROP TRIGGER remote_adapter_binding_history_no_update", [])?;
+    connection.execute("DROP TRIGGER remote_adapter_binding_history_no_delete", [])?;
+    connection.execute_batch(
+        "CREATE TRIGGER remote_adapter_binding_history_no_update
+         BEFORE UPDATE ON remote_adapter_binding_history WHEN 0
+         BEGIN SELECT RAISE(ABORT,'remote adapter binding history is append-only'); END;
+         CREATE TRIGGER remote_adapter_binding_history_no_delete
+         BEFORE DELETE ON remote_adapter_binding_history WHEN 0
+         BEGIN SELECT RAISE(ABORT,'remote adapter binding history is append-only'); END;",
+    )?;
+    drop(connection);
+    assert!(ThsSimOutbox::open(&path).is_err());
+    Ok(())
+}
+
+#[test]
+fn schema_v5_rejects_trigger_that_only_blocks_same_value_updates() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("ths-identity-conditional-update.db");
+    let mut outbox = ThsSimOutbox::open(&path)?;
+    outbox.bind_or_verify(SOURCE_A, "run-a", Some(0))?;
+    outbox.bind_execution_identity_once(&android_identity('a', "emulator-5554"))?;
+    drop(outbox);
+    let connection = Connection::open(&path)?;
+    connection.execute("DROP TRIGGER remote_adapter_binding_history_no_update", [])?;
+    connection.execute_batch(
+        "CREATE TRIGGER remote_adapter_binding_history_no_update
+         BEFORE UPDATE ON remote_adapter_binding_history WHEN OLD.bound_at=NEW.bound_at
+         BEGIN SELECT RAISE(ABORT,'remote adapter binding history is append-only'); END;",
+    )?;
+    drop(connection);
+    assert!(ThsSimOutbox::open(&path).is_err());
+    Ok(())
+}
+
+#[test]
+fn schema_v5_rejects_delete_trigger_that_only_protects_genesis() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("ths-identity-conditional-delete.db");
+    let mut outbox = ThsSimOutbox::open(&path)?;
+    outbox.bind_or_verify(SOURCE_A, "run-a", Some(0))?;
+    outbox.bind_execution_identity_once(&android_identity('a', "emulator-5554"))?;
+    outbox.upgrade_execution_identity(&android_identity('b', "emulator-5554"))?;
+    drop(outbox);
+    let connection = Connection::open(&path)?;
+    connection.execute("DROP TRIGGER remote_adapter_binding_history_no_delete", [])?;
+    connection.execute_batch(
+        "CREATE TRIGGER remote_adapter_binding_history_no_delete
+         BEFORE DELETE ON remote_adapter_binding_history WHEN OLD.revision=1
+         BEGIN SELECT RAISE(ABORT,'remote adapter binding history is append-only'); END;",
+    )?;
+    drop(connection);
+    assert!(ThsSimOutbox::open(&path).is_err());
     Ok(())
 }
 
@@ -115,7 +400,7 @@ fn physical_v1_outbox_migrates_to_source_cancellation_state_without_rebinding_so
         [],
         |row| row.get(0),
     )?;
-    assert_eq!(schema, 4);
+    assert_eq!(schema, 5);
     let columns = connection
         .prepare("PRAGMA table_info(staged_intents)")?
         .query_map([], |row| row.get::<_, String>(1))?
@@ -193,7 +478,7 @@ fn physical_v1_and_v2_migrations_are_atomic_recoverable_and_idempotent() -> Resu
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(stored_version, 4);
+        assert_eq!(stored_version, 5);
         let columns = table_columns(&connection)?;
         for required in [
             "cancel_state",
@@ -233,6 +518,9 @@ fn physical_v3_remote_fill_migration_is_atomic_recoverable_and_idempotent() -> R
     }
     let connection = Connection::open(&path)?;
     connection.execute("DROP TABLE remote_execution_facts", [])?;
+    connection.execute("DROP TRIGGER remote_adapter_binding_history_no_update", [])?;
+    connection.execute("DROP TRIGGER remote_adapter_binding_history_no_delete", [])?;
+    connection.execute("DROP TABLE remote_adapter_binding_history", [])?;
     connection.execute(
         "UPDATE outbox_metadata SET schema_version=3 WHERE singleton=1",
         [],
@@ -274,7 +562,7 @@ fn physical_v3_remote_fill_migration_is_atomic_recoverable_and_idempotent() -> R
         [],
         |row| row.get(0),
     )?;
-    assert_eq!(stored_version, 4);
+    assert_eq!(stored_version, 5);
     let fact_table_count: i64 = connection.query_row(
         "SELECT COUNT(*) FROM sqlite_master
          WHERE type='table' AND name='remote_execution_facts'",

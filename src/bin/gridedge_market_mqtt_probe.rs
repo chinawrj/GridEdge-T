@@ -5,7 +5,7 @@ use std::{path::PathBuf, time::Duration};
 
 #[derive(Debug, Parser)]
 struct Args {
-    #[arg(long, default_value = "192.168.1.201")]
+    #[arg(long, default_value = "127.0.0.1")]
     host: String,
     #[arg(long, default_value_t = 8883)]
     port: u16,

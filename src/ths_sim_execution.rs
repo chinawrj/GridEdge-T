@@ -18,6 +18,11 @@ use std::{collections::BTreeSet, path::Path};
 pub trait SimulationUiDriver {
     fn orders(&mut self) -> Result<SimulationOrderTable>;
     fn fills(&mut self) -> Result<SimulationFillTable>;
+    fn startup_preflight(&mut self) -> Result<()> {
+        self.orders()?;
+        self.fills()?;
+        Ok(())
+    }
     fn prepare(&mut self, order: &SimulatedOrderDraft) -> Result<()>;
     fn submit_once(&mut self, order: &SimulatedOrderDraft) -> Result<()>;
     fn cancel_contract_once(&mut self, contract_id: &str) -> Result<()>;

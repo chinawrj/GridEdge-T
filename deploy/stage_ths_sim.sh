@@ -4,7 +4,7 @@ set -eu
 project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 unsigned_binary="$project_root/target/release/gridedge_ths_live"
 staging_root=${GRIDEDGE_SIGNED_STAGING_ROOT:-"$project_root/target/release/signed"}
-codesign_identity=${GRIDEDGE_CODESIGN_IDENTITY:-"Apple Development: contributors@users.noreply.github.com (Y23J4BGQT9)"}
+codesign_identity=${GRIDEDGE_CODESIGN_IDENTITY:?GRIDEDGE_CODESIGN_IDENTITY is required}
 codesign_team_id=${GRIDEDGE_CODESIGN_TEAM_ID:-WM4JXVE5GV}
 
 cd "$project_root"

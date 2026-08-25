@@ -263,15 +263,12 @@ fn launch_agent_starts_only_weekdays_at_0925_and_restarts_only_failures() {
     assert!(plist
         .contains("<key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key>\n    <false/>"));
     assert!(plist.contains("<key>ThrottleInterval</key>\n  <integer>60</integer>"));
-    let deployment_root = "/Users/ACCOUNT/Library/Application Support/GridEdge-T";
-    assert!(plist.contains(&format!("{deployment_root}/bin/gridedge_ths_live")));
+    let deployment_root = "__GRIDEDGE_DEPLOYMENT_ROOT__";
+    assert!(plist.contains(&format!("{deployment_root}/bin/run_ths_android_sim.sh")));
     assert!(plist.contains(&format!("{deployment_root}/config/ths_002256_sim.yaml")));
-    assert!(
-        plist.contains(&format!("{deployment_root}/runtime/002256-grid.db"))
-            || std::fs::read_to_string("deploy/ths_002256_sim.yaml")
-                .expect("reviewed deployment config")
-                .contains(&format!("{deployment_root}/runtime/002256-grid.db"))
-    );
+    assert!(std::fs::read_to_string("deploy/ths_002256_sim.yaml")
+        .expect("reviewed deployment config")
+        .contains("database: \"__GRIDEDGE_DEPLOYMENT_ROOT__/runtime/002256-grid.db\""));
     assert!(plist.contains("ths-002256-20260819-grid15-opening-v1"));
     assert!(plist.contains(&format!(
         "{deployment_root}/runtime/002256-outbox-opening-v1.db"
@@ -286,7 +283,7 @@ fn launch_agent_starts_only_weekdays_at_0925_and_restarts_only_failures() {
         "{deployment_root}/runtime/002256-opening-v1-market-mqtt.jsonl"
     )));
     assert!(plist.contains("--market-mqtt-host"));
-    assert!(plist.contains("<string>192.168.1.201</string>"));
+    assert!(plist.contains("<string>__GRIDEDGE_MARKET_HOST__</string>"));
     assert!(plist.contains("--market-mqtt-port"));
     assert!(plist.contains("<string>8883</string>"));
     assert!(plist.contains("--market-mqtt-password-file"));
@@ -299,6 +296,43 @@ fn launch_agent_starts_only_weekdays_at_0925_and_restarts_only_failures() {
     assert!(!plist.contains("target/release"));
     assert!(plist.contains("--maximum-unchanged-seconds"));
     assert!(plist.contains("<string>60</string>"));
+    for required in [
+        "--simulation-adapter",
+        "<string>android</string>",
+        "--android-serial",
+        "<string>emulator-5554</string>",
+        "--android-avd-marker",
+        "<string>THSP_API_32</string>",
+        "--android-masked-account",
+        "<string>**0000</string>",
+        "--android-confirmation-account-sha256-file",
+        "--android-money-actions-enabled",
+        "--android-adb-path",
+        "--execution-runner-file",
+        "--execution-launch-plist-file",
+    ] {
+        assert!(
+            plist.contains(required),
+            "missing Android deployment gate {required}"
+        );
+    }
+    assert!(plist.contains(&format!(
+        "{deployment_root}/android-ths/confirmation-account.sha256"
+    )));
+    assert!(plist.contains("GRIDEDGE_ANDROID_SDK_ROOT"));
+    assert!(plist.contains("__GRIDEDGE_USER_HOME__/Library/LaunchAgents"));
+    assert!(plist.contains("__GRIDEDGE_ANDROID_SDK_ROOT__/platform-tools/adb"));
+    let android_runner = std::fs::read_to_string("deploy/run_ths_android_sim.sh")
+        .expect("reviewed Android unattended runner");
+    assert!(android_runner.contains("requires exactly one ADB device"));
+    assert!(android_runner.contains("ro.boot.qemu.avd_name"));
+    assert!(android_runner.contains("-memory 4096"));
+    assert!(android_runner.contains("window_animation_scale 0"));
+    assert!(android_runner.contains("am start -n \"$package/$activity\""));
+    assert!(android_runner.contains("android-runner-failures"));
+    assert!(android_runner.contains("daily circuit breaker is open"));
+    assert!(android_runner.contains("failure_count + 1"));
+    assert!(android_runner.contains("\"$deployment_root/bin/gridedge_ths_live\" \"$@\""));
 
     let installer = std::fs::read_to_string("deploy/install_ths_sim.sh")
         .expect("reviewed deployment installer");
@@ -316,6 +350,7 @@ fn launch_agent_starts_only_weekdays_at_0925_and_restarts_only_failures() {
     assert!(installer.contains("GRIDEDGE_SIGNED_SHA256"));
     assert!(!installer.contains("codesign --force --sign"));
     assert!(!installer.contains("cargo build"));
+    assert!(installer.contains("install -m 755 deploy/run_ths_android_sim.sh"));
     assert!(installer.contains("codesign --verify --strict"));
     assert!(installer.contains("TeamIdentifier=$codesign_team_id"));
     assert!(installer.contains("frozen signed worker must not use an ad-hoc signature"));
@@ -1592,6 +1627,48 @@ fn production_loop_uses_complete_mqtt_ticks_and_never_the_discrete_quote_probe()
 }
 
 #[test]
+fn remote_execution_identity_and_read_only_preflight_block_before_service_or_market_start() {
+    let source = std::fs::read_to_string("src/bin/gridedge_ths_live.rs")
+        .expect("reviewed deployment orchestrator source");
+    let production = source
+        .split_once("fn run() -> Result<()> {")
+        .expect("production run")
+        .1
+        .split_once("fn probe_remote_orders")
+        .expect("production run end")
+        .0;
+
+    let verify = production
+        .find("verify_execution_identity(&execution_identity)")
+        .expect("durable execution identity gate");
+    let preflight = production
+        .find("driver.startup_preflight()?")
+        .expect("read-only remote preflight");
+    let recover = production
+        .find("GridAutomationService::recover_with_algorithm(")
+        .expect("service recovery");
+    let start = production
+        .find("GridAutomationService::start_new_with_algorithm(")
+        .expect("service start");
+    let market = production
+        .find("MarketMqttClient::connect(")
+        .expect("market connection");
+
+    assert!(verify < preflight);
+    assert!(preflight < recover && preflight < start);
+    assert!(recover < market && start < market);
+
+    let bind_dispatch = production
+        .find("if args.bind_execution_identity_only")
+        .expect("identity-only dispatch");
+    let bind_return = production[bind_dispatch..]
+        .find("return Ok(())")
+        .map(|offset| bind_dispatch + offset)
+        .expect("identity-only early return");
+    assert!(bind_return < verify && bind_return < market);
+}
+
+#[test]
 fn startup_backfill_stays_read_only_without_ui_until_the_live_watermark_is_current() {
     let source = std::fs::read_to_string("src/bin/gridedge_ths_live.rs")
         .expect("reviewed deployment orchestrator source");
@@ -1950,7 +2027,7 @@ fn live_completed_bars_use_one_permit_path_and_recovery_bars_never_touch_ui() {
         .expect("completed-bar helper end")
         .0;
     let probe = helper
-        .find("let mut remote_records = probe_remote_orders()?;")
+        .find("let mut remote_records = probe_remote_orders(driver)?;")
         .expect("one initial immutable orders snapshot");
     let precheck = helper
         .find("verify_remote_contracts(&remote_records, &args.outbox, false)")
@@ -1960,7 +2037,7 @@ fn live_completed_bars_use_one_permit_path_and_recovery_bars_never_touch_ui() {
         .expect("durable outbox reconciliation");
     let conditional_reprobe = outbox
         + helper[outbox..]
-            .find("remote_records = probe_remote_orders()?;")
+            .find("remote_records = probe_remote_orders(driver)?;")
             .expect("post-action orders snapshot");
     let permit = helper
         .find("remote_terminal_permit(&remote_records")
@@ -1972,8 +2049,8 @@ fn live_completed_bars_use_one_permit_path_and_recovery_bars_never_touch_ui() {
     assert!(precheck < outbox && outbox < conditional_reprobe && conditional_reprobe < permit);
     assert!(permit < process);
     let conditional = &helper[outbox..permit];
-    assert!(conditional.contains(")? {\n        remote_records = probe_remote_orders()?;"));
-    assert_eq!(helper.matches("probe_remote_orders()?").count(), 2);
+    assert!(conditional.contains(")? {\n        remote_records = probe_remote_orders(driver)?;"));
+    assert_eq!(helper.matches("probe_remote_orders(driver)?").count(), 2);
 
     let process_body = source
         .split_once("fn process_bar(")
@@ -2006,7 +2083,14 @@ fn live_completed_bars_use_one_permit_path_and_recovery_bars_never_touch_ui() {
 fn one_live_reconciliation_boundary_reuses_one_immutable_orders_snapshot() {
     let source = std::fs::read_to_string("src/bin/gridedge_ths_live.rs")
         .expect("reviewed deployment orchestrator source");
-    let full_orders_probes = source.matches("probe_current_orders()?").count();
+    let helper = source
+        .split_once("fn probe_remote_orders(")
+        .expect("remote orders helper")
+        .1
+        .split_once("fn verify_remote_contracts(")
+        .expect("remote orders helper end")
+        .0;
+    let full_orders_probes = helper.matches("driver.orders()?.records()").count();
     assert_eq!(
         full_orders_probes, 1,
         "the same immutable orders-table snapshot must drive unknown-contract audit and the \

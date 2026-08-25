@@ -23,13 +23,31 @@ struct Args {
     interval_minutes: u32,
     #[arg(long)]
     session_date: NaiveDate,
+    /// Optional canonical CSV for feeding the exact rebuilt bars into the strategy replay.
+    #[arg(long)]
+    bars_csv_output: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireRecord {
     topic: String,
-    payload_hex: String,
+    #[serde(default)]
+    payload_hex: Option<String>,
+    #[serde(default)]
+    payload: Option<Vec<u8>>,
+}
+
+impl WireRecord {
+    fn payload_bytes(self, line_index: usize) -> Result<(String, Vec<u8>)> {
+        let payload = match (self.payload_hex, self.payload) {
+            (Some(value), None) => hex::decode(value)
+                .with_context(|| format!("invalid payload hex on line {line_index}"))?,
+            (None, Some(value)) => value,
+            _ => bail!("line {line_index} must contain exactly one payload representation"),
+        };
+        Ok((self.topic, payload))
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -59,9 +77,8 @@ fn main() -> Result<()> {
         }
         let record: WireRecord = serde_json::from_str(&line)
             .with_context(|| format!("invalid market replay line {}", line_index + 1))?;
-        let payload = hex::decode(&record.payload_hex)
-            .with_context(|| format!("invalid payload hex on line {}", line_index + 1))?;
-        bars.extend(builder.ingest(&record.topic, &payload)?);
+        let (topic, payload) = record.payload_bytes(line_index + 1)?;
+        bars.extend(builder.ingest(&topic, &payload)?);
         input_event_count = input_event_count
             .checked_add(1)
             .context("market replay event count overflow")?;
@@ -101,6 +118,24 @@ fn main() -> Result<()> {
     serde_json::to_writer_pretty(&mut output, &report)?;
     output.write_all(b"\n")?;
     output.sync_all()?;
+    if let Some(path) = args.bars_csv_output {
+        if path == args.output {
+            bail!("market replay audit and bar CSV outputs must be different")
+        }
+        let mut csv_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .with_context(|| format!("refusing to overwrite {}", path.display()))?;
+        {
+            let mut writer = csv::Writer::from_writer(&mut csv_file);
+            for bar in &report.bars {
+                writer.serialize(bar)?;
+            }
+            writer.flush()?;
+        }
+        csv_file.sync_all()?;
+    }
     println!(
         "market replay complete: events={} bars={} covered_through_us={} bars_sha256={}",
         report.input_event_count, report.bar_count, report.covered_through_us, report.bars_sha256

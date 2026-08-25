@@ -16,6 +16,7 @@ pub mod rights;
 pub mod risk;
 pub mod run_context;
 pub mod service;
+pub mod ths_android_sim;
 #[cfg(target_os = "macos")]
 pub mod ths_ax;
 pub mod ths_market;

@@ -29,6 +29,50 @@ fn outbox_requires_an_explicit_history_boundary_and_immutable_source() -> Result
 }
 
 #[test]
+fn remote_execution_identity_is_durable_immutable_and_bound_to_run_platform_and_account(
+) -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("ths-remote-identity.db");
+    let mut outbox = ThsSimOutbox::open(&path)?;
+    outbox.bind_or_verify(SOURCE_A, "run-a", Some(0))?;
+    let android_a = json!({
+        "schema": "gridedge.ths-remote-execution-identity.v1",
+        "adapter": "ANDROID",
+        "platform_sha256": "a".repeat(64),
+        "serial": "emulator-5554",
+        "account_sha256": "b".repeat(64),
+        "money_actions_enabled": true,
+    })
+    .to_string();
+    let android_b = android_a.replace("emulator-5554", "emulator-5556");
+
+    let identity_sha = outbox.bind_execution_identity_once(&android_a)?;
+    assert_eq!(identity_sha.len(), 64);
+    assert_eq!(outbox.verify_execution_identity(&android_a)?, identity_sha);
+    assert!(outbox.bind_execution_identity_once(&android_b).is_err());
+    assert!(outbox.verify_execution_identity(&android_b).is_err());
+    drop(outbox);
+
+    let reopened = ThsSimOutbox::open(&path)?;
+    assert_eq!(
+        reopened.verify_execution_identity(&android_a)?,
+        identity_sha
+    );
+    drop(reopened);
+    let connection = Connection::open(&path)?;
+    assert!(connection
+        .execute(
+            "UPDATE remote_adapter_binding SET identity_sha256=?1 WHERE singleton=1",
+            ["c".repeat(64)],
+        )
+        .is_err());
+    assert!(connection
+        .execute("DELETE FROM remote_adapter_binding WHERE singleton=1", [])
+        .is_err());
+    Ok(())
+}
+
+#[test]
 fn physical_v1_outbox_migrates_to_source_cancellation_state_without_rebinding_source() -> Result<()>
 {
     let directory = tempdir()?;

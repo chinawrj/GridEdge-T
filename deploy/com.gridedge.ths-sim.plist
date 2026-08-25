@@ -6,29 +6,29 @@
   <string>com.gridedge.ths-sim</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/bin/gridedge_ths_live</string>
+    <string>__GRIDEDGE_DEPLOYMENT_ROOT__/bin/run_ths_android_sim.sh</string>
     <string>--config</string>
-    <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/config/ths_002256_sim.yaml</string>
+    <string>__GRIDEDGE_DEPLOYMENT_ROOT__/config/ths_002256_sim.yaml</string>
     <string>--run-id</string>
     <string>ths-002256-20260819-grid15-opening-v1</string>
     <string>--outbox</string>
-    <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/runtime/002256-outbox-opening-v1.db</string>
+    <string>__GRIDEDGE_DEPLOYMENT_ROOT__/runtime/002256-outbox-opening-v1.db</string>
     <string>--quote-log</string>
-    <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/runtime/002256-opening-v1-quotes.jsonl</string>
+    <string>__GRIDEDGE_DEPLOYMENT_ROOT__/runtime/002256-opening-v1-quotes.jsonl</string>
     <string>--bar-log</string>
-    <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/runtime/002256-opening-v1-bars.jsonl</string>
+    <string>__GRIDEDGE_DEPLOYMENT_ROOT__/runtime/002256-opening-v1-bars.jsonl</string>
     <string>--market-event-log</string>
-    <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/runtime/002256-opening-v1-market-mqtt.jsonl</string>
+    <string>__GRIDEDGE_DEPLOYMENT_ROOT__/runtime/002256-opening-v1-market-mqtt.jsonl</string>
     <string>--market-mqtt-host</string>
-    <string>192.168.1.201</string>
+    <string>__GRIDEDGE_MARKET_HOST__</string>
     <string>--market-mqtt-port</string>
     <string>8883</string>
     <string>--market-mqtt-username</string>
     <string>gridedge-publisher</string>
     <string>--market-mqtt-password-file</string>
-    <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/market-mqtt/publisher.password</string>
+    <string>__GRIDEDGE_DEPLOYMENT_ROOT__/market-mqtt/publisher.password</string>
     <string>--market-mqtt-ca-file</string>
-    <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/market-mqtt/ca.crt</string>
+    <string>__GRIDEDGE_DEPLOYMENT_ROOT__/market-mqtt/ca.crt</string>
     <string>--interval-minutes</string>
     <string>5</string>
     <string>--poll-seconds</string>
@@ -37,9 +37,35 @@
     <string>60</string>
     <string>--maximum-order-age-seconds</string>
     <string>300</string>
+    <string>--simulation-adapter</string>
+    <string>android</string>
+    <string>--android-serial</string>
+    <string>emulator-5554</string>
+    <string>--android-avd-marker</string>
+    <string>THSP_API_32</string>
+    <string>--android-masked-account</string>
+    <string>**0000</string>
+    <string>--android-security-name</string>
+    <string>兆新股份</string>
+    <string>--android-adb-path</string>
+    <string>__GRIDEDGE_ANDROID_SDK_ROOT__/platform-tools/adb</string>
+    <string>--android-confirmation-account-sha256-file</string>
+    <string>__GRIDEDGE_DEPLOYMENT_ROOT__/android-ths/confirmation-account.sha256</string>
+    <string>--android-money-actions-enabled</string>
+    <string>--execution-runner-file</string>
+    <string>__GRIDEDGE_DEPLOYMENT_ROOT__/bin/run_ths_android_sim.sh</string>
+    <string>--execution-launch-plist-file</string>
+    <string>__GRIDEDGE_USER_HOME__/Library/LaunchAgents/com.gridedge.ths-sim.plist</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>GRIDEDGE_DEPLOYMENT_ROOT</key>
+    <string>__GRIDEDGE_DEPLOYMENT_ROOT__</string>
+    <key>GRIDEDGE_ANDROID_SDK_ROOT</key>
+    <string>__GRIDEDGE_ANDROID_SDK_ROOT__</string>
+  </dict>
   <key>WorkingDirectory</key>
-  <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T</string>
+  <string>__GRIDEDGE_DEPLOYMENT_ROOT__</string>
   <key>StartCalendarInterval</key>
   <array>
     <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>25</integer></dict>
@@ -58,8 +84,8 @@
   <key>ProcessType</key>
   <string>Interactive</string>
   <key>StandardOutPath</key>
-  <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/logs/worker.stdout.log</string>
+  <string>__GRIDEDGE_DEPLOYMENT_ROOT__/logs/worker.stdout.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/ACCOUNT/Library/Application Support/GridEdge-T/logs/worker.stderr.log</string>
+  <string>__GRIDEDGE_DEPLOYMENT_ROOT__/logs/worker.stderr.log</string>
 </dict>
 </plist>

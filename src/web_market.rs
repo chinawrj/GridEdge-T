@@ -22,6 +22,7 @@ struct TradeTick {
     received_us: u64,
     price: Decimal,
     quantity: i64,
+    signed_legacy: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +35,7 @@ struct SourceStatus {
     session_date: NaiveDate,
     status: String,
     covered_through_us: u64,
+    signed_legacy: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +101,13 @@ impl StreamEvent {
         match self {
             Self::Trade(event) => event.received_us,
             Self::Status(event) => event.received_us,
+        }
+    }
+
+    fn signed_legacy(&self) -> bool {
+        match self {
+            Self::Trade(event) => event.signed_legacy,
+            Self::Status(event) => event.signed_legacy,
         }
     }
 }
@@ -449,7 +458,10 @@ fn event_is_outside_reviewed_session(event: &StreamEvent) -> Result<bool> {
     let capture_in_window = (received_time >= morning_start
         && received_time <= morning_capture_end)
         || (received_time >= afternoon_capture_start && received_time <= afternoon_capture_end);
-    Ok(!(event_in_session && capture_in_window))
+    let signed_legacy_same_day_backfill = event.signed_legacy()
+        && received_time >= morning_start
+        && received_time <= NaiveTime::from_hms_opt(15, 5, 0).expect("valid time");
+    Ok(!(event_in_session && (capture_in_window || signed_legacy_same_day_backfill)))
 }
 
 fn is_reviewed_ashare_trading_date(date: NaiveDate) -> Result<bool> {
@@ -523,6 +535,7 @@ fn parse_event(topic: &str, bytes: &[u8], venue: &str, symbol: &str) -> Result<S
         bail!("market event source is not the reviewed Eastmoney provider")
     }
     let provider_version = string_field(source, "provider_version")?;
+    let signed_legacy = provider_version == LEGACY_PROVIDER_VERSION;
     let source_instance_id = Uuid::parse_str(string_field(source, "source_instance_id")?)
         .context("market source instance is not a UUID")?;
     let instrument = object
@@ -584,6 +597,7 @@ fn parse_event(topic: &str, bytes: &[u8], venue: &str, symbol: &str) -> Result<S
                 received_us,
                 price: Decimal::from_i128_with_scale(i128::from(mantissa), scale),
                 quantity,
+                signed_legacy,
             }))
         }
         "SOURCE_STATUS" => {
@@ -603,6 +617,7 @@ fn parse_event(topic: &str, bytes: &[u8], venue: &str, symbol: &str) -> Result<S
                 session_date,
                 status: string_field(payload, "status")?.to_owned(),
                 covered_through_us: u64_field(payload, "covered_through_us")?,
+                signed_legacy,
             }))
         }
         _ => bail!("unsupported market event type for the trade-bar source"),

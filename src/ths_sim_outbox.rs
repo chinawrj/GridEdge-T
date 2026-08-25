@@ -5,7 +5,7 @@ use crate::{
     ths_sim::{RemoteFilledEvidence, SimulatedOrderDraft},
 };
 use anyhow::{bail, Context, Result};
-use chrono::{Duration, NaiveDateTime};
+use chrono::{Duration, NaiveDateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -140,6 +140,17 @@ pub struct ThsSimOutbox {
     conn: Connection,
 }
 
+fn canonical_execution_identity(identity_json: &str) -> Result<(String, String)> {
+    let value: serde_json::Value = serde_json::from_str(identity_json)
+        .context("Tonghuashun remote execution identity is invalid JSON")?;
+    if !value.is_object() {
+        bail!("Tonghuashun remote execution identity must be one JSON object");
+    }
+    let canonical = serde_json::to_string(&value)?;
+    let identity_sha256 = hex::encode(Sha256::digest(canonical.as_bytes()));
+    Ok((canonical, identity_sha256))
+}
+
 impl ThsSimOutbox {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn =
@@ -175,6 +186,20 @@ impl ThsSimOutbox {
                cancel_evidence_json TEXT,
                cancel_error TEXT
              );
+             CREATE TABLE IF NOT EXISTS remote_adapter_binding(
+               singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+               source_database_instance_id TEXT NOT NULL,
+               run_id TEXT NOT NULL,
+               identity_sha256 TEXT NOT NULL,
+               identity_json TEXT NOT NULL,
+               bound_at TEXT NOT NULL
+             );
+             CREATE TRIGGER IF NOT EXISTS remote_adapter_binding_no_update
+             BEFORE UPDATE ON remote_adapter_binding
+             BEGIN SELECT RAISE(ABORT,'remote adapter binding is immutable'); END;
+             CREATE TRIGGER IF NOT EXISTS remote_adapter_binding_no_delete
+             BEFORE DELETE ON remote_adapter_binding
+             BEGIN SELECT RAISE(ABORT,'remote adapter binding is immutable'); END;
              COMMIT;",
         )?;
         migrate_outbox_to_v3(&conn)?;
@@ -259,6 +284,96 @@ impl ThsSimOutbox {
             }
             Some(version) => bail!("unsupported Tonghuashun outbox schema {version}"),
         }
+    }
+
+    pub fn bind_execution_identity_once(&mut self, identity_json: &str) -> Result<String> {
+        let (source_database_instance_id, run_id, _) = self.binding()?;
+        let (canonical, identity_sha256) = canonical_execution_identity(identity_json)?;
+        let existing = self
+            .conn
+            .query_row(
+                "SELECT source_database_instance_id,run_id,identity_sha256,identity_json
+                   FROM remote_adapter_binding WHERE singleton=1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((stored_source, stored_run, stored_sha256, stored_json)) = existing {
+            if stored_source != source_database_instance_id
+                || stored_run != run_id
+                || stored_sha256 != identity_sha256
+                || stored_json != canonical
+            {
+                bail!("Tonghuashun remote execution identity changed");
+            }
+            return Ok(identity_sha256);
+        }
+        let status = self.status()?;
+        if status.discovered != 0
+            || status.eligible != 0
+            || status.submitting != 0
+            || status.ambiguous != 0
+            || status.cancel_requested != 0
+            || status.cancelling != 0
+            || status.cancel_ambiguous != 0
+            || self.staged_intents()?.iter().any(|intent| {
+                intent.state != StagedIntentState::Submitted
+                    || !(intent.terminal_resolution == StagedTerminalResolution::Filled
+                        || intent.cancel_state == StagedCancelState::Cancelled)
+            })
+        {
+            bail!("Tonghuashun remote execution identity requires a frozen terminal outbox");
+        }
+        self.conn.execute(
+            "INSERT INTO remote_adapter_binding(
+               singleton,source_database_instance_id,run_id,identity_sha256,identity_json,bound_at
+             ) VALUES(1,?1,?2,?3,?4,?5)",
+            params![
+                source_database_instance_id,
+                run_id,
+                identity_sha256,
+                canonical,
+                Utc::now().naive_utc().to_string(),
+            ],
+        )?;
+        Ok(identity_sha256)
+    }
+
+    pub fn verify_execution_identity(&self, identity_json: &str) -> Result<String> {
+        let (source_database_instance_id, run_id, _) = self.binding()?;
+        let (canonical, identity_sha256) = canonical_execution_identity(identity_json)?;
+        let stored = self
+            .conn
+            .query_row(
+                "SELECT source_database_instance_id,run_id,identity_sha256,identity_json
+                   FROM remote_adapter_binding WHERE singleton=1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .context("Tonghuashun remote execution identity is not durably bound")?;
+        if stored.0 != source_database_instance_id
+            || stored.1 != run_id
+            || stored.2 != identity_sha256
+            || stored.3 != canonical
+        {
+            bail!("Tonghuashun remote execution identity changed");
+        }
+        Ok(identity_sha256)
     }
 
     pub fn ingest(&mut self, events: &[EventEnvelope]) -> Result<OutboxStatus> {

@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use gridedge_t::{
     config::Config,
     data::{validate_bar, MarketBar},
@@ -10,17 +10,24 @@ use gridedge_t::{
     journal::{EventReader, SqliteStore},
     market_mqtt::{MarketMqttClient, MarketMqttMessage},
     service::GridAutomationService,
-    ths_sim::{
-        probe_current_orders, RemoteFilledEvidence, SimulationMarketQuote, SimulationOrderRecord,
-    },
+    ths_android_sim::{AndroidThsConfig, AndroidThsSimulationUiDriver},
+    ths_sim::{RemoteFilledEvidence, SimulationMarketQuote, SimulationOrderRecord},
     ths_sim_execution::{
         reconcile_ambiguous_terminal_fills, run_automation_cycle, MacOsSimulationUiDriver,
+        SimulationUiDriver,
     },
     ths_sim_outbox::{
-        StagedCancelState, StagedIntent, StagedIntentState, StagedTerminalResolution, ThsSimOutbox,
+        stage_from_source, StagedCancelState, StagedIntent, StagedIntentState,
+        StagedTerminalResolution, ThsSimOutbox,
     },
     web_market::{SourceCompletionKind, WebTradeBarBuilder},
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SimulationAdapter {
+    Macos,
+    Android,
+}
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -51,7 +58,7 @@ struct Args {
     bar_log: PathBuf,
     #[arg(long)]
     market_event_log: PathBuf,
-    #[arg(long, default_value = "192.168.1.201")]
+    #[arg(long, default_value = "127.0.0.1")]
     market_mqtt_host: String,
     #[arg(long, default_value_t = 8883)]
     market_mqtt_port: u16,
@@ -69,6 +76,30 @@ struct Args {
     maximum_unchanged_seconds: i64,
     #[arg(long, default_value_t = 300)]
     maximum_order_age_seconds: i64,
+    #[arg(long, value_enum, default_value_t = SimulationAdapter::Macos)]
+    simulation_adapter: SimulationAdapter,
+    #[arg(long, default_value = "emulator-5554")]
+    android_serial: String,
+    #[arg(long, default_value = "THS")]
+    android_avd_marker: String,
+    #[arg(long, default_value = "**0000")]
+    android_masked_account: String,
+    #[arg(long, default_value = "兆新股份")]
+    android_security_name: String,
+    #[arg(long, default_value = "/opt/homebrew/bin/adb")]
+    android_adb_path: PathBuf,
+    #[arg(long)]
+    android_confirmation_account_sha256_file: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    android_money_actions_enabled: bool,
+    #[arg(long)]
+    execution_runner_file: Option<PathBuf>,
+    #[arg(long)]
+    execution_launch_plist_file: Option<PathBuf>,
+    /// Bind the exact preflighted remote adapter/device/account/deployment
+    /// identity to an already frozen outbox and exit without market work.
+    #[arg(long, default_value_t = false)]
+    bind_execution_identity_only: bool,
     /// Activate an already-authorized platform identity and exit before any
     /// market, outbox, or macOS UI work.
     #[arg(long, default_value_t = false)]
@@ -100,6 +131,15 @@ fn run() -> Result<()> {
         activate_authorized_platform_upgrade(&args, &config)?;
         return Ok(());
     }
+    let quote_symbol = config
+        .symbol
+        .strip_suffix(".SZ")
+        .or_else(|| config.symbol.strip_suffix(".SH"))
+        .context("market symbol lacks a reviewed suffix")?;
+    if args.bind_execution_identity_only {
+        bind_execution_identity_only(&args, &config, quote_symbol)?;
+        return Ok(());
+    }
     let recovery_started_at = Local::now().naive_local();
     let mut builder = WebTradeBarBuilder::new(config.symbol.clone(), args.interval_minutes)?;
     ensure_parent(&args.quote_log)?;
@@ -116,11 +156,6 @@ fn run() -> Result<()> {
         recovery_started_at,
     )?;
 
-    let quote_symbol = config
-        .symbol
-        .strip_suffix(".SZ")
-        .or_else(|| config.symbol.strip_suffix(".SH"))
-        .context("market symbol lacks a reviewed suffix")?;
     let venue = if config.symbol.ends_with(".SZ") {
         "XSHE"
     } else {
@@ -129,6 +164,10 @@ fn run() -> Result<()> {
     let mut store = SqliteStore::open(&config.database)?;
     store.migrate()?;
     let exists = store.run_ids()?.iter().any(|run_id| run_id == &args.run_id);
+    let (mut driver, execution_identity) =
+        build_driver_and_execution_identity(&args, quote_symbol)?;
+    ThsSimOutbox::open(&args.outbox)?.verify_execution_identity(&execution_identity)?;
+    driver.startup_preflight()?;
     let mut service = if exists {
         GridAutomationService::recover_with_algorithm(
             config.clone(),
@@ -144,7 +183,6 @@ fn run() -> Result<()> {
             Some(args.run_id.clone()),
         )?
     };
-    let mut driver = MacOsSimulationUiDriver::default();
     let mut initial_after_sequence = if ThsSimOutbox::open(&args.outbox)?.has_binding()? {
         None
     } else {
@@ -176,7 +214,7 @@ fn run() -> Result<()> {
                 Path::new(&config.database),
                 &mut initial_after_sequence,
                 Local::now().naive_local(),
-                &mut driver,
+                driver.as_mut(),
             )?;
             return Ok(());
         }
@@ -260,7 +298,7 @@ fn run() -> Result<()> {
                     Path::new(&config.database),
                     &mut initial_after_sequence,
                     now,
-                    &mut driver,
+                    driver.as_mut(),
                     &mut bars,
                     &mut service,
                     bar,
@@ -288,7 +326,7 @@ fn run() -> Result<()> {
                     Path::new(&config.database),
                     &mut initial_after_sequence,
                     now,
-                    &mut driver,
+                    driver.as_mut(),
                     &mut service,
                 )?;
             }
@@ -341,6 +379,116 @@ fn activate_authorized_platform_upgrade(args: &Args, config: &Config) -> Result<
         bail!("platform upgrade activation did not reach the target identity")
     }
     Ok(())
+}
+
+fn bind_execution_identity_only(args: &Args, config: &Config, quote_symbol: &str) -> Result<()> {
+    let store = SqliteStore::open_existing_read_only(&config.database)?;
+    let context = gridedge_t::run_context::RunContext::load(&store, &args.run_id)?
+        .context("execution identity binding requires an existing durable run")?;
+    let current_platform_sha256 = gridedge_t::decision::current_platform_sha256();
+    if context.pending_platform_upgrade.is_some()
+        || context.effective_platform_sha256.as_deref() != Some(current_platform_sha256.as_str())
+    {
+        bail!("execution identity binding requires the activated platform identity")
+    }
+    let (mut driver, identity) = build_driver_and_execution_identity(args, quote_symbol)?;
+    driver.startup_preflight()?;
+    let mut outbox = ThsSimOutbox::open(&args.outbox)?;
+    if !outbox.has_binding()? {
+        drop(outbox);
+        stage_from_source(&config.database, &args.run_id, &args.outbox, Some(0))?;
+        outbox = ThsSimOutbox::open(&args.outbox)?;
+    }
+    let identity_sha256 = outbox.bind_execution_identity_once(&identity)?;
+    println!("bound remote simulation execution identity {identity_sha256}");
+    Ok(())
+}
+
+fn build_driver_and_execution_identity(
+    args: &Args,
+    quote_symbol: &str,
+) -> Result<(Box<dyn SimulationUiDriver>, String)> {
+    let runner = args
+        .execution_runner_file
+        .as_deref()
+        .context("remote execution identity requires --execution-runner-file")?;
+    let launch_plist = args
+        .execution_launch_plist_file
+        .as_deref()
+        .context("remote execution identity requires --execution-launch-plist-file")?;
+    let runner_sha256 = gridedge_t::platform_upgrade::sha256_file(runner)?;
+    let launch_plist_sha256 = gridedge_t::platform_upgrade::sha256_file(launch_plist)?;
+    let platform_sha256 = gridedge_t::decision::current_platform_sha256();
+    match args.simulation_adapter {
+        SimulationAdapter::Macos => {
+            let identity = serde_json::json!({
+                "schema": "gridedge.ths-remote-execution-identity.v1",
+                "adapter": "MACOS",
+                "platform_sha256": platform_sha256,
+                "runner_sha256": runner_sha256,
+                "launch_plist_sha256": launch_plist_sha256,
+                "money_actions_enabled": true,
+            });
+            Ok((
+                Box::new(MacOsSimulationUiDriver::default()),
+                serde_json::to_string(&identity)?,
+            ))
+        }
+        SimulationAdapter::Android => {
+            let confirmation_account_sha256 = args
+                .android_confirmation_account_sha256_file
+                .as_ref()
+                .map(|path| {
+                    fs::read_to_string(path)
+                        .with_context(|| {
+                            format!(
+                                "failed to read Android confirmation account hash {}",
+                                path.display()
+                            )
+                        })
+                        .map(|value| value.trim().to_owned())
+                })
+                .transpose()?;
+            let config = AndroidThsConfig {
+                adb_path: args.android_adb_path.clone(),
+                serial: args.android_serial.clone(),
+                avd_name_marker: args.android_avd_marker.clone(),
+                masked_account: args.android_masked_account.clone(),
+                expected_symbol: quote_symbol.to_owned(),
+                expected_security_name: args.android_security_name.clone(),
+                confirmation_account_sha256: confirmation_account_sha256.clone(),
+                money_actions_enabled: args.android_money_actions_enabled,
+                ..AndroidThsConfig::default()
+            };
+            config.validate()?;
+            let account_sha256 = confirmation_account_sha256.context(
+                "Android execution identity requires the full confirmation account hash",
+            )?;
+            let identity = serde_json::json!({
+                "schema": "gridedge.ths-remote-execution-identity.v1",
+                "adapter": "ANDROID",
+                "platform_sha256": platform_sha256,
+                "runner_sha256": runner_sha256,
+                "launch_plist_sha256": launch_plist_sha256,
+                "adb_sha256": gridedge_t::platform_upgrade::sha256_file(&config.adb_path)?,
+                "serial": config.serial.clone(),
+                "avd_name_marker": config.avd_name_marker.clone(),
+                "package": config.package.clone(),
+                "tested_version": config.tested_version.clone(),
+                "masked_account_sha256": gridedge_t::platform_upgrade::sha256_bytes(
+                    config.masked_account.as_bytes()
+                ),
+                "confirmation_account_sha256": account_sha256,
+                "expected_symbol": config.expected_symbol.clone(),
+                "expected_security_name": config.expected_security_name.clone(),
+                "money_actions_enabled": config.money_actions_enabled,
+            });
+            Ok((
+                Box::new(AndroidThsSimulationUiDriver::new(config)?),
+                serde_json::to_string(&identity)?,
+            ))
+        }
+    }
 }
 
 fn load_market_messages(path: &Path) -> Result<Vec<DurableMarketMessage>> {
@@ -414,8 +562,8 @@ fn market_timestamp_not_future(
     Ok(())
 }
 
-fn probe_remote_orders() -> Result<Vec<SimulationOrderRecord>> {
-    probe_current_orders()?.records()
+fn probe_remote_orders(driver: &mut dyn SimulationUiDriver) -> Result<Vec<SimulationOrderRecord>> {
+    driver.orders()?.records()
 }
 
 fn verify_remote_contracts(
@@ -457,16 +605,16 @@ fn reconcile_and_process_bar(
     source_database: &Path,
     initial_after_sequence: &mut Option<i64>,
     now: NaiveDateTime,
-    driver: &mut MacOsSimulationUiDriver,
+    driver: &mut dyn SimulationUiDriver,
     bars: &mut BTreeMap<NaiveDateTime, MarketBar>,
     service: &mut GridAutomationService,
     bar: MarketBar,
 ) -> Result<()> {
     reconcile_ambiguous_terminal_fills(&args.outbox, now, driver)?;
-    let mut remote_records = probe_remote_orders()?;
+    let mut remote_records = probe_remote_orders(driver)?;
     verify_remote_contracts(&remote_records, &args.outbox, false)?;
     if run_outbox(args, source_database, initial_after_sequence, now, driver)? {
-        remote_records = probe_remote_orders()?;
+        remote_records = probe_remote_orders(driver)?;
     }
     let permit =
         remote_terminal_permit(&remote_records, source_database, &args.run_id, &args.outbox)?;
@@ -480,13 +628,13 @@ fn reconcile_terminal_boundary(
     source_database: &Path,
     initial_after_sequence: &mut Option<i64>,
     now: NaiveDateTime,
-    driver: &mut MacOsSimulationUiDriver,
+    driver: &mut dyn SimulationUiDriver,
 ) -> Result<()> {
     reconcile_ambiguous_terminal_fills(&args.outbox, now, driver)?;
-    let mut remote_records = probe_remote_orders()?;
+    let mut remote_records = probe_remote_orders(driver)?;
     verify_remote_contracts(&remote_records, &args.outbox, false)?;
     if run_outbox(args, source_database, initial_after_sequence, now, driver)? {
-        remote_records = probe_remote_orders()?;
+        remote_records = probe_remote_orders(driver)?;
     }
     remote_terminal_permit(&remote_records, source_database, &args.run_id, &args.outbox)?;
     Ok(())
@@ -497,7 +645,7 @@ fn resume_after_market_data_recovery(
     source_database: &Path,
     initial_after_sequence: &mut Option<i64>,
     now: NaiveDateTime,
-    driver: &mut MacOsSimulationUiDriver,
+    driver: &mut dyn SimulationUiDriver,
     service: &mut GridAutomationService,
 ) -> Result<()> {
     reconcile_terminal_boundary(args, source_database, initial_after_sequence, now, driver)?;
@@ -1031,7 +1179,7 @@ fn run_outbox(
     source_database: &Path,
     initial_after_sequence: &mut Option<i64>,
     now: NaiveDateTime,
-    driver: &mut MacOsSimulationUiDriver,
+    driver: &mut dyn SimulationUiDriver,
 ) -> Result<bool> {
     let receipt = run_automation_cycle(
         source_database,

@@ -165,3 +165,7 @@ PR 会自动执行相同的 Rust 门禁、隔离 wheel 安装后的 BFF 测试�
 Python 依赖由 `webapp/uv.lock` 冻结；更新依赖时必须同步提交相应 lockfile。
 
 Design decisions and limits are documented in [`docs/`](docs/). The simulation retains OHLC intrabar ambiguity and deliberately excludes live connectivity, multi-symbol portfolios and predictive model training.
+
+## License
+
+GridEdge-T is released under the [MIT License](LICENSE).

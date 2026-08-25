@@ -395,6 +395,98 @@ fn signed_legacy_boundary_allows_exact_v5_to_v6_sequence_transition_only() -> Re
 }
 
 #[test]
+fn signed_legacy_same_day_history_backfill_is_not_misclassified_as_weekend_pollution() -> Result<()>
+{
+    let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
+    let tick = event_with_source(
+        1,
+        "TRADE_TICK",
+        "2026-08-21 09:34:00",
+        "2026-08-21 11:55:00",
+        "8101d65c-bdba-4de3-83e0-8983506f159e",
+        "eastmoney-time-sales-dom-v5",
+        false,
+        json!({
+            "price": {"mantissa": 335, "scale": 2},
+            "quantity": 100,
+            "unit": "SHARE",
+            "side": "UNKNOWN",
+            "source_row_key": "legacy-same-day-backfill",
+            "source_page": 1,
+        }),
+    );
+    let status = event_with_source(
+        2,
+        "SOURCE_STATUS",
+        "2026-08-21 09:35:01",
+        "2026-08-21 11:55:01",
+        "8101d65c-bdba-4de3-83e0-8983506f159e",
+        "eastmoney-time-sales-dom-v5",
+        false,
+        json!({
+            "status": "SESSION_HISTORY_COMPLETE",
+            "session_date": "2026-08-21",
+            "covered_through_us": timestamp_us_at("2026-08-21 09:35:01"),
+            "capture_sha256": "c".repeat(64),
+        }),
+    );
+
+    assert!(builder.ingest(TRADE_TOPIC, &tick)?.is_empty());
+    let receipt = builder.ingest_with_receipt(STATUS_TOPIC, &status)?;
+    assert_eq!(receipt.bars.len(), 1);
+    assert!(builder.has_complete_session(chrono::NaiveDate::from_ymd_opt(2026, 8, 21).unwrap()));
+    Ok(())
+}
+
+#[test]
+fn signed_legacy_backfill_preserves_same_day_1505_boundary_but_quarantines_cross_day_data(
+) -> Result<()> {
+    let legacy = |sequence, received: &str| {
+        event_with_source(
+            sequence,
+            "TRADE_TICK",
+            "2026-08-21 15:00:00",
+            received,
+            "8101d65c-bdba-4de3-83e0-8983506f159e",
+            "eastmoney-time-sales-dom-v5",
+            false,
+            json!({
+                "price": {"mantissa": 335, "scale": 2},
+                "quantity": 100,
+                "unit": "SHARE",
+                "side": "UNKNOWN",
+                "source_row_key": format!("legacy-boundary-{sequence}"),
+                "source_page": 1,
+            }),
+        )
+    };
+
+    let mut exact = WebTradeBarBuilder::new("002256.SZ", 5)?;
+    assert!(exact
+        .ingest_with_receipt(TRADE_TOPIC, &legacy(1, "2026-08-21 15:05:00"))?
+        .quarantine_reason
+        .is_none());
+
+    let mut late = WebTradeBarBuilder::new("002256.SZ", 5)?;
+    assert_eq!(
+        late.ingest_with_receipt(TRADE_TOPIC, &legacy(1, "2026-08-21 15:05:01"))?
+            .quarantine_reason
+            .as_deref(),
+        Some("OUTSIDE_REVIEWED_A_SHARE_SESSION")
+    );
+
+    let mut weekend = WebTradeBarBuilder::new("002256.SZ", 5)?;
+    assert_eq!(
+        weekend
+            .ingest_with_receipt(TRADE_TOPIC, &legacy(1, "2026-08-22 09:30:00"))?
+            .quarantine_reason
+            .as_deref(),
+        Some("OUTSIDE_REVIEWED_A_SHARE_SESSION")
+    );
+    Ok(())
+}
+
+#[test]
 fn audited_market_backfill_runs_read_only_and_only_resumes_after_reconciliation() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let mut config = Config::load("configs/ths_002256_sim.yaml")?;
@@ -427,20 +519,25 @@ fn market_replay_cli_requires_the_terminal_watermark_and_writes_a_hashed_audit()
     let directory = tempfile::tempdir()?;
     let input_path = directory.path().join("market.jsonl");
     let output_path = directory.path().join("audit.json");
+    let bars_path = directory.path().join("bars.csv");
     let mut input = std::fs::File::create(&input_path)?;
-    for (topic, payload) in [
+    for (index, (topic, payload)) in [
         (TRADE_TOPIC, tick(1, "09:25:00", 351, 2, 100)),
         (TRADE_TOPIC, tick(2, "09:34:00", 352, 2, 200)),
         (
             STATUS_TOPIC,
             status(3, "09:35:01", "SESSION_HISTORY_COMPLETE"),
         ),
-    ] {
-        writeln!(
-            input,
-            "{}",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let wire = if index == 2 {
+            serde_json::json!({"topic": topic, "payload": payload})
+        } else {
             serde_json::json!({"topic": topic, "payload_hex": hex::encode(payload)})
-        )?;
+        };
+        writeln!(input, "{}", wire)?;
     }
     input.sync_all()?;
 
@@ -454,6 +551,8 @@ fn market_replay_cli_requires_the_terminal_watermark_and_writes_a_hashed_audit()
             "002256.SZ",
             "--session-date",
             "2026-08-21",
+            "--bars-csv-output",
+            bars_path.to_str().unwrap(),
         ])
         .output()?;
     assert!(
@@ -468,6 +567,8 @@ fn market_replay_cli_requires_the_terminal_watermark_and_writes_a_hashed_audit()
     assert_eq!(audit["bars"][0]["open"], "3.51");
     assert_eq!(audit["bars"][0]["close"], "3.52");
     assert_eq!(audit["bars_sha256"].as_str().unwrap().len(), 64);
+    let replayed = gridedge_t::data::CsvReplayFeed::load(&bars_path, "002256.SZ")?;
+    assert_eq!(replayed.bars().len(), 1);
     Ok(())
 }
 

@@ -506,6 +506,118 @@ test("a recovered collector ignores both its internal retry and a stale external
   assert.equal(retries.length, 0);
 });
 
+test("a post-close empty rowset retry initializes automatically when the next session becomes live", async () => {
+  let attempts = 0;
+  let initialized = false;
+  let refreshes = 0;
+  let observerStarts = 0;
+  let observerStops = 0;
+  let initialDeliveries = 0;
+  const retries = [];
+  const errors = [];
+  const validatedRows = [];
+  const initializer = createRetriableInitializer(async () => {
+    attempts += 1;
+    const initialPage = await captureInitialPageWithRefresh({
+      async captureStableFirstPage() {
+        if (attempts <= 2) throw new Error("Eastmoney page ? did not become stable");
+        const capture = page(1, ["09:30:03", "09:30:00"]);
+        return { capture, hash: "live-page", rowsetHash: "09:30:03,09:30:00" };
+      },
+      async refreshLatestFirst() {
+        refreshes += 1;
+        if (attempts <= 2) {
+          throw new Error("Eastmoney latest-first cycle did not produce a reviewed rowset effect");
+        }
+      },
+      isRefreshableInitialError(error) {
+        return error.message === "Eastmoney page ? did not become stable";
+      },
+      validateCaptureTiming(capture) {
+        validatedRows.push(capture.rows);
+      },
+    });
+    return await completeProvisionalInitialization({
+      markInitialized(value) {
+        initialized = value;
+      },
+      startObserving() {
+        observerStarts += 1;
+      },
+      stopObserving() {
+        observerStops += 1;
+      },
+      async finish() {
+        initialDeliveries += 1;
+        return { ok: true, rowsetHash: initialPage.rowsetHash };
+      },
+    });
+  }, {
+    isInitialized: () => initialized,
+    scheduleRetry(callback) {
+      retries.push(callback);
+    },
+    async onError(error) {
+      errors.push(error.message);
+    },
+  });
+
+  assert.deepEqual(await initializer.request(), {
+    ok: false,
+    reason: "Eastmoney latest-first cycle did not produce a reviewed rowset effect",
+  });
+  assert.equal(initialized, false);
+  assert.equal(attempts, 1);
+  assert.equal(refreshes, 1);
+  assert.deepEqual(validatedRows, []);
+  assert.equal(observerStarts, 0);
+  assert.equal(observerStops, 0);
+  assert.equal(initialDeliveries, 0);
+  assert.deepEqual(errors, [
+    "Eastmoney latest-first cycle did not produce a reviewed rowset effect",
+  ]);
+  assert.equal(retries.length, 1);
+
+  const firstRetry = retries.shift();
+  firstRetry();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(initialized, false);
+  assert.equal(attempts, 2);
+  assert.equal(refreshes, 2);
+  assert.deepEqual(validatedRows, []);
+  assert.equal(observerStarts, 0);
+  assert.equal(observerStops, 0);
+  assert.equal(initialDeliveries, 0);
+  assert.deepEqual(errors, [
+    "Eastmoney latest-first cycle did not produce a reviewed rowset effect",
+    "Eastmoney latest-first cycle did not produce a reviewed rowset effect",
+  ]);
+  assert.equal(retries.length, 1);
+
+  const secondRetry = retries.shift();
+  secondRetry();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(initialized, true);
+  assert.equal(attempts, 3);
+  assert.equal(refreshes, 2);
+  assert.equal(validatedRows.length, 1);
+  assert.deepEqual(validatedRows[0].map((row) => row.value), ["09:30:03", "09:30:00"]);
+  assert.equal(observerStarts, 1);
+  assert.equal(observerStops, 0);
+  assert.equal(initialDeliveries, 1);
+  assert.equal(retries.length, 0);
+
+  firstRetry();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(attempts, 3);
+  assert.equal(observerStarts, 1);
+  assert.equal(initialDeliveries, 1);
+  assert.deepEqual(await initializer.request(), {
+    ok: true,
+    reason: "ALREADY_INITIALIZED",
+  });
+});
+
 test("a late initialization failure rolls back readiness and observation before retry", async () => {
   let initialized = false;
   let observing = false;

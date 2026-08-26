@@ -1256,7 +1256,7 @@ fn scripted_driver_reads_orders_before_time_only_fills() -> Result<()> {
     let executor = ScriptedAdb {
         snapshots,
         commands,
-        device_time: None,
+        device_time: Some("2026-08-25T00:05:00+0800".to_owned()),
     };
     let mut driver =
         AndroidThsSimulationUiDriver::with_executor(AndroidThsConfig::default(), executor);

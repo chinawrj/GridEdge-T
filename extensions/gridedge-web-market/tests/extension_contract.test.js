@@ -69,14 +69,30 @@ test("MQTT credentials live in extension storage and never enter content scripts
   assert.match(background, /mqtt_password: current\.mqtt_password \? "\*\*\*" : ""/);
 });
 
-test("content collector has manual scan and bounded mutation debounce", () => {
+test("content collector serializes manual, mutation, stability, and retry scans", () => {
   const content = Object.fromEntries(sources)["src/content.js"];
   assert.match(content, /GRIDEDGE_SCAN_NOW/);
-  assert.match(content, /setTimeout\(\(\) => void scan\("mutation"\), 3000\)/);
+  assert.match(content, /createSingleFlightRunner\(scanOnce,\s*\{/);
+  assert.match(content, /queued === "manual" \|\| incoming === "manual" \? "manual" : incoming/);
+  assert.match(content, /requestScan\("manual"\)/);
+  assert.match(content, /requestScan\("mutation"\)/);
   assert.match(content, /observer\.observe\(document\.documentElement,\s*\{[\s\S]*childList:\s*true,[\s\S]*characterData:\s*true,[\s\S]*subtree:\s*true,[\s\S]*\}\)/);
   assert.match(content, /WAITING_FOR_STABLE_ROWSET/);
-  assert.match(content, /setTimeout\(\(\) => void scan\("stability"\), 1000\)/);
+  assert.match(content, /requestScan\("stability"\)/);
+  assert.match(content, /requestScan\("error-retry"\)/);
+  assert.match(content, /cycleLatestFirstControl/);
+  assert.match(content, /maxRefreshAttempts:\s*3/);
   assert.match(content, /captured_at_us: 0/);
+});
+
+test("content collector retries only the reviewed transient DOM order mismatch", () => {
+  const content = Object.fromEntries(sources)["src/content.js"];
+  assert.match(content, /readCaptureWithRetry/);
+  assert.match(content, /Eastmoney time-sales DOM order disagrees with its reviewed control/);
+  assert.match(content, /isRetriableError:\s*isRetriableReviewedControlError/);
+  assert.match(content, /isRefreshableInitialError,\s*\n\s*validateCaptureTiming/);
+  assert.match(content, /maxAttempts:\s*MAX_REVIEWED_SNAPSHOT_ATTEMPTS/);
+  assert.match(content, /maxStateAttempts:\s*60/);
 });
 
 test("popup can export exact durable MQTT replay bytes without database access", () => {
@@ -130,7 +146,9 @@ test("content collector finishes a bounded in-memory history crawl before publis
   assert.match(content, /await crawlSessionHistory\(\)/);
   assert.match(content, /async function establishResumeBoundary/);
   assert.match(content, /GRIDEDGE_RESUME_BOUNDARY/);
-  assert.match(content, /setTimeout\(initializeWithRetry, 15_000\)/);
+  assert.match(pageStability, /function createRetriableInitializer/);
+  assert.match(content, /createRetriableInitializer\(initializeCollector/);
+  assert.match(content, /setTimeout\(\(\) => void requestInitialization\(\), SCAN_ERROR_RETRY_MS\)/);
   assert.ok(content.indexOf("await crawlSessionHistory()") < content.indexOf("observer.observe"));
 });
 

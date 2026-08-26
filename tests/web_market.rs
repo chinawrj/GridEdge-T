@@ -582,7 +582,7 @@ fn quarantined_legacy_tail_transitions_atomically_to_v6_partial_then_safe_live()
         2_763,
         "TRADE_TICK",
         "2026-08-22 10:00:00",
-        "2026-08-22 10:00:00",
+        "2026-08-21 18:00:00",
         fixed_instance,
         "eastmoney-time-sales-dom-v5",
         false,
@@ -603,6 +603,28 @@ fn quarantined_legacy_tail_transitions_atomically_to_v6_partial_then_safe_live()
     );
     assert!(tail.bars.is_empty());
     assert!(tail.completion.is_none());
+
+    let unreviewed_current_clock_skew = event_with_source(
+        1,
+        "TRADE_TICK",
+        "2026-08-22 10:00:00",
+        "2026-08-21 18:00:00",
+        fixed_instance,
+        "eastmoney-time-sales-dom-v6",
+        true,
+        json!({
+            "price": {"mantissa": 335, "scale": 2},
+            "quantity": 100,
+            "unit": "SHARE",
+            "side": "UNKNOWN",
+            "source_row_key": "unreviewed-current-weekend-clock-skew",
+            "source_page": 1,
+        }),
+    );
+    let mut current_builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
+    assert!(current_builder
+        .ingest(TRADE_TOPIC, &unreviewed_current_clock_skew)
+        .is_err());
 
     let boundary_payload = json!({
         "status": "SESSION_RESUME_BOUNDARY",

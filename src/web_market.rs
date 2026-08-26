@@ -318,8 +318,11 @@ impl WebTradeBarBuilder {
             }
         }
 
-        validate_event_integrity_before_disposition(&event)?;
-        if event_is_outside_reviewed_session(&event)? {
+        let outside_reviewed_session = event_is_outside_reviewed_session(&event)?;
+        let reviewed_legacy_pollution_clock_skew =
+            outside_reviewed_session && event.signed_legacy();
+        validate_event_integrity_before_disposition(&event, reviewed_legacy_pollution_clock_skew)?;
+        if outside_reviewed_session {
             self.source_instance_id = Some(event.source_instance_id());
             self.last_sequence = Some(event.sequence());
             self.seen_sequences
@@ -490,8 +493,11 @@ impl WebTradeBarBuilder {
     }
 }
 
-fn validate_event_integrity_before_disposition(event: &StreamEvent) -> Result<()> {
-    if event.timestamp_us() > event.received_us() {
+fn validate_event_integrity_before_disposition(
+    event: &StreamEvent,
+    allow_reviewed_legacy_pollution_clock_skew: bool,
+) -> Result<()> {
+    if event.timestamp_us() > event.received_us() && !allow_reviewed_legacy_pollution_clock_skew {
         bail!("market event timestamp is later than its source capture clock")
     }
     if let StreamEvent::Status(status) = event {

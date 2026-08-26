@@ -1,6 +1,6 @@
 {
   "name": "gridedge-web-market-extension",
-  "version": "0.6.8",
+  "version": "0.6.12",
   "private": true,
   "license": "UNLICENSED",
   "dependencies": {

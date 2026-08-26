@@ -10,8 +10,12 @@
   const MAX_HISTORY_PAGES = 200;
   const MAX_HISTORY_RESTARTS = 3;
   const MAX_STABILITY_ATTEMPTS = 180;
+  const MAX_SCAN_ERROR_RETRIES = 3;
+  const SCAN_ERROR_RETRY_MS = 1500;
+  const MAX_REVIEWED_SNAPSHOT_ATTEMPTS = 60;
   let initialized = false;
   let scheduled = false;
+  let consecutiveScanFailures = 0;
   let lastObservedRowsetHash = null;
   let lastDeliveredRowsetHash = null;
 
@@ -42,27 +46,76 @@
   }
 
   function reviewedRowOrder() {
-    const checkbox = Array.from(document.querySelectorAll('input[type="checkbox"]')).find((input) =>
-      Array.from(input.labels ?? []).some((label) =>
-        core.normalizeText(label.textContent) === "倒序",
-      ),
-    );
+    const checkbox = latestFirstCheckbox();
     if (!checkbox) throw new Error("Eastmoney reviewed row-order control is missing");
     return checkbox.checked ? "LATEST_FIRST" : "EARLIEST_FIRST";
   }
 
-  function ensureLatestFirst() {
-    const checkbox = Array.from(document.querySelectorAll('input[type="checkbox"]')).find((input) =>
+  function latestFirstCheckbox() {
+    return Array.from(document.querySelectorAll('input[type="checkbox"]')).find((input) =>
       Array.from(input.labels ?? []).some((label) =>
         core.normalizeText(label.textContent) === "倒序",
       ),
     );
+  }
+
+  function ensureLatestFirst() {
+    const checkbox = latestFirstCheckbox();
     if (!checkbox) return false;
     if (!checkbox.checked) {
       checkbox.click();
       return false;
     }
     return true;
+  }
+
+  function isRetriableReviewedControlError(error) {
+    return String(error?.message ?? error) ===
+      "Eastmoney time-sales DOM order disagrees with its reviewed control";
+  }
+
+  function isRefreshableInitialError(error) {
+    const message = String(error?.message ?? error);
+    return message === "Eastmoney page ? did not become stable" ||
+      message === "capture latest row is stale" ||
+      message === "Eastmoney time-sales DOM order disagrees with its reviewed control";
+  }
+
+  async function readReviewedSnapshot() {
+    return await pageStability.readCaptureWithRetry({
+      readCapture: async () => provider.parseSnapshot(documentSnapshot()),
+      isRetriableError: isRetriableReviewedControlError,
+      delay: async () => await delay(100),
+      maxAttempts: MAX_REVIEWED_SNAPSHOT_ATTEMPTS,
+    });
+  }
+
+  async function refreshLatestFirst() {
+    let previousRowsetHash = null;
+    try {
+      const previousCapture = provider.parseSnapshot(documentSnapshot());
+      if (previousCapture.rows.length > 0) previousRowsetHash = await rowsetHash(previousCapture);
+    } catch (_error) {
+      // An empty initial table has no rowset; wait for any reviewed rows below.
+    }
+    await pageStability.cycleLatestFirstControl({
+      readControl: latestFirstCheckbox,
+      delay: async () => await delay(100),
+      waitForUncheckedEffect: async () => {
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          await delay(250);
+          try {
+            const capture = provider.parseSnapshot(documentSnapshot());
+            if (capture.rows.length === 0) continue;
+            const currentRowsetHash = await rowsetHash(capture);
+            if (previousRowsetHash === null || currentRowsetHash !== previousRowsetHash) return;
+          } catch (_error) {
+            // Eastmoney can replace the pagination token before its rows.
+          }
+        }
+      },
+      maxStateAttempts: 60,
+    });
   }
 
   function stableCaptureValue(capture) {
@@ -85,7 +138,7 @@
 
   async function stablePageCapture(expectedPageIndex = null, forbiddenRowsetHash = null) {
     return await pageStability.captureStablePage({
-      readCapture: async () => provider.parseSnapshot(documentSnapshot()),
+      readCapture: readReviewedSnapshot,
       stableCaptureHash: async (capture) =>
         await core.sha256Hex(core.canonicalJson(stableCaptureValue(capture))),
       rowsetHash,
@@ -133,7 +186,7 @@
 
   async function crawlSessionHistory() {
     for (let restart = 0; restart < MAX_HISTORY_RESTARTS; restart += 1) {
-      const current = provider.parseSnapshot(documentSnapshot());
+      const current = await readReviewedSnapshot();
       let previousPageRowsetHash = null;
       if (current.completeness.page_index !== 1) {
         previousPageRowsetHash = await rowsetHash(current);
@@ -177,7 +230,7 @@
   }
 
   async function establishResumeBoundary() {
-    let current = provider.parseSnapshot(documentSnapshot());
+    let current = await readReviewedSnapshot();
     let forbiddenRowsetHash = null;
     if (current.completeness.page_index !== 1) {
       forbiddenRowsetHash = await rowsetHash(current);
@@ -202,7 +255,15 @@
 
   async function initializeCollector() {
     while (!ensureLatestFirst()) await delay(750);
-    let currentPage = await stablePageCapture();
+    let currentPage = await pageStability.captureInitialPageWithRefresh({
+      captureStableFirstPage: async (forbiddenRowsetHash) =>
+        await stablePageCapture(null, forbiddenRowsetHash),
+      refreshLatestFirst,
+      isRefreshableInitialError,
+      validateCaptureTiming(capture) {
+        if (capture.completeness.page_index === 1) core.validateCaptureTiming(capture);
+      },
+    });
     const stateResponse = await chrome.runtime.sendMessage({
       type: "GRIDEDGE_GET_CAPTURE_STATE",
       instrument: currentPage.capture.instrument,
@@ -220,42 +281,96 @@
         await establishResumeBoundary();
       }
     }
-    initialized = true;
-    observer.observe(document.documentElement, {
-      childList: true,
-      characterData: true,
-      subtree: true,
+    return await pageStability.completeProvisionalInitialization({
+      markInitialized(value) {
+        initialized = value;
+      },
+      startObserving() {
+        observer.observe(document.documentElement, {
+          childList: true,
+          characterData: true,
+          subtree: true,
+        });
+      },
+      stopObserving() {
+        observer.disconnect();
+      },
+      finish() {
+        return requestScan("initial");
+      },
     });
-    return await scan("initial");
   }
 
-  async function scan(reason) {
-    scheduled = false;
+  const initializationRunner = pageStability.createRetriableInitializer(initializeCollector, {
+    isInitialized: () => initialized,
+    scheduleRetry(callback) {
+      setTimeout(callback, 15_000);
+    },
+    async onError(error) {
+      await chrome.runtime.sendMessage({
+        type: "GRIDEDGE_CAPTURE_ERROR",
+        provider: "eastmoney",
+        page_url: location.href,
+        message: String(error?.message ?? error),
+      });
+    },
+  });
+
+  function requestInitialization() {
+    return initializationRunner.request();
+  }
+
+  function successfulScan(result) {
+    consecutiveScanFailures = 0;
+    return result;
+  }
+
+  async function scanOnce(reason) {
     try {
-      if (!initialized) return { ok: false, reason: "INITIALIZING_HISTORY" };
-      if (!ensureLatestFirst()) {
-        setTimeout(() => void scan("latest-first"), 1500);
-        return { ok: false, reason: "WAITING_FOR_LATEST_FIRST" };
+      if (!initialized) {
+        void requestInitialization();
+        return { ok: false, reason: "INITIALIZING_HISTORY" };
       }
-      let capture = provider.parseSnapshot(documentSnapshot());
+      if (!ensureLatestFirst()) {
+        setTimeout(() => void requestScan("latest-first"), 1500);
+        return successfulScan({ ok: false, reason: "WAITING_FOR_LATEST_FIRST" });
+      }
+      let capture = await readReviewedSnapshot();
       if (capture.completeness.page_index !== 1) {
         const staleRowsetHash = await rowsetHash(capture);
         await navigateHistory("首页", 1);
         capture = (await stablePageCapture(1, staleRowsetHash)).capture;
       }
-      if (capture.rows.length === 0) return { ok: false, reason: "NO_TIME_SALES_ROWS" };
-      const rowsetHash = await core.sha256Hex(core.canonicalJson(stableCaptureValue(capture)));
-      if (rowsetHash !== lastObservedRowsetHash) {
-        lastObservedRowsetHash = rowsetHash;
-        setTimeout(() => void scan("stability"), 1000);
-        return { ok: false, reason: "WAITING_FOR_STABLE_ROWSET" };
+      if (capture.rows.length === 0) {
+        return successfulScan({ ok: false, reason: "NO_TIME_SALES_ROWS" });
       }
-      if (reason !== "manual" && rowsetHash === lastDeliveredRowsetHash) {
-        return { ok: true, reason: "UNCHANGED" };
+      try {
+        core.validateCaptureTiming(capture);
+      } catch (error) {
+        if (String(error?.message ?? error) !== "capture latest row is stale") throw error;
+        capture = (await pageStability.refreshStaleFirstPage({
+          staleCapture: capture,
+          rowsetHash,
+          refreshLatestFirst,
+          captureStableFirstPage: async (forbiddenRowsetHash) =>
+            await stablePageCapture(1, forbiddenRowsetHash),
+          validateCaptureTiming: core.validateCaptureTiming,
+          retryDelay: async () => await delay(500),
+          maxRefreshAttempts: 3,
+        })).capture;
       }
-      const response = await deliverCapture(capture, rowsetHash);
-      lastDeliveredRowsetHash = rowsetHash;
-      return response;
+      const captureHash = await core.sha256Hex(core.canonicalJson(stableCaptureValue(capture)));
+      if (captureHash !== lastObservedRowsetHash) {
+        lastObservedRowsetHash = captureHash;
+        setTimeout(() => void requestScan("stability"), 1000);
+        return successfulScan({ ok: false, reason: "WAITING_FOR_STABLE_ROWSET" });
+      }
+      if (reason !== "manual" && captureHash === lastDeliveredRowsetHash) {
+        return successfulScan({ ok: true, reason: "UNCHANGED" });
+      }
+      const response = await deliverCapture(capture, captureHash);
+      lastDeliveredRowsetHash = captureHash;
+      return successfulScan(response);
     } catch (error) {
       const message = String(error?.message ?? error);
       if (message.includes("live capture has no overlap with the prior durable watermark")) {
@@ -269,7 +384,7 @@
             characterData: true,
             subtree: true,
           });
-          return { ok: true, reason: "HISTORY_RECOVERED" };
+          return successfulScan({ ok: true, reason: "HISTORY_RECOVERED" });
         } catch (recoveryError) {
           try {
             const boundary = await establishResumeBoundary();
@@ -279,7 +394,11 @@
               characterData: true,
               subtree: true,
             });
-            return { ok: true, reason: "PARTIAL_SESSION_BOUNDARY_RECOVERED", boundary };
+            return successfulScan({
+              ok: true,
+              reason: "PARTIAL_SESSION_BOUNDARY_RECOVERED",
+              boundary,
+            });
           } catch (boundaryError) {
             await chrome.runtime.sendMessage({
               type: "GRIDEDGE_CAPTURE_ERROR",
@@ -287,7 +406,12 @@
               page_url: location.href,
               message: String(boundaryError?.message ?? boundaryError),
             });
-            return { ok: false, reason: String(boundaryError?.message ?? boundaryError) };
+            const boundaryMessage = String(boundaryError?.message ?? boundaryError);
+            if (consecutiveScanFailures < MAX_SCAN_ERROR_RETRIES) {
+              consecutiveScanFailures += 1;
+              setTimeout(() => void requestInitialization(), SCAN_ERROR_RETRY_MS);
+            }
+            return { ok: false, reason: boundaryMessage };
           }
         }
       }
@@ -297,30 +421,36 @@
         page_url: location.href,
         message,
       });
+      if (consecutiveScanFailures < MAX_SCAN_ERROR_RETRIES) {
+        consecutiveScanFailures += 1;
+        setTimeout(() => void requestScan("error-retry"), SCAN_ERROR_RETRY_MS);
+      }
       return { ok: false, reason: message };
     }
+  }
+
+  const scanRunner = pageStability.createSingleFlightRunner(scanOnce, {
+    mergeReason: (queued, incoming) =>
+      queued === "manual" || incoming === "manual" ? "manual" : incoming,
+  });
+  function requestScan(reason) {
+    return scanRunner.request(reason);
   }
 
   function scheduleScan() {
     if (!initialized || scheduled) return;
     scheduled = true;
-    setTimeout(() => void scan("mutation"), 3000);
+    setTimeout(() => {
+      scheduled = false;
+      void requestScan("mutation");
+    }, 3000);
   }
 
   const observer = new MutationObserver(scheduleScan);
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type !== "GRIDEDGE_SCAN_NOW") return false;
-    void scan("manual").then(sendResponse);
+    void requestScan("manual").then(sendResponse);
     return true;
   });
-  const initializeWithRetry = () => void initializeCollector().catch(async (error) => {
-    await chrome.runtime.sendMessage({
-      type: "GRIDEDGE_CAPTURE_ERROR",
-      provider: "eastmoney",
-      page_url: location.href,
-      message: String(error?.message ?? error),
-    });
-    setTimeout(initializeWithRetry, 15_000);
-  });
-  initializeWithRetry();
+  void requestInitialization();
 })();

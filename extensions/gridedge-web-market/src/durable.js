@@ -13,6 +13,7 @@
   const AUDITED_LEGACY_SOURCE_KEY = `${SOURCE_ID}|XSHE|002256`;
   const AUDITED_LEGACY_SOURCE_INSTANCE = "8101d65c-bdba-4de3-83e0-8983506f159e";
   const AUDITED_LEGACY_NEXT_SEQUENCE = 2764;
+  const SOURCE_OBSERVATION_POLICY = "ACTIVE_REVIEWED_LATEST_FIRST_CYCLE_V1";
   let writerTail = Promise.resolve();
 
   function request(requestObject) {
@@ -52,7 +53,7 @@
     return await request(opening);
   }
 
-  function validateCapture(capture) {
+  function validateCapture(capture, { allowStaleLatest = false } = {}) {
     if (!capture || typeof capture !== "object" || Array.isArray(capture)) {
       throw new Error("capture must be an object");
     }
@@ -131,7 +132,8 @@
          capture.completeness.covered_through_us !== Math.max(...rowTimes))) {
       throw new Error("complete history watermark disagrees with exact row bounds");
     }
-    core.validateCaptureTiming(capture);
+    if (allowStaleLatest) core.validateSourceObservationTiming(capture);
+    else core.validateCaptureTiming(capture);
     return capture;
   }
 
@@ -330,6 +332,70 @@
     };
   }
 
+  async function canonicalSourceObservationEvent(
+    capture,
+    captureSha256,
+    sourceInstanceId,
+    sourceSequence,
+    previousObservedAtUs,
+    coveredThroughUs,
+    latestDisplayedTradeUs,
+    sourceId = SOURCE_ID,
+  ) {
+    const payload = {
+      status: "SOURCE_OBSERVED_CURRENT",
+      session_date: capture.session_date,
+      observed_at_us: capture.captured_at_us,
+      covered_through_us: coveredThroughUs,
+      latest_displayed_trade_us: latestDisplayedTradeUs,
+      page_index: capture.completeness.page_index,
+      page_count: capture.completeness.page_count,
+      row_count: capture.rows.length,
+      capture_sha256: captureSha256,
+      source_captured_at_us: capture.captured_at_us,
+      policy: SOURCE_OBSERVATION_POLICY,
+    };
+    if (previousObservedAtUs !== undefined) {
+      payload.previous_observed_at_us = previousObservedAtUs;
+    }
+    const document = {
+      spec: "gridedge.market",
+      schema_version: 1,
+      event_type: "SOURCE_STATUS",
+      source: {
+        source_id: sourceId,
+        source_instance_id: sourceInstanceId,
+        source_type: "WEB_UI",
+        provider: capture.provider,
+        provider_version: capture.provider_version,
+      },
+      instrument: capture.instrument,
+      source_sequence: sourceSequence,
+      ts_us: capture.captured_at_us,
+      recv_us: capture.captured_at_us,
+      payload,
+      evidence_sha256: await core.sha256Hex(core.canonicalJson({
+        provider: capture.provider,
+        provider_version: capture.provider_version,
+        source_url: capture.source_url,
+        payload,
+      })),
+    };
+    const { recv_us: _receivedAt, ...identity } = document;
+    const eventId = await core.sha256Hex(core.canonicalJson(identity));
+    document.event_id = eventId;
+    return {
+      event_id: eventId,
+      source_key: `${sourceId}|${capture.instrument.venue}|${capture.instrument.symbol}`,
+      source_sequence: sourceSequence,
+      mqtt_topic: `gridedge/market/v1/${capture.instrument.venue}/${capture.instrument.symbol}/status`,
+      payload: core.canonicalJson(document),
+      state: "PENDING",
+      attempts: 0,
+      created_at_us: core.unixMicrosNow(),
+    };
+  }
+
   async function canonicalResumeBoundaryEvent(
     captureValue,
     claimedCaptureSha256,
@@ -407,9 +473,14 @@
     database,
     captureValue,
     claimedCaptureSha256,
-    createResumeBoundary = false,
+    { createResumeBoundary = false, sourceObservationPolicy = null } = {},
   ) {
-    const capture = validateCapture(captureValue);
+    if (sourceObservationPolicy !== null && sourceObservationPolicy !== SOURCE_OBSERVATION_POLICY) {
+      throw new Error("source observation policy is not reviewed");
+    }
+    const capture = validateCapture(captureValue, {
+      allowStaleLatest: sourceObservationPolicy === SOURCE_OBSERVATION_POLICY,
+    });
     const canonicalCapture = core.canonicalJson(capture);
     const captureSha256 = await core.sha256Hex(canonicalCapture);
     if (captureSha256 !== claimedCaptureSha256) {
@@ -544,6 +615,36 @@
         state.next_sequence += 1;
         state.covered_through_us = liveCoveredThroughUs;
       }
+      if (sourceObservationPolicy === SOURCE_OBSERVATION_POLICY) {
+        const observationSession = state.complete_session_date ?? state.resume_boundary_session_date;
+        if (capture.completeness.session_complete || capture.completeness.page_index !== 1 ||
+            observationSession !== capture.session_date || state.covered_through_us === undefined) {
+          throw new Error("source observation lacks an active reviewed page-one session watermark");
+        }
+        const previousObservedAtUs = state.source_observed_session_date === capture.session_date
+          ? state.source_observed_at_us
+          : undefined;
+        if (previousObservedAtUs !== undefined && capture.captured_at_us <= previousObservedAtUs) {
+          throw new Error("source observation clock did not strictly advance");
+        }
+        const latestDisplayedTradeUs = Math.max(...capture.rows.map((row) =>
+          core.eventTimeUs(capture.session_date, row.source_trade_time)));
+        if (latestDisplayedTradeUs !== state.covered_through_us) {
+          throw new Error("source observation latest displayed trade disagrees with durable coverage");
+        }
+        statusEvents.push(await canonicalSourceObservationEvent(
+          capture,
+          captureSha256,
+          state.source_instance_id,
+          state.next_sequence,
+          previousObservedAtUs,
+          state.covered_through_us,
+          latestDisplayedTradeUs,
+        ));
+        state.next_sequence += 1;
+        state.source_observed_at_us = capture.captured_at_us;
+        state.source_observed_session_date = capture.session_date;
+      }
     }
 
     const names = ["source_state", "capture_batches", "web_rows", "capture_conflicts", "market_event_outbox"];
@@ -599,15 +700,18 @@
     };
   }
 
-  function ingestCapture(database, captureValue, claimedCaptureSha256) {
-    const operation = writerTail.then(() => ingestCaptureImpl(database, captureValue, claimedCaptureSha256));
+  function ingestCapture(database, captureValue, claimedCaptureSha256, options = {}) {
+    const operation = writerTail.then(() =>
+      ingestCaptureImpl(database, captureValue, claimedCaptureSha256, options));
     writerTail = operation.catch(() => undefined);
     return operation;
   }
 
   function ingestResumeBoundary(database, captureValue, claimedCaptureSha256) {
     const operation = writerTail.then(() =>
-      ingestCaptureImpl(database, captureValue, claimedCaptureSha256, true));
+      ingestCaptureImpl(database, captureValue, claimedCaptureSha256, {
+        createResumeBoundary: true,
+      }));
     writerTail = operation.catch(() => undefined);
     return operation;
   }
@@ -745,11 +849,28 @@
         throw new Error("stored replay trade payload is invalid");
       }
     } else {
+      const sourceObserved = document.payload?.status === "SOURCE_OBSERVED_CURRENT";
       if (document.payload?.session_date !== sessionDate ||
-          document.payload?.covered_through_us !== document.ts_us ||
-          !["SESSION_HISTORY_COMPLETE", "SESSION_RESUME_BOUNDARY", "LIVE_CONTIGUOUS"]
-            .includes(document.payload?.status)) {
+          !["SESSION_HISTORY_COMPLETE", "SESSION_RESUME_BOUNDARY", "LIVE_CONTIGUOUS", "SOURCE_OBSERVED_CURRENT"]
+            .includes(document.payload?.status) ||
+          (!sourceObserved && document.payload?.covered_through_us !== document.ts_us)) {
         throw new Error("stored replay status session date or watermark is invalid");
+      }
+      if (sourceObserved &&
+          (source.provider_version !== "eastmoney-time-sales-dom-v6" ||
+           document.payload.observed_at_us !== document.ts_us ||
+           document.recv_us !== document.ts_us ||
+           !Number.isSafeInteger(document.payload.covered_through_us) ||
+           document.payload.covered_through_us > document.payload.observed_at_us ||
+           document.payload.latest_displayed_trade_us !== document.payload.covered_through_us ||
+           document.payload.page_index !== 1 ||
+           !Number.isSafeInteger(document.payload.page_count) || document.payload.page_count < 1 ||
+           !Number.isSafeInteger(document.payload.row_count) || document.payload.row_count < 1 ||
+           document.payload.policy !== SOURCE_OBSERVATION_POLICY ||
+           (document.payload.previous_observed_at_us !== undefined &&
+            (!Number.isSafeInteger(document.payload.previous_observed_at_us) ||
+             document.payload.previous_observed_at_us >= document.payload.observed_at_us)))) {
+        throw new Error("stored replay source observation proof is invalid");
       }
       if (document.payload.status === "SESSION_RESUME_BOUNDARY" &&
           (source.provider_version !== "eastmoney-time-sales-dom-v6" ||

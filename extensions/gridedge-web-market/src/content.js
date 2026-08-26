@@ -12,6 +12,8 @@
   const MAX_STABILITY_ATTEMPTS = 180;
   const MAX_SCAN_ERROR_RETRIES = 3;
   const SCAN_ERROR_RETRY_MS = 1500;
+  const SCAN_HEARTBEAT_MS = 30_000;
+  const SOURCE_OBSERVATION_POLICY = "ACTIVE_REVIEWED_LATEST_FIRST_CYCLE_V1";
   const MAX_REVIEWED_SNAPSHOT_ATTEMPTS = 60;
   let initialized = false;
   let scheduled = false;
@@ -102,17 +104,21 @@
       readControl: latestFirstCheckbox,
       delay: async () => await delay(100),
       waitForUncheckedEffect: async () => {
-        for (let attempt = 0; attempt < 20; attempt += 1) {
-          await delay(250);
-          try {
-            const capture = provider.parseSnapshot(documentSnapshot());
-            if (capture.rows.length === 0) continue;
-            const currentRowsetHash = await rowsetHash(capture);
-            if (previousRowsetHash === null || currentRowsetHash !== previousRowsetHash) return;
-          } catch (_error) {
-            // Eastmoney can replace the pagination token before its rows.
-          }
-        }
+        await pageStability.waitForReviewedRowsetEffect({
+          previousRowsetHash,
+          readRowsetHash: async () => {
+            try {
+              const capture = provider.parseSnapshot(documentSnapshot());
+              if (capture.rows.length === 0) return previousRowsetHash;
+              return await rowsetHash(capture);
+            } catch (_error) {
+              // Eastmoney can replace the pagination token before its rows.
+              return previousRowsetHash;
+            }
+          },
+          delay: async () => await delay(250),
+          maxAttempts: 20,
+        });
       },
       maxStateAttempts: 60,
     });
@@ -171,14 +177,16 @@
     throw new Error(`Eastmoney history navigation did not reach page ${expectedPageIndex}`);
   }
 
-  async function deliverCapture(capture, rowsetHash) {
-    core.validateCaptureTiming(capture);
+  async function deliverCapture(capture, rowsetHash, sourceObservationPolicy = null) {
+    if (sourceObservationPolicy === null) core.validateCaptureTiming(capture);
+    else core.validateSourceObservationTiming(capture);
     const captureSha256 = await core.sha256Hex(core.canonicalJson(capture));
     const response = await chrome.runtime.sendMessage({
       type: "GRIDEDGE_CAPTURE_BATCH",
       capture,
       capture_sha256: captureSha256,
       rowset_hash: rowsetHash,
+      source_observation_policy: sourceObservationPolicy,
     });
     if (!response?.ok) throw new Error(response?.error ?? response?.reason ?? "capture delivery failed");
     return response;
@@ -335,6 +343,22 @@
         setTimeout(() => void requestScan("latest-first"), 1500);
         return successfulScan({ ok: false, reason: "WAITING_FOR_LATEST_FIRST" });
       }
+      if (reason === "heartbeat") {
+        const observed = await pageStability.captureSourceObservation({
+          refreshLatestFirst,
+          captureStableFirstPage: async (expectedPageIndex) =>
+            await stablePageCapture(expectedPageIndex),
+          validateObservationTiming: core.validateSourceObservationTiming,
+        });
+        const response = await deliverCapture(
+          observed.capture,
+          observed.rowsetHash,
+          SOURCE_OBSERVATION_POLICY,
+        );
+        lastObservedRowsetHash = observed.rowsetHash;
+        lastDeliveredRowsetHash = observed.rowsetHash;
+        return successfulScan(response);
+      }
       let capture = await readReviewedSnapshot();
       if (capture.completeness.page_index !== 1) {
         const staleRowsetHash = await rowsetHash(capture);
@@ -365,7 +389,7 @@
         setTimeout(() => void requestScan("stability"), 1000);
         return successfulScan({ ok: false, reason: "WAITING_FOR_STABLE_ROWSET" });
       }
-      if (reason !== "manual" && captureHash === lastDeliveredRowsetHash) {
+      if (!pageStability.shouldDeliverCapture(reason, captureHash, lastDeliveredRowsetHash)) {
         return successfulScan({ ok: true, reason: "UNCHANGED" });
       }
       const response = await deliverCapture(capture, captureHash);
@@ -430,8 +454,11 @@
   }
 
   const scanRunner = pageStability.createSingleFlightRunner(scanOnce, {
-    mergeReason: (queued, incoming) =>
-      queued === "manual" || incoming === "manual" ? "manual" : incoming,
+    mergeReason: (queued, incoming) => {
+      if (queued === "manual" || incoming === "manual") return "manual";
+      if (queued === "heartbeat" || incoming === "heartbeat") return "heartbeat";
+      return incoming;
+    },
   });
   function requestScan(reason) {
     return scanRunner.request(reason);
@@ -447,6 +474,10 @@
   }
 
   const observer = new MutationObserver(scheduleScan);
+  pageStability.installSourceHeartbeat(requestScan, {
+    intervalMs: SCAN_HEARTBEAT_MS,
+    scheduleEvery: setInterval,
+  });
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type !== "GRIDEDGE_SCAN_NOW") return false;
     void requestScan("manual").then(sendResponse);

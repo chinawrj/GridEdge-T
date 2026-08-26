@@ -63,6 +63,40 @@ class FakeMessage:
 
 
 class MarketEventValidationTest(unittest.TestCase):
+    def test_qos1_database_publication_requires_broker_puback_not_local_acceptance(self):
+        class Result:
+            rc = 0
+
+            def __init__(self, published):
+                self.published = published
+                self.waited = False
+
+            def wait_for_publish(self, timeout):
+                self.waited = timeout == 10.0
+
+            def is_published(self):
+                return self.published
+
+        class Client:
+            def __init__(self, result):
+                self.result = result
+
+            def publish(self, *_args, **_kwargs):
+                return self.result
+
+        pending = Result(False)
+        with self.assertRaisesRegex(RuntimeError, "did not receive MQTT QoS1 PUBACK"):
+            market_ingestor.publish_qos1_and_wait(
+                Client(pending), "committed", b"{}", object()
+            )
+        self.assertTrue(pending.waited)
+
+        committed = Result(True)
+        market_ingestor.publish_qos1_and_wait(
+            Client(committed), "committed", b"{}", object()
+        )
+        self.assertTrue(committed.waited)
+
     def test_message_handler_publishes_commit_receipt_before_acknowledging_insert_or_duplicate(self):
         validated = market_ingestor.validate_document(
             event(), "gridedge/market/v1/XSHE/002256/trade"
@@ -87,13 +121,25 @@ class MarketEventValidationTest(unittest.TestCase):
                 )
                 actions.append("application-ack-published")
 
+            def publish_committed(topic, payload):
+                self.assertEqual(
+                    (topic, payload),
+                    (
+                        "gridedge/market-committed/v1/XSHE/002256/trade",
+                        event(),
+                    ),
+                )
+                actions.append("committed-event-published")
+
             market_ingestor.process_market_message(
-                Store(), message, publish, lambda mid, qos: actions.append(("mqtt-ack", mid, qos))
+                Store(), message, publish_committed, publish,
+                lambda mid, qos: actions.append(("mqtt-ack", mid, qos))
             )
             self.assertEqual(
                 actions,
                 [
                     "database-committed",
+                    "committed-event-published",
                     "application-ack-published",
                     ("mqtt-ack", message.mid, message.qos),
                 ],
@@ -115,6 +161,7 @@ class MarketEventValidationTest(unittest.TestCase):
             ConflictStore(),
             message,
             lambda *args: published.append(args),
+            lambda *args: published.append(args),
             lambda mid, qos: acknowledged.append((mid, qos)),
         )
         self.assertEqual(result, "conflict")
@@ -132,6 +179,7 @@ class MarketEventValidationTest(unittest.TestCase):
         result = market_ingestor.process_market_message(
             RejectStore(),
             rejected_message,
+            lambda *args: published.append(args),
             lambda *args: published.append(args),
             lambda mid, qos: acknowledged.append((mid, qos)),
         )
@@ -154,6 +202,7 @@ class MarketEventValidationTest(unittest.TestCase):
                 FailingStore(),
                 FakeMessage(event()),
                 lambda *_args: None,
+                lambda *_args: None,
                 lambda mid, qos: acknowledged.append((mid, qos)),
             )
         self.assertEqual(acknowledged, [])
@@ -165,14 +214,37 @@ class MarketEventValidationTest(unittest.TestCase):
             def reject(self, *_args):
                 raise AssertionError("valid event must not be rejected")
 
-        with self.assertRaisesRegex(RuntimeError, "ACK broker unavailable"):
+        with self.assertRaisesRegex(RuntimeError, "committed broker unavailable"):
             market_ingestor.process_market_message(
                 InsertStore(),
                 FakeMessage(event()),
+                lambda *_args: (_ for _ in ()).throw(RuntimeError("committed broker unavailable")),
                 lambda *_args: (_ for _ in ()).throw(RuntimeError("ACK broker unavailable")),
                 lambda mid, qos: acknowledged.append((mid, qos)),
             )
         self.assertEqual(acknowledged, [])
+
+        with self.assertRaisesRegex(RuntimeError, "ACK broker unavailable"):
+            market_ingestor.process_market_message(
+                InsertStore(),
+                FakeMessage(event()),
+                lambda *_args: None,
+                lambda *_args: (_ for _ in ()).throw(RuntimeError("ACK broker unavailable")),
+                lambda mid, qos: acknowledged.append((mid, qos)),
+            )
+        self.assertEqual(acknowledged, [])
+
+    def test_committed_event_keeps_exact_market_bytes_and_uses_a_separate_topic(self):
+        raw = event()
+        validated = market_ingestor.validate_document(
+            raw, "gridedge/market/v1/XSHE/002256/trade"
+        )
+        self.assertEqual(
+            market_ingestor.committed_market_event(
+                validated, "gridedge/market/v1/XSHE/002256/trade", raw
+            ),
+            ("gridedge/market-committed/v1/XSHE/002256/trade", raw),
+        )
 
     def test_application_ack_is_canonical_and_binds_the_committed_event(self):
         validated = market_ingestor.validate_document(

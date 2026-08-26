@@ -62,7 +62,7 @@ CNY 200,000 simulated cash. Its `max_position` and resource target are the numer
 business position cap; profits above the cash floor can fund additional later positions. The market
 score must still pass before cash can authorize a BUY, so this budget does not create a high-price
 buy signal. The launch-agent template is `deploy/com.gridedge.ths-sim.plist`; it starts the release
-worker at 09:25 on weekdays and a successful 15:05 exit is not restarted. The Mac must stay logged
+worker at 09:00 on weekdays so its committed-market subscription precedes collection; a successful 15:05 exit is not restarted. The Mac must stay logged
 in and unlocked because Accessibility actions deliberately fail closed at the lock screen.
 
 The independent outbox can already bind to one immutable GridEdge database/run and stage only

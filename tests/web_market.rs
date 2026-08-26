@@ -273,6 +273,195 @@ fn ingest_receipt_binds_released_bars_to_the_exact_completion_status() -> Result
 }
 
 #[test]
+fn source_observations_are_separate_from_trade_coverage_and_never_release_bars() -> Result<()> {
+    let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
+    builder.ingest(TRADE_TOPIC, &tick(1, "09:31:00", 352, 2, 100))?;
+    builder.ingest(STATUS_TOPIC, &status(2, "09:35:01", "LIVE_CONTIGUOUS"))?;
+    let covered = builder.covered_through_us();
+
+    let first = builder.ingest_with_receipt(
+        STATUS_TOPIC,
+        &source_observation(3, "09:35:30", None, "09:35:01"),
+    )?;
+    assert!(first.bars.is_empty());
+    assert!(first.completion.is_none());
+    let first_observation = first
+        .source_observation
+        .expect("source observation receipt");
+    assert_eq!(first_observation.previous_observed_at_us, None);
+    assert_eq!(first_observation.observed_at_us, timestamp_us("09:35:30"));
+    assert_eq!(
+        first_observation.covered_through_us,
+        timestamp_us("09:35:01")
+    );
+    assert_eq!(builder.covered_through_us(), covered);
+
+    let second = builder.ingest_with_receipt(
+        STATUS_TOPIC,
+        &source_observation(4, "09:36:00", Some("09:35:30"), "09:35:01"),
+    )?;
+    assert!(second.bars.is_empty());
+    assert!(second.completion.is_none());
+    assert_eq!(
+        second
+            .source_observation
+            .expect("second source observation")
+            .previous_observed_at_us,
+        Some(timestamp_us("09:35:30")),
+    );
+    assert_eq!(builder.covered_through_us(), covered);
+    Ok(())
+}
+
+#[test]
+fn forged_source_observation_is_rejected_atomically() -> Result<()> {
+    let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
+    builder.ingest(TRADE_TOPIC, &tick(1, "09:31:00", 352, 2, 100))?;
+    builder.ingest(STATUS_TOPIC, &status(2, "09:35:01", "LIVE_CONTIGUOUS"))?;
+    builder.ingest_with_receipt(
+        STATUS_TOPIC,
+        &source_observation(3, "09:35:30", None, "09:35:01"),
+    )?;
+    let before = format!("{builder:?}");
+
+    assert!(builder
+        .ingest_with_receipt(
+            STATUS_TOPIC,
+            &source_observation(4, "09:36:00", Some("09:35:29"), "09:35:01"),
+        )
+        .is_err());
+    assert_eq!(format!("{builder:?}"), before);
+    Ok(())
+}
+
+#[test]
+fn source_observation_chain_resets_only_after_new_day_coverage_is_established() -> Result<()> {
+    let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
+    builder.ingest(
+        STATUS_TOPIC,
+        &status(1, "09:35:01", "SESSION_HISTORY_COMPLETE"),
+    )?;
+    builder.ingest_with_receipt(
+        STATUS_TOPIC,
+        &source_observation(2, "09:35:30", None, "09:35:01"),
+    )?;
+
+    builder.ingest(
+        STATUS_TOPIC,
+        &event_at(
+            3,
+            "SOURCE_STATUS",
+            "2026-08-24 09:35:01",
+            json!({
+                "status": "SESSION_HISTORY_COMPLETE",
+                "session_date": "2026-08-24",
+                "covered_through_us": timestamp_us_at("2026-08-24 09:35:01"),
+                "capture_sha256": "d".repeat(64),
+            }),
+        ),
+    )?;
+    let first_today = builder.ingest_with_receipt(
+        STATUS_TOPIC,
+        &source_observation_at(4, "2026-08-24 09:35:30", None, "2026-08-24 09:35:01"),
+    )?;
+    assert_eq!(
+        first_today
+            .source_observation
+            .expect("first observation today")
+            .previous_observed_at_us,
+        None,
+    );
+    let second_today = builder.ingest_with_receipt(
+        STATUS_TOPIC,
+        &source_observation_at(
+            5,
+            "2026-08-24 09:36:00",
+            Some("2026-08-24 09:35:30"),
+            "2026-08-24 09:35:01",
+        ),
+    )?;
+    assert_eq!(
+        second_today
+            .source_observation
+            .expect("second observation today")
+            .previous_observed_at_us,
+        Some(timestamp_us_at("2026-08-24 09:35:30")),
+    );
+    Ok(())
+}
+
+#[test]
+fn source_observation_chain_also_resets_after_a_new_day_partial_boundary() -> Result<()> {
+    let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
+    builder.ingest(
+        STATUS_TOPIC,
+        &status(1, "09:35:01", "SESSION_HISTORY_COMPLETE"),
+    )?;
+    builder.ingest_with_receipt(
+        STATUS_TOPIC,
+        &source_observation(2, "09:35:30", None, "09:35:01"),
+    )?;
+    builder.ingest(
+        STATUS_TOPIC,
+        &event_at(
+            3,
+            "SOURCE_STATUS",
+            "2026-08-24 13:40:20",
+            json!({
+                "status": "SESSION_RESUME_BOUNDARY",
+                "session_date": "2026-08-24",
+                "covered_from_us": timestamp_us_at("2026-08-24 13:00:01"),
+                "covered_through_us": timestamp_us_at("2026-08-24 13:40:20"),
+                "page_index": 1,
+                "page_count": 13,
+                "row_count": 144,
+                "capture_sha256": "d".repeat(64),
+                "policy": "INCOMPLETE_EASTMONEY_HISTORY_EXPLICIT_POLICY_V1",
+            }),
+        ),
+    )?;
+    let first_today = builder.ingest_with_receipt(
+        STATUS_TOPIC,
+        &source_observation_at(4, "2026-08-24 13:40:30", None, "2026-08-24 13:40:20"),
+    )?;
+    assert_eq!(
+        first_today
+            .source_observation
+            .expect("first partial-session observation today")
+            .previous_observed_at_us,
+        None,
+    );
+    Ok(())
+}
+
+#[test]
+fn javascript_durable_source_observation_bytes_are_accepted_by_the_rust_builder() -> Result<()> {
+    let output = Command::new("node")
+        .arg("extensions/gridedge-web-market/scripts/render_source_observation_stream.js")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
+    let mut observation_count = 0;
+    let mut released_bars = 0;
+    for line in String::from_utf8(output.stdout)?.lines() {
+        let record: Value = serde_json::from_str(line)?;
+        let topic = record["topic"].as_str().expect("fixture topic");
+        let payload = hex::decode(record["payload_hex"].as_str().expect("fixture bytes"))?;
+        let receipt = builder.ingest_with_receipt(topic, &payload)?;
+        observation_count += usize::from(receipt.source_observation.is_some());
+        released_bars += receipt.bars.len();
+    }
+    assert_eq!(observation_count, 2);
+    assert_eq!(released_bars, 0);
+    assert!(builder.latest_source_observation().is_some());
+    Ok(())
+}
+
+#[test]
 fn source_sequence_gaps_conflicts_and_forged_event_ids_fail_closed_atomically() -> Result<()> {
     let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
     let first = tick(42, "09:30:01", 355, 2, 100);
@@ -1153,6 +1342,61 @@ fn status_with_previous(sequence: u64, time: &str, previous: &str) -> Vec<u8> {
     value["payload"]["previous_covered_through_us"] = json!(timestamp_us(previous));
     canonicalize_event_id(&mut value);
     serde_json::to_vec(&value).expect("status bytes")
+}
+
+fn source_observation(
+    sequence: u64,
+    observed: &str,
+    previous_observed: Option<&str>,
+    covered_through: &str,
+) -> Vec<u8> {
+    let mut payload = json!({
+        "status": "SOURCE_OBSERVED_CURRENT",
+        "session_date": "2026-08-21",
+        "observed_at_us": timestamp_us(observed),
+        "covered_through_us": timestamp_us(covered_through),
+        "latest_displayed_trade_us": timestamp_us(covered_through),
+        "page_index": 1,
+        "page_count": 1,
+        "row_count": 4,
+        "capture_sha256": "c".repeat(64),
+        "policy": "ACTIVE_REVIEWED_LATEST_FIRST_CYCLE_V1",
+    });
+    if let Some(previous) = previous_observed {
+        payload["previous_observed_at_us"] = json!(timestamp_us(previous));
+    }
+    event_with_recv(
+        sequence,
+        "SOURCE_STATUS",
+        &format!("2026-08-21 {observed}"),
+        &format!("2026-08-21 {observed}"),
+        payload,
+    )
+}
+
+fn source_observation_at(
+    sequence: u64,
+    observed: &str,
+    previous_observed: Option<&str>,
+    covered_through: &str,
+) -> Vec<u8> {
+    let session_date = &observed[..10];
+    let mut payload = json!({
+        "status": "SOURCE_OBSERVED_CURRENT",
+        "session_date": session_date,
+        "observed_at_us": timestamp_us_at(observed),
+        "covered_through_us": timestamp_us_at(covered_through),
+        "latest_displayed_trade_us": timestamp_us_at(covered_through),
+        "page_index": 1,
+        "page_count": 1,
+        "row_count": 4,
+        "capture_sha256": "c".repeat(64),
+        "policy": "ACTIVE_REVIEWED_LATEST_FIRST_CYCLE_V1",
+    });
+    if let Some(previous) = previous_observed {
+        payload["previous_observed_at_us"] = json!(timestamp_us_at(previous));
+    }
+    event_with_recv(sequence, "SOURCE_STATUS", observed, observed, payload)
 }
 
 fn resume_boundary_with_from(sequence: u64, time: &str, from: &str) -> Vec<u8> {

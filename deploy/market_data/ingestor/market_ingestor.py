@@ -201,6 +201,36 @@ def application_ack(event: ValidatedEvent, result: str) -> tuple[str, bytes]:
     return f"gridedge/market-ack/v1/{event_id}", canonical_json(receipt)
 
 
+def committed_market_event(
+    event: ValidatedEvent, original_topic: str, raw: bytes
+) -> tuple[str, bytes]:
+    del event
+    prefix = "gridedge/market/v1/"
+    if not original_topic.startswith(prefix):
+        raise ValueError("committed market event requires the reviewed original topic")
+    return (
+        f"gridedge/market-committed/v1/{original_topic[len(prefix):]}",
+        raw,
+    )
+
+
+def publish_qos1_and_wait(
+    client: Any, topic: str, payload: bytes, properties: Any, timeout: float = 10.0
+) -> None:
+    result = client.publish(
+        topic,
+        payload,
+        qos=1,
+        retain=False,
+        properties=properties,
+    )
+    if result.rc != 0:
+        raise RuntimeError("database publication was not accepted by the MQTT client")
+    result.wait_for_publish(timeout=timeout)
+    if not result.is_published():
+        raise RuntimeError("database publication did not receive MQTT QoS1 PUBACK")
+
+
 class EventStore:
     def __init__(self, connection_info: str):
         self.connection_info = connection_info
@@ -331,6 +361,7 @@ def read_secret(path: str) -> str:
 def process_market_message(
     store: EventStore,
     message: Any,
+    publish_committed_market: Any,
     publish_application_ack: Any,
     acknowledge_delivery: Any,
 ) -> str:
@@ -350,6 +381,10 @@ def process_market_message(
         if result == "conflict":
             acknowledge_delivery(message.mid, message.qos)
             return result
+        committed_topic, committed_payload = committed_market_event(
+            event, message.topic, raw
+        )
+        publish_committed_market(committed_topic, committed_payload)
         ack_topic, ack_payload = application_ack(event, result)
         publish_application_ack(ack_topic, ack_payload)
         acknowledge_delivery(message.mid, message.qos)
@@ -379,6 +414,15 @@ def main() -> int:
     )
     client.username_pw_set(os.environ["MQTT_USERNAME"], mqtt_password)
     client.tls_set(ca_certs=os.environ["MQTT_CA_FILE"], tls_version=ssl.PROTOCOL_TLS_CLIENT)
+    publisher = mqtt.Client(
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+        client_id=f"{os.environ['MQTT_CLIENT_ID']}-committed-publisher",
+        protocol=mqtt.MQTTv5,
+    )
+    publisher.username_pw_set(os.environ["MQTT_USERNAME"], mqtt_password)
+    publisher.tls_set(
+        ca_certs=os.environ["MQTT_CA_FILE"], tls_version=ssl.PROTOCOL_TLS_CLIENT
+    )
 
     def on_connect(client: mqtt.Client, _userdata: Any, _flags: Any, reason_code: Any, _properties: Any) -> None:
         if reason_code.is_failure:
@@ -388,21 +432,19 @@ def main() -> int:
         print("market ingestor connected with MQTT 5", flush=True)
 
     def on_message(client: mqtt.Client, _userdata: Any, message: mqtt.MQTTMessage) -> None:
-        def publish_commit_ack(ack_topic: str, ack_payload: bytes) -> None:
+        def publish_committed_fact(topic: str, payload: bytes) -> None:
             properties = mqtt.Properties(mqtt.PacketTypes.PUBLISH)
             properties.ContentType = "application/json"
-            published = client.publish(
-                ack_topic,
-                ack_payload,
-                qos=1,
-                retain=False,
-                properties=properties,
-            )
-            if published.rc != mqtt.MQTT_ERR_SUCCESS:
-                raise RuntimeError("database commit ACK was not accepted by MQTT")
+            publish_qos1_and_wait(publisher, topic, payload, properties)
 
         try:
-            result = process_market_message(store, message, publish_commit_ack, client.ack)
+            result = process_market_message(
+                store,
+                message,
+                publish_committed_fact,
+                publish_committed_fact,
+                client.ack,
+            )
             if result == "conflict":
                 print(f"market identity conflict: {message.topic}", file=sys.stderr, flush=True)
         except Exception as error:
@@ -415,9 +457,17 @@ def main() -> int:
     def stop(_signal: int, _frame: Any) -> None:
         stopping.set()
         client.disconnect()
+        publisher.disconnect()
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    publisher.connect(
+        os.environ["MQTT_HOST"],
+        int(os.environ["MQTT_PORT"]),
+        keepalive=30,
+        clean_start=mqtt.MQTT_CLEAN_START_FIRST_ONLY,
+    )
+    publisher.loop_start()
     client.connect(
         os.environ["MQTT_HOST"],
         int(os.environ["MQTT_PORT"]),
@@ -427,6 +477,7 @@ def main() -> int:
     while not stopping.is_set():
         client.loop(timeout=1.0)
         time.sleep(0.01)
+    publisher.loop_stop()
     return 0
 
 

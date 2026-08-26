@@ -13,6 +13,7 @@ const LEGACY_PROVIDER_VERSION: &str = "eastmoney-time-sales-dom-v5";
 const LEGACY_SOURCE_INSTANCE: &str = "8101d65c-bdba-4de3-83e0-8983506f159e";
 const LEGACY_FINAL_SEQUENCE: u64 = 2_763;
 const PARTIAL_RESUME_POLICY: &str = "INCOMPLETE_EASTMONEY_HISTORY_EXPLICIT_POLICY_V1";
+const SOURCE_OBSERVATION_POLICY: &str = "ACTIVE_REVIEWED_LATEST_FIRST_CYCLE_V1";
 
 #[derive(Debug, Clone)]
 struct TradeTick {
@@ -37,6 +38,9 @@ struct SourceStatus {
     status: String,
     declared_previous_covered_through_us: Option<u64>,
     covered_through_us: u64,
+    declared_previous_observed_at_us: Option<u64>,
+    observed_at_us: Option<u64>,
+    latest_displayed_trade_us: Option<u64>,
     signed_legacy: bool,
 }
 
@@ -62,12 +66,22 @@ pub struct SourceCompletion {
     pub covered_through_us: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceObservation {
+    pub source_sequence: u64,
+    pub session_date: NaiveDate,
+    pub previous_observed_at_us: Option<u64>,
+    pub observed_at_us: u64,
+    pub covered_through_us: u64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MarketIngestReceipt {
     pub event_timestamp_us: u64,
     pub received_timestamp_us: u64,
     pub bars: Vec<MarketBar>,
     pub completion: Option<SourceCompletion>,
+    pub source_observation: Option<SourceObservation>,
     pub quarantine_reason: Option<String>,
 }
 
@@ -197,6 +211,7 @@ pub struct WebTradeBarBuilder {
     pending: BTreeMap<NaiveDateTime, PendingTradeBar>,
     emitted: BTreeSet<NaiveDateTime>,
     covered_through_us: Option<u64>,
+    latest_source_observation: Option<SourceObservation>,
     complete_sessions: BTreeSet<NaiveDate>,
     resume_boundary_sessions: BTreeMap<NaiveDate, NaiveDateTime>,
     safe_resume_boundary_sessions: BTreeSet<NaiveDate>,
@@ -232,6 +247,7 @@ impl WebTradeBarBuilder {
             pending: BTreeMap::new(),
             emitted: BTreeSet::new(),
             covered_through_us: None,
+            latest_source_observation: None,
             complete_sessions: BTreeSet::new(),
             resume_boundary_sessions: BTreeMap::new(),
             safe_resume_boundary_sessions: BTreeSet::new(),
@@ -252,6 +268,10 @@ impl WebTradeBarBuilder {
 
     pub fn covered_through_us(&self) -> Option<u64> {
         self.covered_through_us
+    }
+
+    pub fn latest_source_observation(&self) -> Option<SourceObservation> {
+        self.latest_source_observation
     }
 
     pub fn ingest(&mut self, topic: &str, bytes: &[u8]) -> Result<Vec<MarketBar>> {
@@ -301,6 +321,7 @@ impl WebTradeBarBuilder {
                     received_timestamp_us: event.received_us(),
                     bars: Vec::new(),
                     completion: None,
+                    source_observation: None,
                     quarantine_reason: self
                         .quarantined_sequences
                         .contains(&event.sequence())
@@ -333,33 +354,40 @@ impl WebTradeBarBuilder {
                 received_timestamp_us: event.received_us(),
                 bars: Vec::new(),
                 completion: None,
+                source_observation: None,
                 quarantine_reason: Some("OUTSIDE_REVIEWED_A_SHARE_SESSION".to_owned()),
             });
         }
 
-        let (bars, completion) = match &event {
+        let (bars, completion, source_observation) = match &event {
             StreamEvent::Trade(tick) => {
                 self.apply_trade(tick)?;
-                (Vec::new(), None)
+                (Vec::new(), None, None)
             }
             StreamEvent::Status(status) => {
-                let previous_covered_through_us = self.covered_through_us;
-                let kind = match status.status.as_str() {
-                    "SESSION_HISTORY_COMPLETE" => SourceCompletionKind::SessionHistoryComplete,
-                    "SESSION_RESUME_BOUNDARY" => SourceCompletionKind::SessionResumeBoundary,
-                    "LIVE_CONTIGUOUS" => SourceCompletionKind::LiveContiguous,
-                    _ => bail!("market source status has an invalid completion kind"),
-                };
-                (
-                    self.apply_status(status)?,
-                    Some(SourceCompletion {
-                        source_sequence: status.sequence,
-                        session_date: status.session_date,
-                        kind,
-                        previous_covered_through_us,
-                        covered_through_us: status.covered_through_us,
-                    }),
-                )
+                if status.status == "SOURCE_OBSERVED_CURRENT" {
+                    let observation = self.apply_source_observation(status)?;
+                    (Vec::new(), None, Some(observation))
+                } else {
+                    let previous_covered_through_us = self.covered_through_us;
+                    let kind = match status.status.as_str() {
+                        "SESSION_HISTORY_COMPLETE" => SourceCompletionKind::SessionHistoryComplete,
+                        "SESSION_RESUME_BOUNDARY" => SourceCompletionKind::SessionResumeBoundary,
+                        "LIVE_CONTIGUOUS" => SourceCompletionKind::LiveContiguous,
+                        _ => bail!("market source status has an invalid completion kind"),
+                    };
+                    (
+                        self.apply_status(status)?,
+                        Some(SourceCompletion {
+                            source_sequence: status.sequence,
+                            session_date: status.session_date,
+                            kind,
+                            previous_covered_through_us,
+                            covered_through_us: status.covered_through_us,
+                        }),
+                        None,
+                    )
+                }
             }
         };
         self.source_instance_id = Some(event.source_instance_id());
@@ -371,6 +399,7 @@ impl WebTradeBarBuilder {
             received_timestamp_us: event.received_us(),
             bars,
             completion,
+            source_observation,
             quarantine_reason: None,
         })
     }
@@ -453,6 +482,12 @@ impl WebTradeBarBuilder {
             self.safe_resume_boundary_sessions
                 .remove(&status.session_date);
             self.covered_through_us = Some(status.covered_through_us);
+            if self
+                .latest_source_observation
+                .is_some_and(|observation| observation.session_date != status.session_date)
+            {
+                self.latest_source_observation = None;
+            }
             return Ok(Vec::new());
         }
         let completed_ends = self
@@ -488,8 +523,58 @@ impl WebTradeBarBuilder {
         self.covered_through_us = Some(status.covered_through_us);
         if status.status == "SESSION_HISTORY_COMPLETE" {
             self.complete_sessions.insert(status.session_date);
+            if self
+                .latest_source_observation
+                .is_some_and(|observation| observation.session_date != status.session_date)
+            {
+                self.latest_source_observation = None;
+            }
         }
         Ok(bars)
+    }
+
+    fn apply_source_observation(&mut self, status: &SourceStatus) -> Result<SourceObservation> {
+        let observed_at_us = status
+            .observed_at_us
+            .context("source observation lacks its observed clock")?;
+        if status.timestamp_us != observed_at_us || status.received_us != observed_at_us {
+            bail!("source observation clock is not atomically bound to its receipt")
+        }
+        if self.covered_through_us != Some(status.covered_through_us) {
+            bail!("source observation changed or disagrees with the trade coverage watermark")
+        }
+        if status.latest_displayed_trade_us != Some(status.covered_through_us) {
+            bail!("source observation latest displayed trade disagrees with durable coverage")
+        }
+        match self
+            .latest_source_observation
+            .map(|observation| observation.observed_at_us)
+        {
+            Some(previous)
+                if status.declared_previous_observed_at_us != Some(previous)
+                    || observed_at_us <= previous =>
+            {
+                bail!("source observation does not strictly continue its declared predecessor")
+            }
+            None if status.declared_previous_observed_at_us.is_some() => {
+                bail!("first source observation declared a nonexistent predecessor")
+            }
+            _ => {}
+        }
+        if shanghai_datetime(observed_at_us)?.date() != status.session_date
+            || shanghai_datetime(status.covered_through_us)?.date() != status.session_date
+        {
+            bail!("source observation disagrees with its session date")
+        }
+        let observation = SourceObservation {
+            source_sequence: status.sequence,
+            session_date: status.session_date,
+            previous_observed_at_us: status.declared_previous_observed_at_us,
+            observed_at_us,
+            covered_through_us: status.covered_through_us,
+        };
+        self.latest_source_observation = Some(observation);
+        Ok(observation)
     }
 }
 
@@ -501,16 +586,25 @@ fn validate_event_integrity_before_disposition(
         bail!("market event timestamp is later than its source capture clock")
     }
     if let StreamEvent::Status(status) = event {
-        if status.timestamp_us != status.covered_through_us
-            || !matches!(
-                status.status.as_str(),
-                "SESSION_HISTORY_COMPLETE" | "SESSION_RESUME_BOUNDARY" | "LIVE_CONTIGUOUS"
-            )
-        {
-            bail!("market source status has an invalid completion watermark")
-        }
-        if shanghai_datetime(status.covered_through_us)?.date() != status.session_date {
-            bail!("market source watermark disagrees with its session date")
+        if status.status == "SOURCE_OBSERVED_CURRENT" {
+            if status.observed_at_us != Some(status.timestamp_us)
+                || status.received_us != status.timestamp_us
+                || status.covered_through_us > status.timestamp_us
+            {
+                bail!("market source observation has invalid clock evidence")
+            }
+        } else {
+            if status.timestamp_us != status.covered_through_us
+                || !matches!(
+                    status.status.as_str(),
+                    "SESSION_HISTORY_COMPLETE" | "SESSION_RESUME_BOUNDARY" | "LIVE_CONTIGUOUS"
+                )
+            {
+                bail!("market source status has an invalid completion watermark")
+            }
+            if shanghai_datetime(status.covered_through_us)?.date() != status.session_date {
+                bail!("market source watermark disagrees with its session date")
+            }
         }
     }
     Ok(())
@@ -691,6 +785,11 @@ fn parse_event(topic: &str, bytes: &[u8], venue: &str, symbol: &str) -> Result<S
             let covered_from_us = optional_u64_field(payload, "covered_from_us")?;
             let declared_previous_covered_through_us =
                 optional_u64_field(payload, "previous_covered_through_us")?;
+            let declared_previous_observed_at_us =
+                optional_u64_field(payload, "previous_observed_at_us")?;
+            let observed_at_us = optional_u64_field(payload, "observed_at_us")?;
+            let latest_displayed_trade_us =
+                optional_u64_field(payload, "latest_displayed_trade_us")?;
             let page_index = optional_u64_field(payload, "page_index")?;
             let page_count = optional_u64_field(payload, "page_count")?;
             let row_count = optional_u64_field(payload, "row_count")?;
@@ -717,6 +816,22 @@ fn parse_event(topic: &str, bytes: &[u8], venue: &str, symbol: &str) -> Result<S
             {
                 bail!("session resume boundary lacks its exact reviewed partial-session proof")
             }
+            if status == "SOURCE_OBSERVED_CURRENT"
+                && (signed_legacy
+                    || observed_at_us != Some(timestamp_us)
+                    || received_us != timestamp_us
+                    || covered_through_us > timestamp_us
+                    || latest_displayed_trade_us != Some(covered_through_us)
+                    || shanghai_datetime(covered_through_us)?.date() != session_date
+                    || page_index != Some(1)
+                    || page_count.is_none_or(|count| count < 1)
+                    || row_count.is_none_or(|count| count < 1)
+                    || policy.as_deref() != Some(SOURCE_OBSERVATION_POLICY)
+                    || declared_previous_observed_at_us
+                        .is_some_and(|previous| previous >= timestamp_us))
+            {
+                bail!("source observation lacks its exact reviewed active-page proof")
+            }
             Ok(StreamEvent::Status(SourceStatus {
                 sequence,
                 event_id: event_id.to_owned(),
@@ -727,6 +842,9 @@ fn parse_event(topic: &str, bytes: &[u8], venue: &str, symbol: &str) -> Result<S
                 status,
                 declared_previous_covered_through_us,
                 covered_through_us,
+                declared_previous_observed_at_us,
+                observed_at_us,
+                latest_displayed_trade_us,
                 signed_legacy,
             }))
         }

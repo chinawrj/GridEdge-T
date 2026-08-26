@@ -73,7 +73,8 @@ test("content collector serializes manual, mutation, stability, and retry scans"
   const content = Object.fromEntries(sources)["src/content.js"];
   assert.match(content, /GRIDEDGE_SCAN_NOW/);
   assert.match(content, /createSingleFlightRunner\(scanOnce,\s*\{/);
-  assert.match(content, /queued === "manual" \|\| incoming === "manual" \? "manual" : incoming/);
+  assert.match(content, /queued === "manual" \|\| incoming === "manual"/);
+  assert.match(content, /queued === "heartbeat" \|\| incoming === "heartbeat"/);
   assert.match(content, /requestScan\("manual"\)/);
   assert.match(content, /requestScan\("mutation"\)/);
   assert.match(content, /observer\.observe\(document\.documentElement,\s*\{[\s\S]*childList:\s*true,[\s\S]*characterData:\s*true,[\s\S]*subtree:\s*true,[\s\S]*\}\)/);
@@ -83,6 +84,16 @@ test("content collector serializes manual, mutation, stability, and retry scans"
   assert.match(content, /cycleLatestFirstControl/);
   assert.match(content, /maxRefreshAttempts:\s*3/);
   assert.match(content, /captured_at_us: 0/);
+});
+
+test("content collector publishes only an actively refreshed bounded source observation", () => {
+  const content = Object.fromEntries(sources)["src/content.js"];
+  assert.match(content, /SCAN_HEARTBEAT_MS\s*=\s*30_000/);
+  assert.match(content, /installSourceHeartbeat\(requestScan/);
+  assert.match(content, /captureSourceObservation\(/);
+  assert.match(content, /refreshLatestFirst,/);
+  assert.match(content, /ACTIVE_REVIEWED_LATEST_FIRST_CYCLE_V1/);
+  assert.match(content, /shouldDeliverCapture\(reason, captureHash, lastDeliveredRowsetHash\)/);
 });
 
 test("content collector retries only the reviewed transient DOM order mismatch", () => {

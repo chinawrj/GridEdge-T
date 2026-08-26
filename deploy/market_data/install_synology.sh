@@ -163,6 +163,61 @@ for migration in "$MARKET_ROOT"/app/postgres/migrations/*.sql; do
   fi
 done
 
+# Establish the exact persistent consumer session exactly once, before the
+# first committed-capable ingestor can publish. Reusing this client id later
+# would drain an existing offline backlog, so the durable marker forbids it.
+prime_marker="$MARKET_ROOT/data/committed-consumer-002256.genesis-v1"
+prime_marker_content='gridedge-paper-committed-002256 31536000 QoS1 trade,status'
+if [ -e "$prime_marker" ]; then
+  if [ ! -f "$prime_marker" ] || [ "$(cat "$prime_marker")" != "$prime_marker_content" ]; then
+    echo "committed consumer genesis marker is malformed; refusing to re-prime" >&2
+    exit 1
+  fi
+else
+  "$REMOTE_DOCKER" stop gridedge-market-ingestor >/dev/null 2>&1 || true
+  persistence_before=$($REMOTE_DOCKER exec gridedge-market-mqtt \
+    sh -c "stat -c '%Y:%s' /mosquitto/data/mosquitto.db 2>/dev/null || echo absent")
+  set +e
+  prime_output=$($REMOTE_DOCKER exec gridedge-market-mqtt mosquitto_sub \
+    -V mqttv5 -h 127.0.0.1 -p 8883 --insecure \
+    --cafile /mosquitto/config/tls/ca.crt \
+    -u gridedge-publisher \
+    -P "$(cat "$MARKET_ROOT/secrets/mqtt-publisher.password")" \
+    -i gridedge-paper-committed-002256 -c -x 31536000 -q 1 \
+    -t gridedge/market-committed/v1/XSHE/002256/trade \
+    -t gridedge/market-committed/v1/XSHE/002256/status \
+    -d -W 1 2>&1)
+  prime_status=$?
+  set -e
+  if { [ "$prime_status" -ne 0 ] && [ "$prime_status" -ne 27 ]; } ||
+    ! printf '%s\n' "$prime_output" | grep -F 'Subscribed (mid: 1): 1, 1' >/dev/null; then
+    printf '%s\n' "$prime_output" >&2
+    echo "failed to establish the committed market consumer genesis session" >&2
+    exit 1
+  fi
+  sleep 1
+  "$REMOTE_DOCKER" kill --signal USR1 gridedge-market-mqtt >/dev/null
+  persistence_after=$persistence_before
+  attempt=0
+  while [ "$attempt" -lt 20 ]; do
+    persistence_after=$($REMOTE_DOCKER exec gridedge-market-mqtt \
+      sh -c "stat -c '%Y:%s' /mosquitto/data/mosquitto.db 2>/dev/null || echo absent")
+    [ "$persistence_after" != "$persistence_before" ] && break
+    attempt=$((attempt + 1))
+    sleep 1
+  done
+  if [ "$persistence_after" = "$persistence_before" ] || [ "$persistence_after" = absent ]; then
+    echo "Mosquitto did not durably flush the committed consumer session" >&2
+    exit 1
+  fi
+  umask 077
+  prime_marker_tmp="$prime_marker.tmp.$$"
+  printf '%s\n' "$prime_marker_content" > "$prime_marker_tmp"
+  chmod 600 "$prime_marker_tmp"
+  mv -f "$prime_marker_tmp" "$prime_marker"
+  sync
+fi
+
 # The ingestor uses a deliberately explicit paho loop and does not silently
 # reconnect after a broker process replacement. Recreate it after MQTT so a
 # healthy-but-unsubscribed old container cannot acknowledge no market data.

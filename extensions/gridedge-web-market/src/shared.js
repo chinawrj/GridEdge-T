@@ -128,7 +128,7 @@
     return weekday !== 0 && weekday !== 6 && !A_SHARE_2026_CLOSED_WEEKDAYS.has(sessionDate);
   }
 
-  function validateCaptureTiming(capture, nowUs = unixMicrosNow()) {
+  function validateSourceObservationTiming(capture, nowUs = unixMicrosNow()) {
     if (!capture || !Number.isSafeInteger(capture.captured_at_us) ||
         !/^\d{4}-\d{2}-\d{2}$/.test(capture.session_date) ||
         !Array.isArray(capture.rows) || capture.rows.length === 0) {
@@ -160,7 +160,14 @@
     if (ageUs < 0) {
       throw new Error("capture latest row is later than its capture clock");
     }
-    if (ageUs > 60_000_000) {
+    return capture;
+  }
+
+  function validateCaptureTiming(capture, nowUs = unixMicrosNow()) {
+    validateSourceObservationTiming(capture, nowUs);
+    const latestTradeUs = Math.max(...capture.rows.map((row) =>
+      eventTimeUs(capture.session_date, row.source_trade_time)));
+    if (capture.captured_at_us - latestTradeUs > 60_000_000) {
       throw new Error("capture latest row is stale");
     }
     return capture;
@@ -182,5 +189,6 @@
     strictPositiveDecimal,
     unixMicrosNow,
     validateCaptureTiming,
+    validateSourceObservationTiming,
   };
 });

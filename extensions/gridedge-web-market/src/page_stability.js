@@ -79,6 +79,17 @@
     }
   }
 
+  async function captureSourceObservation({
+    refreshLatestFirst,
+    captureStableFirstPage,
+    validateObservationTiming,
+  }) {
+    await refreshLatestFirst();
+    const stable = await captureStableFirstPage(1);
+    validateObservationTiming(stable.capture);
+    return stable;
+  }
+
   async function cycleLatestFirstControl({
     readControl,
     delay,
@@ -103,6 +114,20 @@
     await waitFor(true);
   }
 
+  async function waitForReviewedRowsetEffect({
+    previousRowsetHash,
+    readRowsetHash,
+    delay,
+    maxAttempts,
+  }) {
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      const currentRowsetHash = await readRowsetHash();
+      if (currentRowsetHash !== previousRowsetHash) return;
+      if (attempt + 1 < maxAttempts) await delay();
+    }
+    throw new Error("Eastmoney latest-first cycle did not produce a reviewed rowset effect");
+  }
+
   function createSingleFlightRunner(run, { mergeReason = (_queued, incoming) => incoming } = {}) {
     let inFlight = null;
     let queuedReason = null;
@@ -124,6 +149,21 @@
         return inFlight;
       },
     };
+  }
+
+  function shouldDeliverCapture(reason, captureHash, lastDeliveredRowsetHash) {
+    return captureHash !== lastDeliveredRowsetHash ||
+      reason === "manual";
+  }
+
+  function installSourceHeartbeat(requestScan, {
+    intervalMs,
+    scheduleEvery = setInterval,
+  }) {
+    if (!Number.isSafeInteger(intervalMs) || intervalMs <= 0 || intervalMs > 60_000) {
+      throw new Error("source heartbeat interval must be within the live watermark bound");
+    }
+    return scheduleEvery(() => requestScan("heartbeat"), intervalMs);
   }
 
   function createRetriableInitializer(initialize, {
@@ -222,12 +262,16 @@
 
   return {
     captureInitialPageWithRefresh,
+    captureSourceObservation,
     captureStablePage,
     completeProvisionalInitialization,
     createRetriableInitializer,
     createSingleFlightRunner,
     cycleLatestFirstControl,
+    installSourceHeartbeat,
     readCaptureWithRetry,
     refreshStaleFirstPage,
+    shouldDeliverCapture,
+    waitForReviewedRowsetEffect,
   };
 });

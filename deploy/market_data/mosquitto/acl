@@ -4,8 +4,10 @@ topic write gridedge/market/v1/#
 # consumer. It can read market facts but has no order, ledger, or UI topic.
 topic read gridedge/market/v1/#
 topic read gridedge/market-ack/v1/#
+topic read gridedge/market-committed/v1/#
 
 user gridedge-ingestor
 topic read gridedge/market/v1/#
 topic write gridedge/market-ack/v1/#
+topic write gridedge/market-committed/v1/#
 topic read $SYS/broker/#

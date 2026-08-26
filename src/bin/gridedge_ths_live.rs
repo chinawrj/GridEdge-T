@@ -193,9 +193,12 @@ fn run() -> Result<()> {
     } else {
         Some(0)
     };
+    let mut latest_reviewed_completion_received_at_us = None;
     service.enter_market_data_recovery("EASTMONEY_SESSION_HISTORY_BACKFILL")?;
     for bar in bars.values() {
-        service.on_bar(bar)?;
+        if is_executable_strategy_bar(bar) {
+            service.on_bar(bar)?;
+        }
     }
     for bar in recovered_completed_bars {
         process_market_recovery_bar(&args.bar_log, &mut bars, &mut service, bar)?;
@@ -207,7 +210,7 @@ fn run() -> Result<()> {
         &args.market_mqtt_username,
         &args.market_mqtt_password_file,
         &args.market_mqtt_ca_file,
-        &format!("gridedge-paper-{quote_symbol}"),
+        &format!("gridedge-paper-committed-{quote_symbol}"),
         venue,
         quote_symbol,
     )?;
@@ -224,6 +227,22 @@ fn run() -> Result<()> {
             return Ok(());
         }
         let Some(message) = market.receive(StdDuration::from_secs(args.poll_seconds))? else {
+            let now = Local::now().naive_local();
+            if is_market_session(now)
+                && source_observation_timeout_requires_recovery(
+                    service.state.mode,
+                    preferred_market_liveness_watermark(
+                        builder
+                            .latest_source_observation()
+                            .map(|observation| observation.observed_at_us),
+                        latest_reviewed_completion_received_at_us,
+                    ),
+                    now,
+                    args.maximum_unchanged_seconds,
+                )?
+            {
+                service.enter_market_data_recovery("EASTMONEY_SOURCE_OBSERVATION_TIMEOUT")?;
+            }
             continue;
         };
         append_json_line(
@@ -242,24 +261,26 @@ fn run() -> Result<()> {
         market_timestamp_not_future(receipt.received_timestamp_us, now, "market receipt")?;
         let date = now.date();
         let released_bar_count = receipt.bars.len();
-        let completion_current = receipt
-            .completion
-            .map(|completion| {
-                market_watermark_is_current(
-                    Some(completion.covered_through_us),
+        let received_source_observation = receipt.source_observation.is_some();
+        let source_observation_gate = builder
+            .latest_source_observation()
+            .map(|observation| {
+                let current = market_watermark_is_current(
+                    Some(observation.observed_at_us),
                     now,
                     args.maximum_unchanged_seconds,
-                )
-                .map(|current| (completion, current))
-            })
-            .transpose()?;
-        let completion_gate = completion_current
-            .map(|(completion, current)| {
+                )?;
                 let previous_current = market_watermarks_are_contiguous(
-                    completion.previous_covered_through_us,
-                    completion.covered_through_us,
+                    observation.previous_observed_at_us,
+                    observation.observed_at_us,
                     args.maximum_unchanged_seconds,
                 )?;
+                Ok::<_, anyhow::Error>((observation, current, previous_current))
+            })
+            .transpose()?;
+        let completion_gate = receipt
+            .completion
+            .map(|completion| {
                 let released_bars_current = receipt
                     .bars
                     .iter()
@@ -269,23 +290,72 @@ fn run() -> Result<()> {
                     .collect::<Result<Vec<_>>>()?
                     .into_iter()
                     .all(std::convert::identity);
+                let (current, previous_current, observation_matches_today) =
+                    source_observation_gate
+                        .map(|(observation, current, previous_current)| {
+                            Ok::<_, anyhow::Error>((
+                                current,
+                                previous_current,
+                                observation.session_date == date,
+                            ))
+                        })
+                        .unwrap_or_else(|| {
+                            Ok((
+                                market_watermark_is_current(
+                                    Some(completion.covered_through_us),
+                                    now,
+                                    args.maximum_unchanged_seconds,
+                                )?,
+                                market_watermarks_are_contiguous(
+                                    completion.previous_covered_through_us,
+                                    completion.covered_through_us,
+                                    args.maximum_unchanged_seconds,
+                                )?,
+                                completion.session_date == date,
+                            ))
+                        })?;
                 Ok::<_, anyhow::Error>((
                     completion,
                     current,
                     previous_current,
+                    observation_matches_today,
                     released_bars_current,
                 ))
             })
             .transpose()?;
-        if let Some((completion, current, previous_current, released_bars_current)) =
-            completion_gate
+        if let Some((
+            completion,
+            current,
+            previous_current,
+            observation_matches_today,
+            released_bars_current,
+        )) = completion_gate
+        {
+            latest_reviewed_completion_received_at_us = reviewed_completion_liveness_watermark(
+                latest_reviewed_completion_received_at_us,
+                completion.kind == SourceCompletionKind::LiveContiguous,
+                current,
+                previous_current,
+                completion.session_date == date && observation_matches_today,
+                released_bar_count,
+                released_bars_current,
+                receipt.received_timestamp_us,
+            );
+        }
+        if let Some((
+            completion,
+            current,
+            previous_current,
+            observation_matches_today,
+            released_bars_current,
+        )) = completion_gate
         {
             if completion_requires_recovery(
                 service.state.mode,
                 completion.kind == SourceCompletionKind::LiveContiguous,
                 current,
                 previous_current,
-                completion.session_date == date,
+                completion.session_date == date && observation_matches_today,
                 released_bar_count,
                 released_bars_current,
             ) {
@@ -312,15 +382,20 @@ fn run() -> Result<()> {
                 process_market_recovery_bar(&args.bar_log, &mut bars, &mut service, bar)?;
             }
         }
-        if let Some((completion, current, previous_current, released_bars_current)) =
-            completion_gate
+        if let Some((
+            completion,
+            current,
+            previous_current,
+            observation_matches_today,
+            released_bars_current,
+        )) = completion_gate
         {
             if completion_allows_resume(
                 service.state.mode,
                 completion.kind == SourceCompletionKind::LiveContiguous,
                 current,
                 previous_current,
-                completion.session_date == date,
+                completion.session_date == date && observation_matches_today,
                 released_bar_count,
                 released_bars_current,
             ) && market_session_boundary_allows_resume(
@@ -336,7 +411,47 @@ fn run() -> Result<()> {
                     now,
                     driver.as_mut(),
                     &mut service,
+                    preferred_market_liveness_watermark(
+                        builder
+                            .latest_source_observation()
+                            .map(|observation| observation.observed_at_us),
+                        latest_reviewed_completion_received_at_us,
+                    )
+                    .context("reviewed completion resume lacks a liveness watermark")?,
                 )?;
+            }
+        }
+        if received_source_observation {
+            if let Some((observation, current, previous_current)) = source_observation_gate {
+                if source_observation_requires_recovery(
+                    service.state.mode,
+                    current,
+                    previous_current,
+                    observation.session_date == date,
+                ) {
+                    service.enter_market_data_recovery("EASTMONEY_SOURCE_OBSERVATION_CATCHUP")?;
+                }
+                if source_observation_allows_resume(
+                    service.state.mode,
+                    current,
+                    previous_current,
+                    observation.session_date == date,
+                ) && market_session_boundary_allows_resume(
+                    builder.has_complete_session(date),
+                    builder.partial_session_resume_is_safe(date),
+                    args.allow_partial_session_resume_boundary,
+                ) && is_market_session(now)
+                {
+                    resume_after_market_data_recovery(
+                        &args,
+                        Path::new(&config.database),
+                        &mut initial_after_sequence,
+                        now,
+                        driver.as_mut(),
+                        &mut service,
+                        observation.observed_at_us,
+                    )?;
+                }
             }
         }
     }
@@ -674,11 +789,32 @@ fn resume_after_market_data_recovery(
     now: NaiveDateTime,
     driver: &mut dyn SimulationUiDriver,
     service: &mut GridAutomationService,
+    liveness_watermark_us: u64,
 ) -> Result<()> {
     reconcile_terminal_boundary(args, source_database, initial_after_sequence, now, driver)?;
+    let post_audit_now = Local::now().naive_local();
+    if !is_market_session(post_audit_now)
+        || !market_watermark_is_current(
+            Some(liveness_watermark_us),
+            post_audit_now,
+            args.maximum_unchanged_seconds,
+        )?
+    {
+        return Ok(());
+    }
     let reconciliation = service.reconcile()?;
     if !reconciliation.matched {
         bail!("market-data recovery cannot resume before Paper reconciliation matches")
+    }
+    let pre_resume_now = Local::now().naive_local();
+    if !is_market_session(pre_resume_now)
+        || !market_watermark_is_current(
+            Some(liveness_watermark_us),
+            pre_resume_now,
+            args.maximum_unchanged_seconds,
+        )?
+    {
+        return Ok(());
     }
     service.resume_after_reconciliation(
         "Eastmoney complete source watermark and Paper/remote terminal audit matched",
@@ -1199,6 +1335,71 @@ fn completion_allows_resume(
         && session_matches_today
         && released_bar_count <= 1
         && released_bars_are_current
+}
+
+fn source_observation_requires_recovery(
+    mode: gridedge_t::domain::ServiceMode,
+    observation_is_current: bool,
+    previous_observation_is_contiguous: bool,
+    session_matches_today: bool,
+) -> bool {
+    mode == gridedge_t::domain::ServiceMode::Running
+        && (!observation_is_current
+            || !previous_observation_is_contiguous
+            || !session_matches_today)
+}
+
+fn source_observation_allows_resume(
+    mode: gridedge_t::domain::ServiceMode,
+    observation_is_current: bool,
+    previous_observation_is_contiguous: bool,
+    session_matches_today: bool,
+) -> bool {
+    mode == gridedge_t::domain::ServiceMode::ReadOnly
+        && observation_is_current
+        && previous_observation_is_contiguous
+        && session_matches_today
+}
+
+fn source_observation_timeout_requires_recovery(
+    mode: gridedge_t::domain::ServiceMode,
+    observed_at_us: Option<u64>,
+    now: NaiveDateTime,
+    maximum_age_seconds: i64,
+) -> Result<bool> {
+    Ok(mode == gridedge_t::domain::ServiceMode::Running
+        && !market_watermark_is_current(observed_at_us, now, maximum_age_seconds)?)
+}
+
+fn preferred_market_liveness_watermark(
+    observed_at_us: Option<u64>,
+    reviewed_completion_received_at_us: Option<u64>,
+) -> Option<u64> {
+    observed_at_us.or(reviewed_completion_received_at_us)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reviewed_completion_liveness_watermark(
+    previous_received_at_us: Option<u64>,
+    completion_is_live: bool,
+    completion_is_current: bool,
+    previous_completion_is_contiguous: bool,
+    session_matches_today: bool,
+    released_bar_count: usize,
+    released_bars_are_current: bool,
+    source_received_at_us: u64,
+) -> Option<u64> {
+    if completion_is_live
+        && completion_is_current
+        && previous_completion_is_contiguous
+        && session_matches_today
+        && released_bar_count <= 1
+        && released_bars_are_current
+    {
+        Some(source_received_at_us)
+    } else {
+        previous_received_at_us
+    }
 }
 
 fn market_session_boundary_allows_resume(

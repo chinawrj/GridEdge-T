@@ -189,6 +189,67 @@ mod live_subject {
         )
     }
 
+    pub(super) fn source_observation_recovery_decision(
+        mode: gridedge_t::domain::ServiceMode,
+        observation_is_current: bool,
+        previous_observation_is_contiguous: bool,
+        session_matches_today: bool,
+    ) -> (bool, bool) {
+        (
+            source_observation_requires_recovery(
+                mode,
+                observation_is_current,
+                previous_observation_is_contiguous,
+                session_matches_today,
+            ),
+            source_observation_allows_resume(
+                mode,
+                observation_is_current,
+                previous_observation_is_contiguous,
+                session_matches_today,
+            ),
+        )
+    }
+
+    pub(super) fn source_observation_timeout_decision(
+        mode: gridedge_t::domain::ServiceMode,
+        observed_at_us: Option<u64>,
+        now: chrono::NaiveDateTime,
+        maximum_age_seconds: i64,
+    ) -> anyhow::Result<bool> {
+        source_observation_timeout_requires_recovery(mode, observed_at_us, now, maximum_age_seconds)
+    }
+
+    pub(super) fn preferred_liveness(
+        observed_at_us: Option<u64>,
+        reviewed_completion_received_at_us: Option<u64>,
+    ) -> Option<u64> {
+        preferred_market_liveness_watermark(observed_at_us, reviewed_completion_received_at_us)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn update_reviewed_completion_liveness(
+        previous_received_at_us: Option<u64>,
+        completion_is_live: bool,
+        completion_is_current: bool,
+        previous_completion_is_contiguous: bool,
+        session_matches_today: bool,
+        released_bar_count: usize,
+        released_bars_are_current: bool,
+        source_received_at_us: u64,
+    ) -> Option<u64> {
+        reviewed_completion_liveness_watermark(
+            previous_received_at_us,
+            completion_is_live,
+            completion_is_current,
+            previous_completion_is_contiguous,
+            session_matches_today,
+            released_bar_count,
+            released_bars_are_current,
+            source_received_at_us,
+        )
+    }
+
     pub(super) fn session_gate(
         has_complete_history: bool,
         has_resume_boundary: bool,
@@ -250,7 +311,7 @@ fn every_unknown_nonterminal_contract_blocks_before_market_or_order_ui() {
 }
 
 #[test]
-fn launch_agent_starts_only_weekdays_at_0925_and_restarts_only_failures() {
+fn launch_agent_starts_only_weekdays_at_0900_and_restarts_only_failures() {
     let plist = std::fs::read_to_string("deploy/com.gridedge.ths-sim.plist")
         .expect("reviewed launch-agent template");
 
@@ -268,7 +329,7 @@ fn launch_agent_starts_only_weekdays_at_0925_and_restarts_only_failures() {
     );
     assert_eq!(
         plist
-            .matches("<key>Minute</key><integer>25</integer>")
+            .matches("<key>Minute</key><integer>0</integer>")
             .count(),
         5
     );
@@ -1814,6 +1875,156 @@ fn startup_backfill_stays_read_only_without_ui_until_the_live_watermark_is_curre
 }
 
 #[test]
+fn startup_durable_bar_replay_never_applies_non_executable_session_boundaries() {
+    let source = std::fs::read_to_string("src/bin/gridedge_ths_live.rs")
+        .expect("reviewed deployment orchestrator source");
+    let replay = source
+        .split_once("for bar in bars.values() {")
+        .expect("startup durable-bar replay")
+        .1
+        .split_once("for bar in recovered_completed_bars {")
+        .expect("startup reconstructed-bar replay")
+        .0;
+
+    assert!(
+        replay.contains("if is_executable_strategy_bar(bar)"),
+        "the durable bar log may contain the 11:30/15:00 completion boundary, which must not be sent to the strategy ledger"
+    );
+    assert_eq!(replay.matches("service.on_bar(bar)?").count(), 1);
+}
+
+#[test]
+fn rolling_upgrade_uses_a_fresh_contiguous_completion_until_source_observations_arrive() {
+    let source = std::fs::read_to_string("src/bin/gridedge_ths_live.rs")
+        .expect("reviewed deployment orchestrator source");
+    let gate = source
+        .split_once("let completion_gate = receipt")
+        .expect("completion liveness gate")
+        .1
+        .split_once("if let Some((")
+        .expect("completion liveness gate end")
+        .0;
+
+    assert!(gate.contains("completion.covered_through_us"));
+    assert!(gate.contains("completion.previous_covered_through_us"));
+    assert!(gate.contains("market_watermark_is_current("));
+    assert!(gate.contains("market_watermarks_are_contiguous("));
+    assert!(gate.contains("source_observation_gate"));
+    assert!(
+        gate.contains(".map(|(observation, current, previous_current)|"),
+        "a present source observation must remain the preferred liveness evidence"
+    );
+}
+
+#[test]
+fn rolling_upgrade_silence_prefers_observation_and_temporarily_falls_back_to_completion() {
+    assert_eq!(
+        live_subject::preferred_liveness(None, Some(59)),
+        Some(59),
+        "before the first source observation, the committed completion is the liveness clock"
+    );
+    assert_eq!(
+        live_subject::preferred_liveness(Some(41), Some(59)),
+        Some(41),
+        "once an observation exists, a newer completion must never mask a stale observation"
+    );
+    assert_eq!(live_subject::preferred_liveness(None, None), None);
+}
+
+#[test]
+fn rolling_upgrade_liveness_uses_only_the_received_clock_of_a_fully_reviewed_live_completion(
+) -> Result<()> {
+    let to_us = |timestamp: NaiveDateTime| {
+        u64::try_from(
+            (timestamp - chrono::Duration::hours(8))
+                .and_utc()
+                .timestamp_micros(),
+        )
+        .expect("positive reviewed timestamp")
+    };
+    let coverage = to_us(at("2026-08-26 14:57:00"));
+    let source_received = to_us(at("2026-08-26 14:57:39"));
+
+    let reviewed = live_subject::update_reviewed_completion_liveness(
+        None,
+        true,
+        true,
+        true,
+        true,
+        1,
+        true,
+        source_received,
+    );
+    assert_eq!(reviewed, Some(source_received));
+    assert_ne!(reviewed, Some(coverage));
+    assert!(!live_subject::source_observation_timeout_decision(
+        gridedge_t::domain::ServiceMode::Running,
+        live_subject::preferred_liveness(None, reviewed),
+        at("2026-08-26 14:58:06"),
+        60,
+    )?);
+    assert!(live_subject::source_observation_timeout_decision(
+        gridedge_t::domain::ServiceMode::Running,
+        live_subject::preferred_liveness(None, reviewed),
+        at("2026-08-26 14:58:40"),
+        60,
+    )?);
+
+    for invalid in [
+        (false, true, true, true, 1, true),
+        (true, false, true, true, 1, true),
+        (true, true, false, true, 1, true),
+        (true, true, true, false, 1, true),
+        (true, true, true, true, 2, true),
+        (true, true, true, true, 1, false),
+    ] {
+        assert_eq!(
+            live_subject::update_reviewed_completion_liveness(
+                Some(7),
+                invalid.0,
+                invalid.1,
+                invalid.2,
+                invalid.3,
+                invalid.4,
+                invalid.5,
+                source_received,
+            ),
+            Some(7),
+            "history, stale, gapped, cross-day, multi-bar, or stale-bar receipts must not refresh liveness",
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn recovery_rechecks_liveness_after_the_terminal_ui_audit_before_resuming() {
+    let source = std::fs::read_to_string("src/bin/gridedge_ths_live.rs")
+        .expect("reviewed deployment orchestrator source");
+    let resume = source
+        .split_once("fn resume_after_market_data_recovery(")
+        .expect("recovery resume function")
+        .1
+        .split_once("#[cfg(test)]")
+        .expect("recovery resume function end")
+        .0;
+    let audit = resume
+        .find("reconcile_terminal_boundary(")
+        .expect("terminal UI audit");
+    let fresh_now = resume[audit..]
+        .find("Local::now().naive_local()")
+        .expect("fresh clock after terminal UI audit")
+        + audit;
+    let liveness = resume[fresh_now..]
+        .find("market_watermark_is_current(")
+        .expect("post-audit liveness recheck")
+        + fresh_now;
+    let durable_resume = resume
+        .find("service.reconcile()")
+        .expect("durable reconciliation before resume");
+    assert!(audit < fresh_now && fresh_now < liveness && liveness < durable_resume);
+}
+
+#[test]
 fn recovery_watermark_rejects_stale_and_future_completion() -> Result<()> {
     let now = at("2026-08-21 13:30:00");
     let to_us = |timestamp: NaiveDateTime| {
@@ -1976,6 +2187,72 @@ fn restart_replay_rejects_future_raw_evidence_and_future_durable_bars_before_use
         amount: Some(Decimal::new(33300, 2)),
     };
     assert!(live_subject::validate_recovery_bars_at(&[future_bar], frozen_start).is_err());
+    Ok(())
+}
+
+#[test]
+fn source_observation_chain_controls_availability_without_claiming_trade_coverage() {
+    use gridedge_t::domain::ServiceMode;
+
+    assert_eq!(
+        live_subject::source_observation_recovery_decision(ServiceMode::Running, true, true, true,),
+        (false, false),
+    );
+    assert_eq!(
+        live_subject::source_observation_recovery_decision(ServiceMode::Running, true, false, true,),
+        (true, false),
+    );
+    assert_eq!(
+        live_subject::source_observation_recovery_decision(ServiceMode::ReadOnly, true, true, true,),
+        (false, true),
+    );
+    assert_eq!(
+        live_subject::source_observation_recovery_decision(
+            ServiceMode::ReadOnly,
+            false,
+            true,
+            true,
+        ),
+        (false, false),
+    );
+}
+
+#[test]
+fn mqtt_silence_moves_running_to_recovery_after_the_source_observation_deadline() -> Result<()> {
+    use gridedge_t::domain::ServiceMode;
+    let now = at("2026-08-26 13:10:01");
+    let to_us = |timestamp: NaiveDateTime| {
+        u64::try_from(
+            (timestamp - chrono::Duration::hours(8))
+                .and_utc()
+                .timestamp_micros(),
+        )
+        .unwrap()
+    };
+    assert!(!live_subject::source_observation_timeout_decision(
+        ServiceMode::Running,
+        Some(to_us(at("2026-08-26 13:09:30"))),
+        now,
+        60,
+    )?);
+    assert!(live_subject::source_observation_timeout_decision(
+        ServiceMode::Running,
+        Some(to_us(at("2026-08-26 13:09:00"))),
+        now,
+        60,
+    )?);
+    assert!(live_subject::source_observation_timeout_decision(
+        ServiceMode::Running,
+        None,
+        now,
+        60,
+    )?);
+    assert!(!live_subject::source_observation_timeout_decision(
+        ServiceMode::ReadOnly,
+        None,
+        now,
+        60,
+    )?);
     Ok(())
 }
 

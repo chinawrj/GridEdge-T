@@ -150,7 +150,9 @@ async function deliverCapture(message, sender, resumeBoundary = false) {
       message.capture,
       message.capture_sha256,
     )
-    : await GridEdgeDurable.ingestCapture(database, message.capture, message.capture_sha256);
+    : await GridEdgeDurable.ingestCapture(database, message.capture, message.capture_sha256, {
+      sourceObservationPolicy: message.source_observation_policy ?? null,
+    });
   try {
     const delivery = await flushOutbox();
     return { ok: true, stored, delivery };

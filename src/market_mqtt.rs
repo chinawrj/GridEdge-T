@@ -18,7 +18,63 @@ pub struct MarketMqttMessage {
     pub payload: Vec<u8>,
 }
 
+fn validate_common_wire_contract(
+    payload: &[u8],
+    qos: QoS,
+    retained: bool,
+    content_type: Option<&str>,
+) -> Result<()> {
+    if qos != QoS::AtLeastOnce {
+        bail!("market MQTT message must use QoS 1")
+    }
+    if retained {
+        bail!("market data events must not be retained")
+    }
+    if content_type != Some("application/json") {
+        bail!("market MQTT message must declare application/json")
+    }
+    if payload.is_empty() || payload.len() > 1_048_576 {
+        bail!("market MQTT payload size is invalid")
+    }
+    Ok(())
+}
+
 impl MarketMqttMessage {
+    pub fn from_committed_wire_contract(
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        retained: bool,
+        content_type: Option<&str>,
+    ) -> Result<Self> {
+        validate_common_wire_contract(payload, qos, retained, content_type)?;
+        let suffix = topic
+            .strip_prefix("gridedge/market-committed/v1/")
+            .context("worker received a market event before its PostgreSQL commit")?;
+        let mut segments = suffix.split('/');
+        let venue = segments
+            .next()
+            .context("committed market topic lacks venue")?;
+        let symbol = segments
+            .next()
+            .context("committed market topic lacks symbol")?;
+        let kind = segments
+            .next()
+            .context("committed market topic lacks event kind")?;
+        if segments.next().is_some()
+            || !matches!(venue, "XSHE" | "XSHG")
+            || symbol.len() != 6
+            || !symbol.bytes().all(|byte| byte.is_ascii_digit())
+            || !matches!(kind, "trade" | "status")
+        {
+            bail!("committed market topic identity is invalid")
+        }
+        Ok(Self {
+            topic: format!("gridedge/market/v1/{venue}/{symbol}/{kind}"),
+            payload: payload.to_vec(),
+        })
+    }
+
     pub fn from_wire_contract(
         topic: &str,
         payload: &[u8],
@@ -26,18 +82,7 @@ impl MarketMqttMessage {
         retained: bool,
         content_type: Option<&str>,
     ) -> Result<Self> {
-        if qos != QoS::AtLeastOnce {
-            bail!("market MQTT message must use QoS 1")
-        }
-        if retained {
-            bail!("market data events must not be retained")
-        }
-        if content_type != Some("application/json") {
-            bail!("market MQTT message must declare application/json")
-        }
-        if payload.is_empty() || payload.len() > 1_048_576 {
-            bail!("market MQTT payload size is invalid")
-        }
+        validate_common_wire_contract(payload, qos, retained, content_type)?;
         Ok(Self {
             topic: topic.to_owned(),
             payload: payload.to_vec(),
@@ -104,14 +149,14 @@ impl MarketMqttClient {
             .set_transport(Transport::tls(ca, None, None))
             .set_keep_alive(Duration::from_secs(20))
             .set_clean_start(false)
-            .set_session_expiry_interval(Some(172_800));
+            .set_session_expiry_interval(Some(31_536_000));
         let (client, mut connection) = Client::new(options, 256);
         client.subscribe(
-            format!("gridedge/market/v1/{venue}/{symbol}/trade"),
+            format!("gridedge/market-committed/v1/{venue}/{symbol}/trade"),
             QoS::AtLeastOnce,
         )?;
         client.subscribe(
-            format!("gridedge/market/v1/{venue}/{symbol}/status"),
+            format!("gridedge/market-committed/v1/{venue}/{symbol}/status"),
             QoS::AtLeastOnce,
         )?;
         let (pump_receiver, pump) =
@@ -131,8 +176,18 @@ impl MarketMqttClient {
                     }
                 };
                 match event {
-                    Event::Incoming(Incoming::SubAck(_)) => {
-                        MarketMqttPumpPoll::Event(MarketMqttPumpEvent::SubscriptionAcknowledged)
+                    Event::Incoming(Incoming::SubAck(suback)) => {
+                        match suback.return_codes.as_slice() {
+                            [rumqttc::v5::mqttbytes::v5::SubscribeReasonCode::Success(
+                                QoS::AtLeastOnce,
+                            )] => MarketMqttPumpPoll::Event(
+                                MarketMqttPumpEvent::SubscriptionAcknowledged,
+                            ),
+                            _ => MarketMqttPumpPoll::Event(MarketMqttPumpEvent::Fatal(
+                                "market MQTT subscription was not granted at exact QoS 1"
+                                    .to_owned(),
+                            )),
+                        }
                     }
                     Event::Incoming(Incoming::Publish(publish)) => {
                         match validate_publish(publish) {
@@ -170,9 +225,7 @@ impl MarketMqttClient {
                 .context("market MQTT subscriptions were not acknowledged in time")?;
             match event {
                 MarketMqttPumpEvent::SubscriptionAcknowledged => self.subscription_acks += 1,
-                MarketMqttPumpEvent::Message(message) => {
-                    self.pending.push_back(message);
-                }
+                MarketMqttPumpEvent::Message(message) => self.pending.push_back(message),
                 MarketMqttPumpEvent::Fatal(error) => bail!(error),
             }
         }
@@ -239,15 +292,16 @@ where
 
 fn validate_publish(publish: rumqttc::v5::mqttbytes::v5::Publish) -> Result<MarketMqttMessage> {
     let topic = std::str::from_utf8(&publish.topic).context("market MQTT topic is not UTF-8")?;
-    MarketMqttMessage::from_wire_contract(
+    let content_type = publish
+        .properties
+        .as_ref()
+        .and_then(|properties| properties.content_type.as_deref());
+    MarketMqttMessage::from_committed_wire_contract(
         topic,
         &publish.payload,
         publish.qos,
         publish.retain,
-        publish
-            .properties
-            .as_ref()
-            .and_then(|properties| properties.content_type.as_deref()),
+        content_type,
     )
 }
 

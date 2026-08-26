@@ -267,7 +267,7 @@ BUY 成交价高于保守均价、SELL 成交价低于保守均价都阻断；�
 在今日委托表中缺席，permit 仍由源账 Paper fills 与持久成交明细独立重算；同一合同若今日出现则仍须
 逐字段匹配。SUBMITTED/CANCELLING/AMBIGUOUS、删除事实、篡改证据、未知开放合同都必须 fail closed，
 且审计前后源账 head 与 staged intent 不变、资金 UI 动作次数为零。
-launchd 合同固定工作日 09:25、release binary、60 秒 stale、失败退出重启和成功日终不重启；新 outbox
+launchd 合同固定工作日 09:00 先建立 committed 行情持久订阅、release binary、60 秒 stale、失败退出重启和成功日终不重启；新 outbox
 才使用显式 sequence 0，已有绑定必须沿持久 cursor 续作并证明零重扫、零 UI 二次动作。
 `prepare-form` 的 fake executor 必须证明写入脚本不包含点击“确定买入/卖出”，且第二次 probe 对
 代码、Decimal 价格和数量逐字段回读；任一字段被客户端改写时立即失败，不能继续到后续阶段。

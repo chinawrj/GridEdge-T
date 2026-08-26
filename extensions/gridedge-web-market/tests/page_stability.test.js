@@ -6,12 +6,16 @@ const assert = require("node:assert/strict");
 const {
   captureStablePage,
   captureInitialPageWithRefresh,
+  captureSourceObservation,
   completeProvisionalInitialization,
   createRetriableInitializer,
   createSingleFlightRunner,
   cycleLatestFirstControl,
+  installSourceHeartbeat,
   readCaptureWithRetry,
   refreshStaleFirstPage,
+  shouldDeliverCapture,
+  waitForReviewedRowsetEffect,
 } = require("../src/page_stability.js");
 
 function page(index, rows) {
@@ -30,6 +34,82 @@ const fullHash = async (capture) =>
   `${capture.completeness.page_index}:${capture.rows.map((row) => row.value).join(",")}`;
 const rowsHash = async (capture) => capture.rows.map((row) => row.value).join(",");
 const noDelay = async () => {};
+
+test("an unchanged reviewed page schedules a bounded source heartbeat", async () => {
+  const requests = [];
+  let scheduled = null;
+  let interval = null;
+  const handle = installSourceHeartbeat(
+    async (reason) => requests.push(reason),
+    {
+      intervalMs: 30_000,
+      scheduleEvery(callback, milliseconds) {
+        scheduled = callback;
+        interval = milliseconds;
+        return "heartbeat-handle";
+      },
+    },
+  );
+
+  assert.equal(handle, "heartbeat-handle");
+  assert.equal(interval, 30_000);
+  await scheduled();
+  assert.deepEqual(requests, ["heartbeat"]);
+  assert.equal(shouldDeliverCapture("mutation", "same", "same"), false);
+  assert.equal(shouldDeliverCapture("heartbeat", "same", "same"), false);
+  assert.equal(shouldDeliverCapture("manual", "same", "same"), true);
+  assert.equal(shouldDeliverCapture("mutation", "new", "old"), true);
+});
+
+test("a source heartbeat actively refreshes latest-first before accepting one stable observation", async () => {
+  const calls = [];
+  const stable = { capture: { captured_at_us: 123 }, rowsetHash: "stable" };
+  const result = await captureSourceObservation({
+    async refreshLatestFirst() {
+      calls.push("refresh");
+    },
+    async captureStableFirstPage(expectedPageIndex) {
+      calls.push(`capture:${expectedPageIndex}`);
+      return stable;
+    },
+    validateObservationTiming(capture) {
+      calls.push(`validate:${capture.captured_at_us}`);
+    },
+  });
+
+  assert.equal(result, stable);
+  assert.deepEqual(calls, ["refresh", "capture:1", "validate:123"]);
+});
+
+test("an active source observation rejects a latest-first cycle with no reviewed rowset effect", async () => {
+  let reads = 0;
+  await assert.rejects(
+    () => waitForReviewedRowsetEffect({
+      previousRowsetHash: "stale",
+      async readRowsetHash() {
+        reads += 1;
+        return "stale";
+      },
+      delay: async () => {},
+      maxAttempts: 3,
+    }),
+    /did not produce a reviewed rowset effect/,
+  );
+  assert.equal(reads, 3);
+});
+
+test("an active source observation accepts one explicit reviewed rowset effect", async () => {
+  const hashes = ["stale", "fresh"];
+  await waitForReviewedRowsetEffect({
+    previousRowsetHash: "stale",
+    async readRowsetHash() {
+      return hashes.shift();
+    },
+    delay: async () => {},
+    maxAttempts: 3,
+  });
+  assert.deepEqual(hashes, []);
+});
 
 test("a transient reviewed-control mismatch is retried before the snapshot is used", async () => {
   let reads = 0;

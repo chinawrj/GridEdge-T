@@ -160,7 +160,7 @@ data directories, applies forward SQL migrations, and copies only the CA
 certificate plus publisher credential back to the Mac. The CA private key is
 never mounted into a running service container. The second command installs an isolated Python
 environment and the read-only LaunchAgent `com.gridedge.market-shadow`; it
-starts at 09:25 on weekdays and tails the existing `002256-quotes.jsonl`.
+The Android paper worker starts at 09:00 on weekdays and establishes its committed-market subscription before collection. The separate shadow quote publisher tails the existing `002256-quotes.jsonl` on its own schedule.
 
 Automated local contracts are:
 

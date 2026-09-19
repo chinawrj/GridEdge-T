@@ -11,11 +11,67 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarketMqttMessage {
     pub topic: String,
     pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewedMarketMqttContract {
+    pub committed_prefix: String,
+}
+
+fn reviewed_namespace(value: &str) -> Result<(String, Option<String>)> {
+    if value == "gridedge" {
+        return Ok(("gridedge".to_owned(), None));
+    }
+    let nonce = value
+        .strip_prefix("gridedge-e2e/")
+        .context("market MQTT namespace is outside production and isolated E2E")?;
+    let uuid_text = nonce
+        .strip_prefix("e2e-0629-")
+        .context("isolated market MQTT namespace lacks the reviewed nonce prefix")?;
+    let parsed = Uuid::parse_str(uuid_text).context("isolated market MQTT nonce is not UUID")?;
+    if parsed.get_version_num() != 4 || parsed.hyphenated().to_string() != uuid_text {
+        bail!("isolated market MQTT nonce must be canonical lowercase UUIDv4")
+    }
+    Ok((value.to_owned(), Some(nonce.to_owned())))
+}
+
+pub fn reviewed_market_mqtt_contract(
+    host: &str,
+    port: u16,
+    username: &str,
+    client_id: &str,
+    topic_namespace: &str,
+) -> Result<ReviewedMarketMqttContract> {
+    let (namespace, nonce) = reviewed_namespace(topic_namespace)?;
+    match nonce {
+        None => {
+            if host != "192.168.1.201"
+                || port != 8_883
+                || username != "gridedge-publisher"
+                || !client_id.starts_with("gridedge-paper-committed-")
+            {
+                bail!("production market MQTT endpoint, client, and namespace are not atomic")
+            }
+        }
+        Some(nonce) => {
+            if !matches!(host, "127.0.0.1" | "localhost")
+                || port != 18_883
+                || username != "gridedge-e2e-worker"
+                || client_id != format!("{nonce}-worker")
+            {
+                bail!("isolated market MQTT endpoint, client, and namespace are not atomic")
+            }
+        }
+    }
+    Ok(ReviewedMarketMqttContract {
+        committed_prefix: format!("{namespace}/market-committed/v1/"),
+    })
 }
 
 fn validate_common_wire_contract(
@@ -47,9 +103,28 @@ impl MarketMqttMessage {
         retained: bool,
         content_type: Option<&str>,
     ) -> Result<Self> {
+        Self::from_namespaced_committed_wire_contract(
+            topic,
+            payload,
+            qos,
+            retained,
+            content_type,
+            "gridedge",
+        )
+    }
+
+    pub fn from_namespaced_committed_wire_contract(
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        retained: bool,
+        content_type: Option<&str>,
+        topic_namespace: &str,
+    ) -> Result<Self> {
         validate_common_wire_contract(payload, qos, retained, content_type)?;
+        let (namespace, _) = reviewed_namespace(topic_namespace)?;
         let suffix = topic
-            .strip_prefix("gridedge/market-committed/v1/")
+            .strip_prefix(&format!("{namespace}/market-committed/v1/"))
             .context("worker received a market event before its PostgreSQL commit")?;
         let mut segments = suffix.split('/');
         let venue = segments
@@ -118,6 +193,7 @@ impl MarketMqttClient {
         password_file: &Path,
         ca_file: &Path,
         client_id: &str,
+        topic_namespace: &str,
         venue: &str,
         symbol: &str,
     ) -> Result<Self> {
@@ -130,6 +206,8 @@ impl MarketMqttClient {
         {
             bail!("market MQTT subscription instrument is invalid")
         }
+        let contract =
+            reviewed_market_mqtt_contract(host, port, username, client_id, topic_namespace)?;
         validate_private_file(password_file)?;
         let password = fs::read_to_string(password_file)
             .with_context(|| format!("failed to read {}", password_file.display()))?;
@@ -152,13 +230,14 @@ impl MarketMqttClient {
             .set_session_expiry_interval(Some(31_536_000));
         let (client, mut connection) = Client::new(options, 256);
         client.subscribe(
-            format!("gridedge/market-committed/v1/{venue}/{symbol}/trade"),
+            format!("{}{venue}/{symbol}/trade", contract.committed_prefix),
             QoS::AtLeastOnce,
         )?;
         client.subscribe(
-            format!("gridedge/market-committed/v1/{venue}/{symbol}/status"),
+            format!("{}{venue}/{symbol}/status", contract.committed_prefix),
             QoS::AtLeastOnce,
         )?;
+        let committed_prefix = contract.committed_prefix;
         let (pump_receiver, pump) =
             spawn_market_mqtt_pump(format!("market-mqtt-{venue}-{symbol}"), move || {
                 let event = match connection.recv_timeout(Duration::from_secs(1)) {
@@ -190,7 +269,7 @@ impl MarketMqttClient {
                         }
                     }
                     Event::Incoming(Incoming::Publish(publish)) => {
-                        match validate_publish(publish) {
+                        match validate_publish(publish, &committed_prefix) {
                             Ok(message) => {
                                 MarketMqttPumpPoll::Event(MarketMqttPumpEvent::Message(message))
                             }
@@ -290,18 +369,25 @@ where
     Ok((pump_receiver, pump))
 }
 
-fn validate_publish(publish: rumqttc::v5::mqttbytes::v5::Publish) -> Result<MarketMqttMessage> {
+fn validate_publish(
+    publish: rumqttc::v5::mqttbytes::v5::Publish,
+    committed_prefix: &str,
+) -> Result<MarketMqttMessage> {
     let topic = std::str::from_utf8(&publish.topic).context("market MQTT topic is not UTF-8")?;
     let content_type = publish
         .properties
         .as_ref()
         .and_then(|properties| properties.content_type.as_deref());
-    MarketMqttMessage::from_committed_wire_contract(
+    let namespace = committed_prefix
+        .strip_suffix("/market-committed/v1/")
+        .context("market MQTT committed prefix is invalid")?;
+    MarketMqttMessage::from_namespaced_committed_wire_contract(
         topic,
         &publish.payload,
         publish.qos,
         publish.retain,
         content_type,
+        namespace,
     )
 }
 

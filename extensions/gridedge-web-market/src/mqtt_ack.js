@@ -17,9 +17,9 @@
     };
   }
 
-  function validateCommittedAck(topic, payload, event) {
+  function validateCommittedAck(topic, payload, event, ackRoot = ACK_PREFIX) {
     const expected = expectedIdentity(event);
-    if (topic !== `${ACK_PREFIX}/${expected.event_id}`) {
+    if (topic !== `${ackRoot}/${expected.event_id}`) {
       throw new Error("database ACK topic does not bind the pending event");
     }
     let receipt;
@@ -40,9 +40,9 @@
     return { ok: true };
   }
 
-  function subscribe(client) {
+  function subscribe(client, ackRoot = ACK_PREFIX) {
     return new Promise((resolve, reject) => {
-      client.subscribe(`${ACK_PREFIX}/#`, { qos: 1 }, (error, granted) => {
+      client.subscribe(`${ackRoot}/#`, { qos: 1 }, (error, granted) => {
         if (error) return reject(error);
         if (!Array.isArray(granted) || granted.length !== 1 || granted[0].qos !== 1) {
           return reject(new Error("database ACK subscription was not granted at QoS 1"));
@@ -52,8 +52,8 @@
     });
   }
 
-  async function waitForCommittedAck(client, event, publish, timeoutMs = 15_000) {
-    const target = `${ACK_PREFIX}/${event.event_id}`;
+  async function waitForCommittedAck(client, event, publish, timeoutMs = 15_000, ackRoot = ACK_PREFIX) {
+    const target = `${ackRoot}/${event.event_id}`;
     let timer;
     let settle;
     const receipt = new Promise((resolve, reject) => {
@@ -63,7 +63,7 @@
     const onMessage = (topic, payload) => {
       if (topic !== target) return;
       try {
-        validateCommittedAck(topic, payload, event);
+        validateCommittedAck(topic, payload, event, ackRoot);
         settle.resolve();
       } catch (error) {
         settle.reject(error);
@@ -79,5 +79,15 @@
     }
   }
 
-  return { ACK_PREFIX, subscribe, validateCommittedAck, waitForCommittedAck };
+  function withAckRoot(ackRoot) {
+    return {
+      subscribe: (client) => subscribe(client, ackRoot),
+      validateCommittedAck: (topic, payload, event) =>
+        validateCommittedAck(topic, payload, event, ackRoot),
+      waitForCommittedAck: (client, event, publish, timeoutMs) =>
+        waitForCommittedAck(client, event, publish, timeoutMs, ackRoot),
+    };
+  }
+
+  return { ACK_PREFIX, subscribe, validateCommittedAck, waitForCommittedAck, withAckRoot };
 });

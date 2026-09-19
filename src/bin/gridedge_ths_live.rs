@@ -68,6 +68,14 @@ struct Args {
     market_mqtt_password_file: PathBuf,
     #[arg(long)]
     market_mqtt_ca_file: PathBuf,
+    /// Override the durable MQTT session identity for an isolated shadow run.
+    /// Production omits this and retains the reviewed per-symbol identity.
+    #[arg(long)]
+    market_mqtt_client_id: Option<String>,
+    /// Physical MQTT topic namespace. Production is fixed to `gridedge`;
+    /// isolated READ_ONLY E2E uses `gridedge-e2e/e2e-0629-<uuid-v4>`.
+    #[arg(long, default_value = "gridedge")]
+    market_mqtt_topic_namespace: String,
     #[arg(long, default_value_t = 5)]
     interval_minutes: u32,
     #[arg(long, default_value_t = 5)]
@@ -101,6 +109,13 @@ struct Args {
     execution_runner_file: Option<PathBuf>,
     #[arg(long)]
     execution_launch_plist_file: Option<PathBuf>,
+    #[arg(long)]
+    execution_guard_file: Option<PathBuf>,
+    /// Atomically attest that the read-only simulation-account startup
+    /// preflight passed. The runner uses this to keep later market transport
+    /// faults out of the Android-only daily circuit breaker.
+    #[arg(long)]
+    android_preflight_handshake_file: Option<PathBuf>,
     /// Bind the exact preflighted remote adapter/device/account/deployment
     /// identity to an already frozen outbox and exit without market work.
     #[arg(long, default_value_t = false)]
@@ -173,6 +188,9 @@ fn run() -> Result<()> {
         build_driver_and_execution_identity(&args, quote_symbol)?;
     ThsSimOutbox::open(&args.outbox)?.verify_execution_identity(&execution_identity)?;
     driver.startup_preflight()?;
+    if let Some(path) = &args.android_preflight_handshake_file {
+        publish_android_preflight_handshake(path)?;
+    }
     let mut service = if exists {
         GridAutomationService::recover_with_algorithm(
             config.clone(),
@@ -194,7 +212,14 @@ fn run() -> Result<()> {
         Some(0)
     };
     let mut latest_reviewed_completion_received_at_us = None;
-    service.enter_market_data_recovery("EASTMONEY_SESSION_HISTORY_BACKFILL")?;
+    enter_market_data_recovery_and_stage(
+        &mut service,
+        "EASTMONEY_SESSION_HISTORY_BACKFILL",
+        Path::new(&config.database),
+        &args.run_id,
+        &args.outbox,
+        &mut initial_after_sequence,
+    )?;
     for bar in bars.values() {
         if is_executable_strategy_bar(bar) {
             service.on_bar(bar)?;
@@ -203,14 +228,34 @@ fn run() -> Result<()> {
     for bar in recovered_completed_bars {
         process_market_recovery_bar(&args.bar_log, &mut bars, &mut service, bar)?;
     }
+    sync_outbox_cursor(
+        Path::new(&config.database),
+        &args.run_id,
+        &args.outbox,
+        &mut initial_after_sequence,
+    )?;
 
+    let default_market_client_id = format!("gridedge-paper-committed-{quote_symbol}");
+    let market_client_id = args
+        .market_mqtt_client_id
+        .as_deref()
+        .unwrap_or(&default_market_client_id);
+    if market_client_id.is_empty()
+        || market_client_id.len() > 128
+        || !market_client_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        bail!("market MQTT client id is outside the reviewed identity alphabet")
+    }
     let mut market = MarketMqttClient::connect(
         &args.market_mqtt_host,
         args.market_mqtt_port,
         &args.market_mqtt_username,
         &args.market_mqtt_password_file,
         &args.market_mqtt_ca_file,
-        &format!("gridedge-paper-committed-{quote_symbol}"),
+        market_client_id,
+        &args.market_mqtt_topic_namespace,
         venue,
         quote_symbol,
     )?;
@@ -241,7 +286,14 @@ fn run() -> Result<()> {
                     args.maximum_unchanged_seconds,
                 )?
             {
-                service.enter_market_data_recovery("EASTMONEY_SOURCE_OBSERVATION_TIMEOUT")?;
+                enter_market_data_recovery_and_stage(
+                    &mut service,
+                    "EASTMONEY_SOURCE_OBSERVATION_TIMEOUT",
+                    Path::new(&config.database),
+                    &args.run_id,
+                    &args.outbox,
+                    &mut initial_after_sequence,
+                )?;
             }
             continue;
         };
@@ -262,6 +314,11 @@ fn run() -> Result<()> {
         let date = now.date();
         let released_bar_count = receipt.bars.len();
         let received_source_observation = receipt.source_observation.is_some();
+        let trade_coverage_is_current = market_watermark_is_current(
+            builder.covered_through_us(),
+            now,
+            args.maximum_unchanged_seconds,
+        )?;
         let source_observation_gate = builder
             .latest_source_observation()
             .map(|observation| {
@@ -359,7 +416,14 @@ fn run() -> Result<()> {
                 released_bar_count,
                 released_bars_current,
             ) {
-                service.enter_market_data_recovery("EASTMONEY_LIVE_WATERMARK_CATCHUP")?;
+                enter_market_data_recovery_and_stage(
+                    &mut service,
+                    "EASTMONEY_LIVE_WATERMARK_CATCHUP",
+                    Path::new(&config.database),
+                    &args.run_id,
+                    &args.outbox,
+                    &mut initial_after_sequence,
+                )?;
             }
         }
         for bar in receipt.bars {
@@ -428,14 +492,23 @@ fn run() -> Result<()> {
                     current,
                     previous_current,
                     observation.session_date == date,
+                    trade_coverage_is_current,
                 ) {
-                    service.enter_market_data_recovery("EASTMONEY_SOURCE_OBSERVATION_CATCHUP")?;
+                    enter_market_data_recovery_and_stage(
+                        &mut service,
+                        "EASTMONEY_SOURCE_OBSERVATION_CATCHUP",
+                        Path::new(&config.database),
+                        &args.run_id,
+                        &args.outbox,
+                        &mut initial_after_sequence,
+                    )?;
                 }
                 if source_observation_allows_resume(
                     service.state.mode,
                     current,
                     previous_current,
                     observation.session_date == date,
+                    trade_coverage_is_current,
                 ) && market_session_boundary_allows_resume(
                     builder.has_complete_session(date),
                     builder.partial_session_resume_is_safe(date),
@@ -558,8 +631,13 @@ fn build_driver_and_execution_identity(
         .execution_launch_plist_file
         .as_deref()
         .context("remote execution identity requires --execution-launch-plist-file")?;
+    let guard = args
+        .execution_guard_file
+        .as_deref()
+        .context("remote execution identity requires --execution-guard-file")?;
     let runner_sha256 = gridedge_t::platform_upgrade::sha256_file(runner)?;
     let launch_plist_sha256 = gridedge_t::platform_upgrade::sha256_file(launch_plist)?;
+    let guard_sha256 = gridedge_t::platform_upgrade::sha256_file(guard)?;
     let platform_sha256 = gridedge_t::decision::current_platform_sha256();
     match args.simulation_adapter {
         SimulationAdapter::Macos => {
@@ -569,6 +647,7 @@ fn build_driver_and_execution_identity(
                 "platform_sha256": platform_sha256,
                 "runner_sha256": runner_sha256,
                 "launch_plist_sha256": launch_plist_sha256,
+                "guard_sha256": guard_sha256,
                 "money_actions_enabled": true,
             });
             Ok((
@@ -612,6 +691,7 @@ fn build_driver_and_execution_identity(
                 "platform_sha256": platform_sha256,
                 "runner_sha256": runner_sha256,
                 "launch_plist_sha256": launch_plist_sha256,
+                "guard_sha256": guard_sha256,
                 "adb_sha256": gridedge_t::platform_upgrade::sha256_file(&config.adb_path)?,
                 "serial": config.serial.clone(),
                 "avd_name_marker": config.avd_name_marker.clone(),
@@ -816,9 +896,43 @@ fn resume_after_market_data_recovery(
     {
         return Ok(());
     }
-    service.resume_after_reconciliation(
-        "Eastmoney complete source watermark and Paper/remote terminal audit matched",
+    commit_recovery_resume_and_sync(
+        || {
+            service.resume_after_reconciliation(
+                "Eastmoney complete source watermark and Paper/remote terminal audit matched",
+            )
+        },
+        || {
+            run_outbox(
+                args,
+                source_database,
+                initial_after_sequence,
+                pre_resume_now,
+                driver,
+            )
+            .map(|_| ())
+        },
     )
+}
+
+fn commit_recovery_resume_and_sync(
+    mut resume: impl FnMut() -> Result<()>,
+    mut sync_outbox: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    resume()?;
+    sync_outbox()
+}
+
+fn enter_market_data_recovery_and_stage(
+    service: &mut GridAutomationService,
+    reason: &str,
+    source_database: &Path,
+    run_id: &str,
+    outbox: &Path,
+    initial_after_sequence: &mut Option<i64>,
+) -> Result<()> {
+    service.enter_market_data_recovery(reason)?;
+    sync_outbox_cursor(source_database, run_id, outbox, initial_after_sequence)
 }
 
 #[cfg(test)]
@@ -1342,11 +1456,13 @@ fn source_observation_requires_recovery(
     observation_is_current: bool,
     previous_observation_is_contiguous: bool,
     session_matches_today: bool,
+    trade_coverage_is_current: bool,
 ) -> bool {
     mode == gridedge_t::domain::ServiceMode::Running
         && (!observation_is_current
             || !previous_observation_is_contiguous
-            || !session_matches_today)
+            || !session_matches_today
+            || !trade_coverage_is_current)
 }
 
 fn source_observation_allows_resume(
@@ -1354,11 +1470,13 @@ fn source_observation_allows_resume(
     observation_is_current: bool,
     previous_observation_is_contiguous: bool,
     session_matches_today: bool,
+    trade_coverage_is_current: bool,
 ) -> bool {
     mode == gridedge_t::domain::ServiceMode::ReadOnly
         && observation_is_current
         && previous_observation_is_contiguous
         && session_matches_today
+        && trade_coverage_is_current
 }
 
 fn source_observation_timeout_requires_recovery(
@@ -1436,6 +1554,21 @@ fn run_outbox(
         );
     }
     Ok(changed_remote_state)
+}
+
+fn sync_outbox_cursor(
+    source_database: &Path,
+    run_id: &str,
+    outbox: &Path,
+    initial_after_sequence: &mut Option<i64>,
+) -> Result<()> {
+    stage_from_source(
+        source_database,
+        run_id,
+        outbox,
+        initial_after_sequence.take(),
+    )?;
+    Ok(())
 }
 
 fn store_bar_if_new(
@@ -1526,6 +1659,28 @@ fn ensure_parent(path: &Path) -> Result<()> {
     {
         fs::create_dir_all(parent)?;
     }
+    Ok(())
+}
+
+fn publish_android_preflight_handshake(path: &Path) -> Result<()> {
+    ensure_parent(path)?;
+    if path.exists() {
+        bail!("Android preflight handshake already exists")
+    }
+    let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .context("failed to create Android preflight handshake")?;
+    writeln!(
+        file,
+        "GRIDEDGE_ANDROID_PREFLIGHT_OK_V1 {}",
+        std::process::id()
+    )?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temporary, path).context("failed to publish Android preflight handshake")?;
     Ok(())
 }
 
@@ -1639,6 +1794,187 @@ mod tests {
             untracked_open_contracts(&[open, cancelled, bound], &known),
             vec!["OPEN".to_owned()]
         );
+    }
+
+    #[test]
+    fn recovery_resume_requires_a_final_outbox_sync_after_audit_events() -> Result<()> {
+        let calls = std::cell::RefCell::new(Vec::new());
+        commit_recovery_resume_and_sync(
+            || {
+                calls.borrow_mut().push("resume");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("sync");
+                Ok(())
+            },
+        )?;
+        assert_eq!(*calls.borrow(), vec!["resume", "sync"]);
+
+        let sync_after_failed_resume = std::cell::Cell::new(0);
+        assert!(commit_recovery_resume_and_sync(
+            || anyhow::bail!("resume failed"),
+            || {
+                sync_after_failed_resume.set(sync_after_failed_resume.get() + 1);
+                Ok(())
+            },
+        )
+        .is_err());
+        assert_eq!(sync_after_failed_resume.get(), 0);
+
+        let resumed_before_failed_sync = std::cell::Cell::new(0);
+        assert!(commit_recovery_resume_and_sync(
+            || {
+                resumed_before_failed_sync.set(resumed_before_failed_sync.get() + 1);
+                Ok(())
+            },
+            || anyhow::bail!("sync failed"),
+        )
+        .is_err());
+        assert_eq!(resumed_before_failed_sync.get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn every_market_recovery_reason_stages_the_mode_event_before_the_loop_can_continue(
+    ) -> Result<()> {
+        for reason in [
+            "EASTMONEY_SESSION_HISTORY_BACKFILL",
+            "EASTMONEY_SOURCE_OBSERVATION_TIMEOUT",
+            "EASTMONEY_LIVE_WATERMARK_CATCHUP",
+            "EASTMONEY_SOURCE_OBSERVATION_CATCHUP",
+        ] {
+            let directory = tempdir()?;
+            let source_path = directory.path().join("ledger.db");
+            let outbox_path = directory.path().join("outbox.db");
+            let run_id = format!("recovery-sync-{reason}");
+            let mut config = Config::load("configs/default.yaml")?;
+            config.database = source_path.display().to_string();
+            config.config_version = run_id.clone();
+            let mut service = GridAutomationService::start_new_with_algorithm(
+                config.clone(),
+                SqliteStore::open(&config.database)?,
+                algorithm_from_config(&config)?,
+                Some(run_id.clone()),
+            )?;
+            let initial = stage_from_source(&source_path, &run_id, &outbox_path, Some(0))?;
+            let initial_head = service.store.latest_sequence(&run_id)?;
+            assert_eq!(initial.cursor, initial_head);
+            let mut after_sequence = None;
+
+            enter_market_data_recovery_and_stage(
+                &mut service,
+                reason,
+                &source_path,
+                &run_id,
+                &outbox_path,
+                &mut after_sequence,
+            )?;
+            let recovery_head = service.store.latest_sequence(&run_id)?;
+            assert_eq!(recovery_head, initial_head + 1);
+            assert_eq!(
+                ThsSimOutbox::open(&outbox_path)?.status()?.cursor,
+                recovery_head
+            );
+
+            enter_market_data_recovery_and_stage(
+                &mut service,
+                reason,
+                &source_path,
+                &run_id,
+                &outbox_path,
+                &mut after_sequence,
+            )?;
+            assert_eq!(service.store.latest_sequence(&run_id)?, recovery_head);
+            assert_eq!(
+                ThsSimOutbox::open(&outbox_path)?.status()?.cursor,
+                recovery_head
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_entry_stage_failure_is_durable_retryable_and_never_executes_an_intent() -> Result<()>
+    {
+        let directory = tempdir()?;
+        let source_path = directory.path().join("ledger.db");
+        let outbox_path = directory.path().join("outbox.db");
+        let run_id = "recovery-stage-retry";
+        let mut config = Config::load("configs/ths_002256_sim.yaml")?;
+        config.database = source_path.display().to_string();
+        config.config_version = run_id.to_owned();
+        config.paper.reject_probability_bps = 0;
+        config.paper.partial_fill_bps = 10_000;
+        let mut service = GridAutomationService::start_new_with_algorithm(
+            config.clone(),
+            SqliteStore::open(&config.database)?,
+            algorithm_from_config(&config)?,
+            Some(run_id.to_owned()),
+        )?;
+        let first = MarketBar {
+            timestamp: timestamp("2026-08-18 09:30:00"),
+            symbol: config.symbol.clone(),
+            open: Decimal::new(351, 2),
+            high: Decimal::new(351, 2),
+            low: Decimal::new(351, 2),
+            close: Decimal::new(351, 2),
+            volume: 0,
+            amount: None,
+        };
+        service.on_bar(&first)?;
+        let before = stage_from_source(&source_path, run_id, &outbox_path, Some(0))?;
+        assert_eq!(before.eligible, 1);
+        let intents_before =
+            serde_json::to_value(ThsSimOutbox::open(&outbox_path)?.staged_intents()?)?;
+        let head_before = service.store.latest_sequence(run_id)?;
+
+        let invalid_outbox = directory.path().join("outbox-is-a-directory");
+        fs::create_dir(&invalid_outbox)?;
+        let mut after_sequence = None;
+        let error = enter_market_data_recovery_and_stage(
+            &mut service,
+            "EASTMONEY_LIVE_WATERMARK_CATCHUP",
+            &source_path,
+            run_id,
+            &invalid_outbox,
+            &mut after_sequence,
+        )
+        .expect_err("a staging failure must propagate");
+        assert!(!error.to_string().is_empty());
+        let recovery_head = service.store.latest_sequence(run_id)?;
+        assert_eq!(recovery_head, head_before + 1);
+        assert_eq!(
+            ThsSimOutbox::open(&outbox_path)?.status()?.cursor,
+            head_before
+        );
+
+        let retried = stage_from_source(&source_path, run_id, &outbox_path, None)?;
+        assert_eq!(retried.cursor, recovery_head);
+        assert_eq!(retried.eligible, 1);
+        assert_eq!(
+            serde_json::to_value(ThsSimOutbox::open(&outbox_path)?.staged_intents()?)?,
+            intents_before
+        );
+
+        let head_after_retry = service.store.latest_sequence(run_id)?;
+        let cursor_after_retry = ThsSimOutbox::open(&outbox_path)?.status()?.cursor;
+        let mut after_sequence = None;
+        assert!(enter_market_data_recovery_and_stage(
+            &mut service,
+            "",
+            &source_path,
+            run_id,
+            &outbox_path,
+            &mut after_sequence,
+        )
+        .is_err());
+        assert_eq!(service.store.latest_sequence(run_id)?, head_after_retry);
+        assert_eq!(
+            ThsSimOutbox::open(&outbox_path)?.status()?.cursor,
+            cursor_after_retry
+        );
+        Ok(())
     }
 
     fn bar(close: &str) -> MarketBar {

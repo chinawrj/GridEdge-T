@@ -43,6 +43,17 @@
     return JSON.stringify(canonicalize(value));
   }
 
+  function stableMarketRowEvidence(row) {
+    const {
+      source_table_ordinal: _sourceTableOrdinal,
+      source_row_ordinal: _sourceRowOrdinal,
+      source_same_second_ordinal: _sourceSameSecondOrdinal,
+      raw_cells: _rawCells,
+      ...evidence
+    } = row;
+    return evidence;
+  }
+
   async function sha256Hex(value) {
     const bytes =
       typeof value === "string" ? new TextEncoder().encode(value) : value;
@@ -119,6 +130,22 @@
     return value;
   }
 
+  function isReviewedAshareSaleTimestamp(timestampUs) {
+    if (!Number.isSafeInteger(timestampUs) || timestampUs < 0) return false;
+    const parts = new Intl.DateTimeFormat("en-GB", {
+      timeZone: "Asia/Shanghai",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(new Date(timestampUs / 1000));
+    const value = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    const secondOfDay = Number(value.hour) * 3600 + Number(value.minute) * 60 +
+      Number(value.second);
+    return (secondOfDay >= 9 * 3600 + 25 * 60 && secondOfDay <= 11 * 3600 + 30 * 60) ||
+      (secondOfDay >= 13 * 3600 && secondOfDay <= 15 * 3600);
+  }
+
   function isAshareTradingDate(sessionDate) {
     if (!/^2026-\d{2}-\d{2}$/.test(sessionDate)) {
       throw new Error(`session date is outside calendar ${A_SHARE_CALENDAR_VERSION}`);
@@ -173,6 +200,39 @@
     return capture;
   }
 
+  function validateClockBoundSourceObservationTiming(capture, nowUs = unixMicrosNow()) {
+    validateSourceObservationTiming(capture, nowUs);
+    if (!Number.isSafeInteger(capture.source_page_observed_at_us) ||
+        capture.source_page_observed_at_us < 0 ||
+        capture.source_row_order !== "LATEST_FIRST") {
+      throw new Error("source observation lacks its reviewed page clock or order proof");
+    }
+    const ageUs = capture.captured_at_us - capture.source_page_observed_at_us;
+    if (ageUs < 0) throw new Error("source page clock is in the future");
+    if (ageUs > 15_000_000) throw new Error("source page clock is stale");
+    if (shanghaiDate(new Date(capture.source_page_observed_at_us / 1000)) !== capture.session_date) {
+      throw new Error("source page clock session date disagrees with capture");
+    }
+    return capture;
+  }
+
+  function validateServerClockBoundSourceObservationTiming(capture, nowUs = unixMicrosNow()) {
+    validateSourceObservationTiming(capture, nowUs);
+    if (!Number.isSafeInteger(capture.source_server_observed_at_us) ||
+        capture.source_server_observed_at_us < 0 ||
+        capture.source_clock_origin !== "EASTMONEY_HTTPS_DATE_HEADER" ||
+        capture.source_row_order !== "LATEST_FIRST") {
+      throw new Error("source observation lacks its reviewed HTTPS clock or order proof");
+    }
+    const ageUs = capture.captured_at_us - capture.source_server_observed_at_us;
+    if (ageUs < 0) throw new Error("source HTTPS clock is in the future");
+    if (ageUs > 15_000_000) throw new Error("source HTTPS clock is stale");
+    if (shanghaiDate(new Date(capture.source_server_observed_at_us / 1000)) !== capture.session_date) {
+      throw new Error("source HTTPS clock session date disagrees with capture");
+    }
+    return capture;
+  }
+
   return {
     CAPTURE_SCHEMA_VERSION,
     CAPTURE_SPEC,
@@ -180,15 +240,19 @@
     canonicalJson,
     normalizeText,
     eventTimeUs,
+    isReviewedAshareSaleTimestamp,
     isAshareTradingDate,
     priceParts,
     providers: {},
     sha256Hex,
     shanghaiDate,
+    stableMarketRowEvidence,
     strictNonNegativeInteger,
     strictPositiveDecimal,
     unixMicrosNow,
     validateCaptureTiming,
+    validateClockBoundSourceObservationTiming,
+    validateServerClockBoundSourceObservationTiming,
     validateSourceObservationTiming,
   };
 });

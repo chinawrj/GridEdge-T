@@ -160,6 +160,8 @@ struct MacOsExecutionIdentity {
     platform_sha256: String,
     runner_sha256: String,
     launch_plist_sha256: String,
+    #[serde(default)]
+    guard_sha256: Option<String>,
     money_actions_enabled: bool,
 }
 
@@ -171,6 +173,8 @@ struct AndroidExecutionIdentity {
     platform_sha256: String,
     runner_sha256: String,
     launch_plist_sha256: String,
+    #[serde(default)]
+    guard_sha256: Option<String>,
     adb_sha256: String,
     serial: String,
     avd_name_marker: String,
@@ -199,8 +203,12 @@ fn typed_execution_identity(identity_json: &str) -> Result<serde_json::Value> {
 }
 
 fn validate_execution_identity_upgrade(previous_json: &str, candidate_json: &str) -> Result<()> {
-    const MUTABLE_DEPLOYMENT_FIELDS: [&str; 3] =
-        ["platform_sha256", "runner_sha256", "launch_plist_sha256"];
+    const MUTABLE_DEPLOYMENT_FIELDS: [&str; 4] = [
+        "platform_sha256",
+        "runner_sha256",
+        "launch_plist_sha256",
+        "guard_sha256",
+    ];
     let mut previous = typed_execution_identity(previous_json)?
         .as_object()
         .cloned()
@@ -211,10 +219,12 @@ fn validate_execution_identity_upgrade(previous_json: &str, candidate_json: &str
         .context("candidate execution identity is not an object")?;
     for field in MUTABLE_DEPLOYMENT_FIELDS {
         for identity in [&previous, &candidate] {
-            let value = identity
-                .get(field)
-                .and_then(serde_json::Value::as_str)
-                .with_context(|| format!("execution identity upgrade requires {field}"))?;
+            let Some(value) = identity.get(field).and_then(serde_json::Value::as_str) else {
+                if field == "guard_sha256" {
+                    continue;
+                }
+                bail!("execution identity upgrade requires {field}");
+            };
             if value.len() != 64
                 || !value
                     .bytes()

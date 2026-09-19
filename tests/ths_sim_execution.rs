@@ -466,6 +466,91 @@ fn automation_cycle_restart_uses_the_persisted_outbox_cursor_without_rescanning_
 }
 
 #[test]
+fn recovery_resume_audit_tail_is_synced_without_any_ui_action_and_retry_is_idempotent() -> Result<()>
+{
+    let directory = tempdir()?;
+    let source_path = directory.path().join("source.db");
+    let outbox_path = directory.path().join("outbox.db");
+    let run_id = "ths-live-resume-audit-tail";
+    let mut config = Config::load("configs/default.yaml")?;
+    config.database = source_path.display().to_string();
+    let mut service = GridAutomationService::start_new_with_algorithm(
+        config.clone(),
+        SqliteStore::open(&config.database)?,
+        algorithm_from_config(&config)?,
+        Some(run_id.to_owned()),
+    )?;
+    service.enter_market_data_recovery("TEST_MARKET_RECOVERY")?;
+
+    let mut before_audit_driver = FakeUiDriver::default();
+    let before_audit = run_automation_cycle(
+        &source_path,
+        run_id,
+        &outbox_path,
+        Some(0),
+        time("2026-08-18 09:31:00"),
+        Duration::minutes(5),
+        &mut before_audit_driver,
+    )?;
+    assert_eq!(
+        before_audit.source_cursor,
+        service.store.latest_sequence(run_id)?
+    );
+    assert_eq!(before_audit_driver.prepare_calls, 0);
+    assert_eq!(before_audit_driver.submit_calls, 0);
+    assert_eq!(before_audit_driver.cancel_calls, 0);
+
+    assert!(service.reconcile()?.matched);
+    service.resume_after_reconciliation("TEST_RECOVERY_MATCHED")?;
+    let audit_head = service.store.latest_sequence(run_id)?;
+    assert_eq!(audit_head, before_audit.source_cursor + 2);
+    assert_eq!(
+        ThsSimOutbox::open(&outbox_path)?.status()?.cursor,
+        before_audit.source_cursor
+    );
+
+    let mut sync_driver = FakeUiDriver::default();
+    let synced = run_automation_cycle(
+        &source_path,
+        run_id,
+        &outbox_path,
+        None,
+        time("2026-08-18 09:31:30"),
+        Duration::minutes(5),
+        &mut sync_driver,
+    )?;
+    assert_eq!(synced.source_cursor, audit_head);
+    assert_eq!(synced.status.cursor, audit_head);
+    assert!(synced.executed.is_empty());
+    assert!(synced.cancelled.is_empty());
+    assert_eq!(sync_driver.order_calls, 0);
+    assert_eq!(sync_driver.fill_calls, 0);
+    assert_eq!(sync_driver.prepare_calls, 0);
+    assert_eq!(sync_driver.submit_calls, 0);
+    assert_eq!(sync_driver.cancel_calls, 0);
+
+    let mut retry_driver = FakeUiDriver::default();
+    let retry = run_automation_cycle(
+        &source_path,
+        run_id,
+        &outbox_path,
+        None,
+        time("2026-08-18 09:32:00"),
+        Duration::minutes(5),
+        &mut retry_driver,
+    )?;
+    assert_eq!(retry.source_cursor, audit_head);
+    assert!(retry.executed.is_empty());
+    assert!(retry.cancelled.is_empty());
+    assert_eq!(retry_driver.order_calls, 0);
+    assert_eq!(retry_driver.fill_calls, 0);
+    assert_eq!(retry_driver.prepare_calls, 0);
+    assert_eq!(retry_driver.submit_calls, 0);
+    assert_eq!(retry_driver.cancel_calls, 0);
+    Ok(())
+}
+
+#[test]
 fn automation_cycle_refuses_all_ui_work_when_any_operation_is_ambiguous() -> Result<()> {
     let directory = tempdir()?;
     let path = directory.path().join("outbox.db");

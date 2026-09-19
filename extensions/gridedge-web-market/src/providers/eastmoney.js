@@ -65,6 +65,56 @@
     return pages.values().next().value ?? { page_index: null, page_count: null };
   }
 
+  function sourcePageObservedAtUs(snapshot) {
+    const text = core.normalizeText(snapshot?.bodyText ?? "");
+    const matches = [...text.matchAll(/(20\d{2}-\d{2}-\d{2})\s+星期[一二三四五六日天]\s+(\d{2}:\d{2}:\d{2})/g)];
+    const clocks = new Set(matches.map((match) => `${match[1]}|${match[2]}`));
+    if (clocks.size !== 1) {
+      throw new Error("Eastmoney page lacks one unique reviewed source clock");
+    }
+    const [date, time] = clocks.values().next().value.split("|");
+    return core.eventTimeUs(date, time);
+  }
+
+  async function sourceServerObservedAtUs(url, fetchImpl = fetch, timeoutMs = 5_000) {
+    const parsed = new URL(url);
+    if (!matches(parsed.href) || parsed.pathname !== "/f1.html" ||
+        parsed.searchParams.size !== 1 || !parsed.searchParams.has("newcode")) {
+      throw new Error("Eastmoney source-clock request is outside the reviewed time-sales URL");
+    }
+    instrumentFromUrl(parsed.href);
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 5_000) {
+      throw new Error("Eastmoney source-clock timeout is outside the reviewed bound");
+    }
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    let response;
+    try {
+      response = await fetchImpl(parsed.href, {
+        method: "HEAD",
+        cache: "no-store",
+        credentials: "omit",
+        redirect: "error",
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (!response?.ok || response.status !== 200 || response.redirected ||
+        response.url !== parsed.href) {
+      throw new Error("Eastmoney source-clock response changed its reviewed HTTPS identity");
+    }
+    const header = response.headers?.get("date");
+    if (!/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) 20\d{2} \d{2}:\d{2}:\d{2} GMT$/.test(header ?? "")) {
+      throw new Error("Eastmoney source-clock response lacks one canonical Date header");
+    }
+    const milliseconds = Date.parse(header);
+    if (!Number.isSafeInteger(milliseconds) || new Date(milliseconds).toUTCString() !== header) {
+      throw new Error("Eastmoney source-clock Date header is invalid");
+    }
+    return milliseconds * 1000;
+  }
+
   function locateTimeSalesTables(tables) {
     const matches = [];
     for (let tableIndex = 0; tableIndex < tables.length; tableIndex += 1) {
@@ -154,9 +204,17 @@
       throw new Error("Eastmoney time-sales DOM order disagrees with its reviewed control");
     }
     if (rowOrder === "LATEST_FIRST") candidates.reverse();
+    const reviewedCandidates = candidates.filter((candidate) =>
+      core.isReviewedAshareSaleTimestamp(core.eventTimeUs(
+        sessionDate,
+        candidate.source_trade_time,
+      )));
+    if (reviewedCandidates.length === 0) {
+      throw new Error("Eastmoney time-sales page has no reviewed A-share sale rows");
+    }
     const occurrences = new Map();
     const secondOrdinals = new Map();
-    return candidates.map((candidate) => {
+    return reviewedCandidates.map((candidate) => {
       const identity = `${sessionDate}|${candidate.source_trade_time}|${candidate.price}|${candidate.quantity_hands}|${candidate.side}`;
       const occurrence = (occurrences.get(identity) ?? 0) + 1;
       occurrences.set(identity, occurrence);
@@ -287,7 +345,12 @@
         throw new Error("final live page overlaps an older history page ambiguously");
       }
     }
-    const rows = pageCaptures.slice().reverse().flatMap((capture) => capture.rows);
+    const rows = [];
+    for (const capture of pageCaptures.slice().reverse()) {
+      for (const row of capture.rows) {
+        rows.push(row);
+      }
+    }
     const newestHistoricalTime = rows.at(-1)?.source_trade_time;
     const appendedLiveRows = finalFirstPage.rows.filter((row) => !initialKeys.has(row.source_row_key));
     if (appendedLiveRows.some((row) => row.source_trade_time < newestHistoricalTime)) {
@@ -325,6 +388,8 @@
     matches,
     assembleSessionHistory,
     parseSnapshot,
+    sourcePageObservedAtUs,
+    sourceServerObservedAtUs,
   };
 
   if (typeof module === "object" && module.exports) {

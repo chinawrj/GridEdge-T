@@ -20,21 +20,21 @@ const STATUS_TOPIC: &str = "gridedge/market/v1/XSHE/002256/status";
 fn complete_trade_ticks_wait_for_a_source_watermark_before_forming_exact_ohlcv() -> Result<()> {
     let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
     assert!(builder
-        .ingest(TRADE_TOPIC, &tick(101, "09:30:01", 355, 2, 100))?
+        .ingest(TRADE_TOPIC, &tick(1, "09:30:01", 355, 2, 100))?
         .is_empty());
     assert!(builder
-        .ingest(TRADE_TOPIC, &tick(102, "09:32:00", 350, 2, 200))?
+        .ingest(TRADE_TOPIC, &tick(2, "09:32:00", 350, 2, 200))?
         .is_empty());
     assert!(builder
-        .ingest(TRADE_TOPIC, &tick(103, "09:34:59", 357, 2, 300))?
+        .ingest(TRADE_TOPIC, &tick(3, "09:34:59", 357, 2, 300))?
         .is_empty());
     assert!(builder
-        .ingest(STATUS_TOPIC, &status(104, "09:34:59", "LIVE_CONTIGUOUS"))?
+        .ingest(STATUS_TOPIC, &status(4, "09:34:59", "LIVE_CONTIGUOUS"))?
         .is_empty());
 
     let bars = builder.ingest(
         STATUS_TOPIC,
-        &status_with_previous(105, "09:35:01", "09:34:59"),
+        &status_with_previous(5, "09:35:01", "09:34:59"),
     )?;
     assert_eq!(bars.len(), 1);
     let bar = &bars[0];
@@ -116,6 +116,87 @@ fn an_explicit_partial_session_boundary_is_auditable_but_not_complete_history() 
     assert_eq!(safe[0].open, Decimal::from_str("3.37")?);
     assert_eq!(safe[0].volume, 300);
     assert!(builder.partial_session_resume_is_safe(date));
+    Ok(())
+}
+
+#[test]
+fn an_explicit_same_day_discontinuity_replaces_complete_state_and_requires_a_new_full_bucket(
+) -> Result<()> {
+    let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
+    builder.ingest(TRADE_TOPIC, &tick(1, "10:40:01", 336, 2, 100))?;
+    builder.ingest(
+        STATUS_TOPIC,
+        &status(2, "10:45:01", "SESSION_HISTORY_COMPLETE"),
+    )?;
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
+    assert!(builder.has_complete_session(date));
+    builder.ingest(
+        STATUS_TOPIC,
+        &source_observation_v3(3, "10:45:05", "10:45:04", None, "10:45:01"),
+    )?;
+    assert!(builder.latest_source_observation().is_some());
+
+    builder.ingest(TRADE_TOPIC, &tick(4, "10:50:00", 399, 2, 777))?;
+    let mut boundary: Value =
+        serde_json::from_slice(&status(5, "10:50:20", "SESSION_RESUME_BOUNDARY"))?;
+    boundary["payload"]["policy"] = json!("SAME_DAY_DISCONTINUITY_BOUNDARY_V2");
+    boundary["payload"]["covered_from_us"] = json!(timestamp_us("10:50:00"));
+    boundary["payload"]["previous_covered_through_us"] = json!(timestamp_us("10:45:01"));
+    canonicalize_event_id(&mut boundary);
+    builder.ingest(STATUS_TOPIC, &serde_json::to_vec(&boundary)?)?;
+    assert!(!builder.has_complete_session(date));
+    assert!(builder.has_resume_boundary(date));
+    assert!(builder.latest_source_observation().is_none());
+
+    builder.ingest(TRADE_TOPIC, &tick(6, "10:54:00", 337, 2, 100))?;
+    assert!(builder
+        .ingest(
+            STATUS_TOPIC,
+            &status_with_previous(7, "10:55:01", "10:50:20"),
+        )?
+        .is_empty());
+    assert!(!builder.partial_session_resume_is_safe(date));
+    builder.ingest(TRADE_TOPIC, &tick(8, "10:56:00", 338, 2, 100))?;
+    let bars = builder.ingest(
+        STATUS_TOPIC,
+        &status_with_previous(9, "11:00:01", "10:55:01"),
+    )?;
+    assert_eq!(bars.len(), 1);
+    assert_eq!(bars[0].timestamp.to_string(), "2026-08-21 11:00:00");
+    assert!(builder.partial_session_resume_is_safe(date));
+    Ok(())
+}
+
+#[test]
+fn same_day_discontinuity_requires_the_exact_complete_watermark_atomically() -> Result<()> {
+    let mut unattached = WebTradeBarBuilder::new("002256.SZ", 5)?;
+    let mut unattached_boundary: Value =
+        serde_json::from_slice(&status(1, "10:50:20", "SESSION_RESUME_BOUNDARY"))?;
+    unattached_boundary["payload"]["policy"] = json!("SAME_DAY_DISCONTINUITY_BOUNDARY_V2");
+    unattached_boundary["payload"]["covered_from_us"] = json!(timestamp_us("10:50:00"));
+    unattached_boundary["payload"]["previous_covered_through_us"] = json!(timestamp_us("10:45:01"));
+    canonicalize_event_id(&mut unattached_boundary);
+    assert!(unattached
+        .ingest(STATUS_TOPIC, &serde_json::to_vec(&unattached_boundary)?)
+        .is_err());
+
+    let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
+    builder.ingest(TRADE_TOPIC, &tick(1, "10:40:01", 336, 2, 100))?;
+    builder.ingest(
+        STATUS_TOPIC,
+        &status(2, "10:45:01", "SESSION_HISTORY_COMPLETE"),
+    )?;
+    let before = format!("{builder:?}");
+    let mut boundary: Value =
+        serde_json::from_slice(&status(3, "10:50:20", "SESSION_RESUME_BOUNDARY"))?;
+    boundary["payload"]["policy"] = json!("SAME_DAY_DISCONTINUITY_BOUNDARY_V2");
+    boundary["payload"]["covered_from_us"] = json!(timestamp_us("10:50:00"));
+    boundary["payload"]["previous_covered_through_us"] = json!(timestamp_us("10:45:00"));
+    canonicalize_event_id(&mut boundary);
+    assert!(builder
+        .ingest(STATUS_TOPIC, &serde_json::to_vec(&boundary)?)
+        .is_err());
+    assert_eq!(format!("{builder:?}"), before);
     Ok(())
 }
 
@@ -273,6 +354,234 @@ fn ingest_receipt_binds_released_bars_to_the_exact_completion_status() -> Result
 }
 
 #[test]
+fn retained_stream_restart_adopts_first_declared_predecessors_without_proving_continuity(
+) -> Result<()> {
+    let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
+
+    builder.ingest(TRADE_TOPIC, &tick(12_000, "13:39:30", 336, 2, 100))?;
+    builder.ingest(TRADE_TOPIC, &tick(12_001, "13:40:30", 337, 2, 200))?;
+
+    let first_completion = builder.ingest_with_receipt(
+        STATUS_TOPIC,
+        &status_with_previous(12_002, "13:40:40", "13:40:20"),
+    )?;
+    assert!(
+        first_completion.bars.is_empty(),
+        "the retained suffix cannot prove either partial bucket"
+    );
+    assert_eq!(
+        first_completion
+            .completion
+            .expect("first retained completion")
+            .previous_covered_through_us,
+        None,
+        "a predecessor declared before this subscriber attached is not local continuity proof"
+    );
+
+    let first_observation = builder.ingest_with_receipt(
+        STATUS_TOPIC,
+        &source_observation(12_003, "13:40:45", Some("13:40:30"), "13:40:40"),
+    )?;
+    assert_eq!(
+        first_observation
+            .source_observation
+            .expect("first retained source observation")
+            .previous_observed_at_us,
+        None,
+        "a predecessor declared before this subscriber attached is not local continuity proof"
+    );
+
+    let next_observation = builder.ingest_with_receipt(
+        STATUS_TOPIC,
+        &source_observation(12_004, "13:41:00", Some("13:40:45"), "13:40:40"),
+    )?;
+    assert_eq!(
+        next_observation
+            .source_observation
+            .expect("locally contiguous source observation")
+            .previous_observed_at_us,
+        Some(timestamp_us("13:40:45"))
+    );
+
+    builder.ingest(TRADE_TOPIC, &tick(12_005, "13:45:00", 338, 2, 300))?;
+    let safe = builder.ingest_with_receipt(
+        STATUS_TOPIC,
+        &status_with_previous(12_006, "13:50:01", "13:40:40"),
+    )?;
+    assert_eq!(safe.bars.len(), 1);
+    assert_eq!(
+        safe.completion
+            .as_ref()
+            .expect("locally contiguous completion")
+            .previous_covered_through_us,
+        Some(timestamp_us("13:40:40")),
+    );
+    assert_eq!(safe.bars[0].timestamp.to_string(), "2026-08-21 13:50:00");
+    assert_eq!(safe.bars[0].open, Decimal::from_str("3.38")?);
+
+    for invalid_status in [
+        status_with_previous(1, "13:40:40", "13:40:20"),
+        status_with_previous(12_000, "13:40:40", "13:40:40"),
+        status_with_previous(12_000, "13:40:40", "13:40:41"),
+        status_with_previous_at(12_000, "2026-08-21 13:40:40", "2026-08-20 13:40:20"),
+        status_with_previous(12_000, "13:40:40", "12:00:00"),
+    ] {
+        let mut invalid = WebTradeBarBuilder::new("002256.SZ", 5)?;
+        let before = format!("{invalid:?}");
+        assert!(invalid.ingest(STATUS_TOPIC, &invalid_status).is_err());
+        assert_eq!(format!("{invalid:?}"), before);
+        invalid.ingest(
+            STATUS_TOPIC,
+            &status_with_previous(12_000, "13:40:40", "13:40:20"),
+        )?;
+    }
+
+    let mut observation = WebTradeBarBuilder::new("002256.SZ", 5)?;
+    let retained_observation = observation.ingest_with_receipt(
+        STATUS_TOPIC,
+        &source_observation(12_000, "13:40:45", Some("13:40:30"), "13:40:40"),
+    )?;
+    assert!(retained_observation.bars.is_empty());
+    assert!(retained_observation.completion.is_none());
+    assert_eq!(observation.covered_through_us(), None);
+    assert_eq!(
+        retained_observation
+            .source_observation
+            .expect("retained observation anchor")
+            .previous_observed_at_us,
+        None
+    );
+    let first_coverage = observation.ingest_with_receipt(
+        STATUS_TOPIC,
+        &status_with_previous(12_001, "13:40:50", "13:40:40"),
+    )?;
+    assert!(first_coverage.bars.is_empty());
+    assert_eq!(
+        first_coverage
+            .completion
+            .expect("retained coverage anchor")
+            .previous_covered_through_us,
+        None
+    );
+    assert_eq!(
+        observation.covered_through_us(),
+        Some(timestamp_us("13:40:50"))
+    );
+    let before = format!("{observation:?}");
+    assert!(observation
+        .ingest_with_receipt(
+            STATUS_TOPIC,
+            &source_observation(12_002, "13:41:00", Some("13:41:00"), "13:40:50"),
+        )
+        .is_err());
+    assert_eq!(format!("{observation:?}"), before);
+    let adopted = observation.ingest_with_receipt(
+        STATUS_TOPIC,
+        &source_observation(12_002, "13:41:00", Some("13:40:45"), "13:40:50"),
+    )?;
+    assert_eq!(
+        adopted.source_observation.unwrap().previous_observed_at_us,
+        Some(timestamp_us("13:40:45"))
+    );
+
+    let mut fresh = WebTradeBarBuilder::new("002256.SZ", 5)?;
+    let before_fresh = format!("{fresh:?}");
+    assert!(fresh
+        .ingest_with_receipt(
+            STATUS_TOPIC,
+            &source_observation(1, "13:40:45", None, "13:40:40"),
+        )
+        .is_err());
+    assert_eq!(format!("{fresh:?}"), before_fresh);
+    Ok(())
+}
+
+#[test]
+fn retained_observation_first_is_non_executable_until_local_coverage_and_one_full_bucket(
+) -> Result<()> {
+    let session_date = chrono::NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
+    let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
+
+    builder.ingest(TRADE_TOPIC, &tick(8_010, "13:29:50", 336, 2, 100))?;
+    builder.ingest(TRADE_TOPIC, &tick(8_011, "13:30:10", 337, 2, 200))?;
+    let first = builder.ingest_with_receipt(
+        STATUS_TOPIC,
+        &source_observation(8_012, "13:31:00", Some("13:30:45"), "13:30:10"),
+    )?;
+    assert!(first.bars.is_empty());
+    assert!(first.completion.is_none());
+    assert_eq!(builder.covered_through_us(), None);
+    assert!(!builder.has_complete_session(session_date));
+    assert!(!builder.partial_session_resume_is_safe(session_date));
+    assert_eq!(
+        first
+            .source_observation
+            .expect("retained source-observation anchor")
+            .previous_observed_at_us,
+        None
+    );
+
+    let second = builder.ingest_with_receipt(
+        STATUS_TOPIC,
+        &source_observation(8_013, "13:31:15", Some("13:31:00"), "13:30:10"),
+    )?;
+    assert!(second.bars.is_empty());
+    assert_eq!(builder.covered_through_us(), None);
+    assert_eq!(
+        second
+            .source_observation
+            .expect("locally chained pre-coverage observation")
+            .previous_observed_at_us,
+        Some(timestamp_us("13:31:00"))
+    );
+
+    let coverage_anchor = builder.ingest_with_receipt(
+        STATUS_TOPIC,
+        &status_with_previous(8_014, "13:31:20", "13:30:10"),
+    )?;
+    assert!(coverage_anchor.bars.is_empty());
+    assert_eq!(
+        coverage_anchor
+            .completion
+            .expect("retained completion anchor")
+            .previous_covered_through_us,
+        None
+    );
+    assert_eq!(builder.covered_through_us(), Some(timestamp_us("13:31:20")));
+    assert!(!builder.partial_session_resume_is_safe(session_date));
+
+    let before_mismatch = format!("{builder:?}");
+    assert!(builder
+        .ingest_with_receipt(
+            STATUS_TOPIC,
+            &source_observation(8_015, "13:31:30", Some("13:31:15"), "13:31:19"),
+        )
+        .is_err());
+    assert_eq!(format!("{builder:?}"), before_mismatch);
+    let exact = builder.ingest_with_receipt(
+        STATUS_TOPIC,
+        &source_observation(8_015, "13:31:30", Some("13:31:15"), "13:31:20"),
+    )?;
+    assert!(exact.bars.is_empty());
+
+    builder.ingest(TRADE_TOPIC, &tick(8_016, "13:35:01", 338, 2, 300))?;
+    builder.ingest(TRADE_TOPIC, &tick(8_017, "13:39:59", 339, 2, 400))?;
+    let first_local_bucket = builder.ingest_with_receipt(
+        STATUS_TOPIC,
+        &status_with_previous(8_018, "13:40:01", "13:31:20"),
+    )?;
+    assert_eq!(first_local_bucket.bars.len(), 1);
+    assert_eq!(
+        first_local_bucket.bars[0].timestamp.to_string(),
+        "2026-08-21 13:40:00"
+    );
+    assert_eq!(first_local_bucket.bars[0].open, Decimal::from_str("3.38")?);
+    assert_eq!(first_local_bucket.bars[0].close, Decimal::from_str("3.39")?);
+    assert!(builder.partial_session_resume_is_safe(session_date));
+    Ok(())
+}
+
+#[test]
 fn source_observations_are_separate_from_trade_coverage_and_never_release_bars() -> Result<()> {
     let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
     builder.ingest(TRADE_TOPIC, &tick(1, "09:31:00", 352, 2, 100))?;
@@ -310,6 +619,118 @@ fn source_observations_are_separate_from_trade_coverage_and_never_release_bars()
         Some(timestamp_us("09:35:30")),
     );
     assert_eq!(builder.covered_through_us(), covered);
+    Ok(())
+}
+
+#[test]
+fn source_clock_v2_is_accepted_without_changing_trade_coverage() -> Result<()> {
+    let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
+    builder.ingest(TRADE_TOPIC, &tick(1, "09:31:00", 352, 2, 100))?;
+    builder.ingest(STATUS_TOPIC, &status(2, "09:35:01", "LIVE_CONTIGUOUS"))?;
+    let covered = builder.covered_through_us();
+
+    let receipt = builder.ingest_with_receipt(
+        STATUS_TOPIC,
+        &source_observation_v2(3, "09:35:30", "09:35:24", None, "09:35:01"),
+    )?;
+    assert!(receipt.bars.is_empty());
+    assert_eq!(
+        receipt
+            .source_observation
+            .expect("clock-bound observation")
+            .observed_at_us,
+        timestamp_us("09:35:30")
+    );
+    assert_eq!(builder.covered_through_us(), covered);
+    Ok(())
+}
+
+#[test]
+fn source_https_clock_v3_is_accepted_and_forgery_is_atomic() -> Result<()> {
+    let base = || -> Result<WebTradeBarBuilder> {
+        let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
+        builder.ingest(TRADE_TOPIC, &tick(1, "09:31:00", 352, 2, 100))?;
+        builder.ingest(STATUS_TOPIC, &status(2, "09:35:01", "LIVE_CONTIGUOUS"))?;
+        Ok(builder)
+    };
+    let mut builder = base()?;
+    let receipt = builder.ingest_with_receipt(
+        STATUS_TOPIC,
+        &source_observation_v3(3, "09:35:30", "09:35:24", None, "09:35:01"),
+    )?;
+    assert_eq!(
+        receipt
+            .source_observation
+            .expect("HTTPS clock observation")
+            .covered_through_us,
+        timestamp_us("09:35:01")
+    );
+
+    for event in [
+        source_observation_v3(3, "09:35:30", "09:35:14", None, "09:35:01"),
+        source_observation_v3(3, "09:35:30", "09:35:31", None, "09:35:01"),
+        source_observation_v3_at(
+            3,
+            "2026-08-21 09:35:30",
+            "2026-08-20 09:35:24",
+            None,
+            "2026-08-21 09:35:01",
+        ),
+    ] {
+        let mut candidate = base()?;
+        let before = format!("{candidate:?}");
+        assert!(candidate.ingest_with_receipt(STATUS_TOPIC, &event).is_err());
+        assert_eq!(format!("{candidate:?}"), before);
+    }
+    Ok(())
+}
+
+#[test]
+fn forged_source_clock_v2_is_rejected_atomically() -> Result<()> {
+    let base = || -> Result<WebTradeBarBuilder> {
+        let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
+        builder.ingest(TRADE_TOPIC, &tick(1, "09:31:00", 352, 2, 100))?;
+        builder.ingest(STATUS_TOPIC, &status(2, "09:35:01", "LIVE_CONTIGUOUS"))?;
+        Ok(builder)
+    };
+    for event in [
+        source_observation_v2(3, "09:35:30", "09:35:14", None, "09:35:01"),
+        source_observation_v2(3, "09:35:30", "09:35:31", None, "09:35:01"),
+        source_observation_v2_at(
+            3,
+            "2026-08-21 09:35:30",
+            "2026-08-20 09:35:24",
+            None,
+            "2026-08-21 09:35:01",
+        ),
+    ] {
+        let mut builder = base()?;
+        let before = format!("{builder:?}");
+        assert!(builder.ingest_with_receipt(STATUS_TOPIC, &event).is_err());
+        assert_eq!(format!("{builder:?}"), before);
+    }
+
+    let mut missing_clock: Value = serde_json::from_slice(&source_observation_v2(
+        3, "09:35:30", "09:35:24", None, "09:35:01",
+    ))?;
+    missing_clock["payload"]
+        .as_object_mut()
+        .expect("payload object")
+        .remove("source_page_observed_at_us");
+    canonicalize_event_id(&mut missing_clock);
+    let mut builder = base()?;
+    assert!(builder
+        .ingest_with_receipt(STATUS_TOPIC, &serde_json::to_vec(&missing_clock)?)
+        .is_err());
+
+    let mut legacy_with_clock: Value =
+        serde_json::from_slice(&source_observation(3, "09:35:30", None, "09:35:01"))?;
+    legacy_with_clock["payload"]["source_page_observed_at_us"] = json!(timestamp_us("09:35:24"));
+    canonicalize_event_id(&mut legacy_with_clock);
+    let mut builder = base()?;
+    assert!(builder
+        .ingest_with_receipt(STATUS_TOPIC, &serde_json::to_vec(&legacy_with_clock)?)
+        .is_err());
     Ok(())
 }
 
@@ -464,23 +885,23 @@ fn javascript_durable_source_observation_bytes_are_accepted_by_the_rust_builder(
 #[test]
 fn source_sequence_gaps_conflicts_and_forged_event_ids_fail_closed_atomically() -> Result<()> {
     let mut builder = WebTradeBarBuilder::new("002256.SZ", 5)?;
-    let first = tick(42, "09:30:01", 355, 2, 100);
+    let first = tick(1, "09:30:01", 355, 2, 100);
     builder.ingest(TRADE_TOPIC, &first)?;
     assert!(
         builder.ingest(TRADE_TOPIC, &first)?.is_empty(),
         "exact MQTT redelivery is idempotent"
     );
     assert!(builder
-        .ingest(TRADE_TOPIC, &tick(44, "09:31:00", 354, 2, 100))
+        .ingest(TRADE_TOPIC, &tick(3, "09:31:00", 354, 2, 100))
         .is_err());
 
-    let mut forged: Value = serde_json::from_slice(&tick(43, "09:31:00", 354, 2, 100))?;
+    let mut forged: Value = serde_json::from_slice(&tick(2, "09:31:00", 354, 2, 100))?;
     forged["event_id"] = Value::String("0".repeat(64));
     assert!(builder
         .ingest(TRADE_TOPIC, &serde_json::to_vec(&forged)?)
         .is_err());
 
-    let bars = builder.ingest(STATUS_TOPIC, &status(43, "09:35:01", "LIVE_CONTIGUOUS"))?;
+    let bars = builder.ingest(STATUS_TOPIC, &status(2, "09:35:01", "LIVE_CONTIGUOUS"))?;
     assert_eq!(bars.len(), 1);
     assert_eq!(bars[0].open, Decimal::from_str("3.55")?);
     assert_eq!(bars[0].close, Decimal::from_str("3.55")?);
@@ -1344,6 +1765,22 @@ fn status_with_previous(sequence: u64, time: &str, previous: &str) -> Vec<u8> {
     serde_json::to_vec(&value).expect("status bytes")
 }
 
+fn status_with_previous_at(sequence: u64, time: &str, previous: &str) -> Vec<u8> {
+    let session_date = &time[..10];
+    event_at(
+        sequence,
+        "SOURCE_STATUS",
+        time,
+        json!({
+            "status": "LIVE_CONTIGUOUS",
+            "session_date": session_date,
+            "covered_through_us": timestamp_us_at(time),
+            "previous_covered_through_us": timestamp_us_at(previous),
+            "capture_sha256": "c".repeat(64),
+        }),
+    )
+}
+
 fn source_observation(
     sequence: u64,
     observed: &str,
@@ -1392,6 +1829,97 @@ fn source_observation_at(
         "row_count": 4,
         "capture_sha256": "c".repeat(64),
         "policy": "ACTIVE_REVIEWED_LATEST_FIRST_CYCLE_V1",
+    });
+    if let Some(previous) = previous_observed {
+        payload["previous_observed_at_us"] = json!(timestamp_us_at(previous));
+    }
+    event_with_recv(sequence, "SOURCE_STATUS", observed, observed, payload)
+}
+
+fn source_observation_v2(
+    sequence: u64,
+    observed: &str,
+    source_page_observed: &str,
+    previous_observed: Option<&str>,
+    covered_through: &str,
+) -> Vec<u8> {
+    source_observation_v2_at(
+        sequence,
+        &format!("2026-08-21 {observed}"),
+        &format!("2026-08-21 {source_page_observed}"),
+        previous_observed
+            .map(|previous| format!("2026-08-21 {previous}"))
+            .as_deref(),
+        &format!("2026-08-21 {covered_through}"),
+    )
+}
+
+fn source_observation_v2_at(
+    sequence: u64,
+    observed: &str,
+    source_page_observed: &str,
+    previous_observed: Option<&str>,
+    covered_through: &str,
+) -> Vec<u8> {
+    let session_date = &observed[..10];
+    let mut payload = json!({
+        "status": "SOURCE_OBSERVED_CURRENT",
+        "session_date": session_date,
+        "observed_at_us": timestamp_us_at(observed),
+        "source_page_observed_at_us": timestamp_us_at(source_page_observed),
+        "covered_through_us": timestamp_us_at(covered_through),
+        "latest_displayed_trade_us": timestamp_us_at(covered_through),
+        "page_index": 1,
+        "page_count": 1,
+        "row_count": 4,
+        "capture_sha256": "c".repeat(64),
+        "policy": "REVIEWED_SOURCE_CLOCK_LATEST_FIRST_V2",
+    });
+    if let Some(previous) = previous_observed {
+        payload["previous_observed_at_us"] = json!(timestamp_us_at(previous));
+    }
+    event_with_recv(sequence, "SOURCE_STATUS", observed, observed, payload)
+}
+
+fn source_observation_v3(
+    sequence: u64,
+    observed: &str,
+    source_server_observed: &str,
+    previous_observed: Option<&str>,
+    covered_through: &str,
+) -> Vec<u8> {
+    source_observation_v3_at(
+        sequence,
+        &format!("2026-08-21 {observed}"),
+        &format!("2026-08-21 {source_server_observed}"),
+        previous_observed
+            .map(|previous| format!("2026-08-21 {previous}"))
+            .as_deref(),
+        &format!("2026-08-21 {covered_through}"),
+    )
+}
+
+fn source_observation_v3_at(
+    sequence: u64,
+    observed: &str,
+    source_server_observed: &str,
+    previous_observed: Option<&str>,
+    covered_through: &str,
+) -> Vec<u8> {
+    let session_date = &observed[..10];
+    let mut payload = json!({
+        "status": "SOURCE_OBSERVED_CURRENT",
+        "session_date": session_date,
+        "observed_at_us": timestamp_us_at(observed),
+        "source_server_observed_at_us": timestamp_us_at(source_server_observed),
+        "source_clock_origin": "EASTMONEY_HTTPS_DATE_HEADER",
+        "covered_through_us": timestamp_us_at(covered_through),
+        "latest_displayed_trade_us": timestamp_us_at(covered_through),
+        "page_index": 1,
+        "page_count": 1,
+        "row_count": 4,
+        "capture_sha256": "c".repeat(64),
+        "policy": "REVIEWED_EASTMONEY_HTTPS_DATE_LATEST_FIRST_V3",
     });
     if let Some(previous) = previous_observed {
         payload["previous_observed_at_us"] = json!(timestamp_us_at(previous));

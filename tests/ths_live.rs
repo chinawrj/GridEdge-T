@@ -23,6 +23,8 @@ use rust_decimal::Decimal;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::os::unix::fs::PermissionsExt;
+use std::process::Command;
 use tempfile::tempdir;
 
 const SOURCE: &str = "0123456789abcdef0123456789abcdef";
@@ -57,6 +59,10 @@ mod live_subject {
         expected_symbol: &str,
     ) -> anyhow::Result<usize> {
         Ok(load_unique_bars(path, expected_symbol)?.len())
+    }
+
+    pub(super) fn publish_android_ready(path: &std::path::Path) -> anyhow::Result<()> {
+        publish_android_preflight_handshake(path)
     }
 
     pub(super) fn audit_known_contracts(
@@ -194,6 +200,7 @@ mod live_subject {
         observation_is_current: bool,
         previous_observation_is_contiguous: bool,
         session_matches_today: bool,
+        trade_coverage_is_current: bool,
     ) -> (bool, bool) {
         (
             source_observation_requires_recovery(
@@ -201,12 +208,14 @@ mod live_subject {
                 observation_is_current,
                 previous_observation_is_contiguous,
                 session_matches_today,
+                trade_coverage_is_current,
             ),
             source_observation_allows_resume(
                 mode,
                 observation_is_current,
                 previous_observation_is_contiguous,
                 session_matches_today,
+                trade_coverage_is_current,
             ),
         )
     }
@@ -311,31 +320,57 @@ fn every_unknown_nonterminal_contract_blocks_before_market_or_order_ui() {
 }
 
 #[test]
-fn launch_agent_starts_only_weekdays_at_0900_and_restarts_only_failures() {
+fn shadow_market_consumers_must_use_an_explicit_isolated_mqtt_session_identity() {
+    let source = std::fs::read_to_string("src/bin/gridedge_ths_live.rs")
+        .expect("reviewed live worker source");
+    assert!(source.contains("market_mqtt_client_id: Option<String>"));
+    assert!(source.contains("market_mqtt_topic_namespace: String"));
+    assert!(source.contains("gridedge-paper-committed-{quote_symbol}"));
+    assert!(source.contains("market MQTT client id is outside the reviewed identity alphabet"));
+    assert!(source.contains(".market_mqtt_client_id"));
+    assert!(source.contains("market_client_id,"));
+    assert!(source.contains("&args.market_mqtt_topic_namespace,"));
+}
+
+#[test]
+fn launch_agent_is_identity_only_and_cannot_compete_with_the_trusted_guard() {
     let plist = std::fs::read_to_string("deploy/com.gridedge.ths-sim.plist")
         .expect("reviewed launch-agent template");
 
-    for weekday in 2..=6 {
-        assert_eq!(
-            plist
-                .matches(&format!("<key>Weekday</key><integer>{weekday}</integer>"))
-                .count(),
-            1
-        );
-    }
+    let plist_json = Command::new("plutil")
+        .args([
+            "-convert",
+            "json",
+            "-o",
+            "-",
+            "deploy/com.gridedge.ths-sim.plist",
+        ])
+        .output()
+        .expect("plutil must inspect the LaunchAgent template");
+    assert!(plist_json.status.success());
+    let plist_value: serde_json::Value =
+        serde_json::from_slice(&plist_json.stdout).expect("plist JSON");
+    let actual_keys = plist_value
+        .as_object()
+        .expect("plist top-level dictionary")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let allowed_keys = [
+        "EnvironmentVariables",
+        "Label",
+        "ProcessType",
+        "ProgramArguments",
+        "StandardErrorPath",
+        "StandardOutPath",
+        "WorkingDirectory",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
     assert_eq!(
-        plist.matches("<key>Hour</key><integer>9</integer>").count(),
-        5
+        actual_keys, allowed_keys,
+        "LaunchAgent gained an activation trigger"
     );
-    assert_eq!(
-        plist
-            .matches("<key>Minute</key><integer>0</integer>")
-            .count(),
-        5
-    );
-    assert!(plist
-        .contains("<key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key>\n    <false/>"));
-    assert!(plist.contains("<key>ThrottleInterval</key>\n  <integer>60</integer>"));
     let deployment_root = "__GRIDEDGE_DEPLOYMENT_ROOT__";
     assert!(plist.contains(&format!("{deployment_root}/bin/run_ths_android_sim.sh")));
     assert!(plist.contains(&format!("{deployment_root}/config/ths_002256_sim.yaml")));
@@ -383,6 +418,7 @@ fn launch_agent_starts_only_weekdays_at_0900_and_restarts_only_failures() {
         "--android-adb-path",
         "--execution-runner-file",
         "--execution-launch-plist-file",
+        "--execution-guard-file",
     ] {
         assert!(
             plist.contains(required),
@@ -405,25 +441,55 @@ fn launch_agent_starts_only_weekdays_at_0900_and_restarts_only_failures() {
     assert!(android_runner.contains("android-runner-failures"));
     assert!(android_runner.contains("daily circuit breaker is open"));
     assert!(android_runner.contains("failure_count + 1"));
-    assert!(android_runner.contains("\"$deployment_root/bin/gridedge_ths_live\" \"$@\""));
+    assert!(android_runner.contains("--android-preflight-handshake-file \"$startup_handshake\""));
+    assert!(android_runner
+        .contains("mktemp \"$deployment_root/runtime/.android-preflight-handshake.XXXXXX\""));
+    assert!(android_runner.contains("[ \"$handshake_pid\" = \"$worker_pid\" ]"));
+    assert!(
+        android_runner.contains("[ \"$actual_handshake_bytes\" = \"$expected_handshake_bytes\" ]")
+    );
+    assert!(android_runner.contains("  \"$@\""));
 
     let installer = std::fs::read_to_string("deploy/install_ths_sim.sh")
         .expect("reviewed deployment installer");
+    let publisher = std::fs::read_to_string("deploy/publish_ths_sim_staged.sh")
+        .expect("reviewed atomic deployment publisher");
     let staging = std::fs::read_to_string("deploy/stage_ths_sim.sh")
         .expect("reviewed signed artifact staging boundary");
-    assert!(staging.contains("cargo build --locked --release --bin gridedge_ths_live"));
+    assert!(
+        staging.contains("cargo build --locked --release --bin gridedge_ths_live --bin gridedge")
+    );
     assert!(staging.contains("GRIDEDGE_CODESIGN_IDENTITY"));
     assert!(staging.contains("codesign --force --sign"));
     assert!(staging.contains("--identifier com.gridedge.ths-live"));
     assert!(staging.contains("candidate_sha256=$(shasum -a 256"));
     assert!(staging.contains("gridedge_ths_live-$candidate_sha256"));
+    assert!(staging.contains("gridedge-validator-$validator_sha256"));
+    assert!(staging.contains("GRIDEDGE_VALIDATOR_BINARY"));
+    assert!(staging.contains("GRIDEDGE_VALIDATOR_SHA256"));
     assert!(installer.contains("GRIDEDGE_CODESIGN_TEAM_ID"));
     assert!(installer.contains("WM4JXVE5GV"));
     assert!(installer.contains("GRIDEDGE_SIGNED_BINARY"));
     assert!(installer.contains("GRIDEDGE_SIGNED_SHA256"));
+    assert!(installer.contains("GRIDEDGE_VALIDATOR_BINARY"));
+    assert!(installer.contains("GRIDEDGE_VALIDATOR_SHA256"));
+    assert!(
+        installer.contains("\"$validator_binary\" validate-config --config \"$config_candidate\"")
+    );
+    assert!(!installer.contains("target/release/gridedge validate-config"));
     assert!(!installer.contains("codesign --force --sign"));
     assert!(!installer.contains("cargo build"));
     assert!(installer.contains("install -m 755 deploy/run_ths_android_sim.sh"));
+    assert!(installer.contains("install -m 755 deploy/run_ths_trusted_session_guard.sh"));
+    assert!(installer.contains("sh deploy/publish_ths_sim_staged.sh"));
+    assert!(publisher.contains("sh deploy/quiesce_ths_runtime.sh"));
+    assert!(publisher.contains("GRIDEDGE_QUIESCE_ASSERT_ONLY=1"));
+    assert!(publisher.contains("ths-deployment-coordination.lock"));
+    assert!(publisher.contains("ths-deployment-maintenance"));
+    assert!(installer.contains("cmp deploy/run_ths_android_sim.sh \"$runner_candidate\""));
+    assert!(installer.contains("cmp deploy/run_ths_trusted_session_guard.sh \"$guard_candidate\""));
+    assert!(installer.contains("sh -n \"$runner_candidate\" \"$guard_candidate\""));
+    assert!(installer.contains("rendered LaunchAgent keys differ from identity-only allowlist"));
     assert!(installer.contains("codesign --verify --strict"));
     assert!(installer.contains("TeamIdentifier=$codesign_team_id"));
     assert!(installer.contains("frozen signed worker must not use an ad-hoc signature"));
@@ -437,18 +503,1019 @@ fn launch_agent_starts_only_weekdays_at_0900_and_restarts_only_failures() {
         .find("if [ \"$candidate_sha256\" != \"$expected_sha256\" ]")
         .expect("target-directory candidate SHA is rechecked");
     let publish = installer
-        .find("mv -f \"$installed_candidate\" \"$installed_binary\"")
-        .expect("verified candidate is atomically published");
+        .find("sh deploy/publish_ths_sim_staged.sh")
+        .expect("verified candidates are published only after launchd is absent");
     let final_sha = installer
         .find("if [ \"$installed_sha256\" != \"$expected_sha256\" ]")
         .expect("published binary SHA is checked again");
     assert!(verify_sha < stage_copy && stage_copy < candidate_sha);
     assert!(candidate_sha < publish && publish < final_sha);
+    let bootout = publisher.find("bootout").expect("launchd bootout");
+    let quiesce = publisher
+        .find("sh deploy/quiesce_ths_runtime.sh")
+        .expect("old trusted-session owner is stopped");
+    let final_absence = publisher
+        .find("GRIDEDGE_QUIESCE_ASSERT_ONLY=1")
+        .expect("final owner absence proof");
+    let replace = publisher
+        .find("mv -f \"$staged_binary\"")
+        .expect("first atomic replacement");
+    assert!(bootout < quiesce && quiesce < final_absence && final_absence < replace);
     assert!(installer.contains("cmp \"$release_binary\" \"$installed_candidate\""));
     assert!(installer.contains("installed_sha256=$(shasum -a 256 \"$installed_binary\""));
     assert!(installer.contains(r#"tell process "Dock""#));
     assert!(installer.contains("grep -F '/usr/bin/open'"));
     assert!(installer.contains("grep -F 'cn.com.10jqka.macstockPro'"));
+}
+
+#[test]
+fn installer_rejects_a_tampered_frozen_validator_before_any_publication() -> Result<()> {
+    let directory = tempdir()?;
+    let deployment_root = directory.path().join("deployment");
+    let user_home = directory.path().join("home");
+    let validator = directory.path().join("gridedge-validator");
+    let signed_worker = directory.path().join("signed-worker");
+    std::fs::write(&validator, b"validator bytes changed after staging\n")?;
+    std::fs::write(&signed_worker, b"not reached\n")?;
+    for path in [&validator, &signed_worker] {
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o555);
+        std::fs::set_permissions(path, permissions)?;
+    }
+
+    let output = Command::new("sh")
+        .arg("deploy/install_ths_sim.sh")
+        .env("GRIDEDGE_DEPLOYMENT_ROOT", &deployment_root)
+        .env("GRIDEDGE_USER_HOME", &user_home)
+        .env("GRIDEDGE_ANDROID_SDK_ROOT", directory.path())
+        .env("GRIDEDGE_ANDROID_MASKED_ACCOUNT", "**0000")
+        .env("GRIDEDGE_MARKET_HOST", "127.0.0.1")
+        .env("GRIDEDGE_SIGNED_BINARY", &signed_worker)
+        .env("GRIDEDGE_SIGNED_SHA256", "0".repeat(64))
+        .env("GRIDEDGE_VALIDATOR_BINARY", &validator)
+        .env("GRIDEDGE_VALIDATOR_SHA256", "0".repeat(64))
+        .output()?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("frozen validator differs from its staged SHA-256"));
+    assert!(
+        !deployment_root.exists(),
+        "validator tamper must fail before creating any publication target"
+    );
+    assert!(!user_home.exists());
+    Ok(())
+}
+
+#[test]
+fn launch_agent_unload_failure_matrix_never_publishes_mixed_runtime_files() -> Result<()> {
+    let directory = tempdir()?;
+    let fake_launchctl = directory.path().join("launchctl");
+    std::fs::write(
+        &fake_launchctl,
+        r#"#!/bin/sh
+case "$1" in
+  print)
+    if [ "$FAKE_MODE" = absent ] || { [ "$FAKE_MODE" = loaded_success ] && [ -f "$FAKE_STATE" ]; }; then
+      echo "Could not find service" >&2
+      exit 113
+    fi
+    exit 0
+    ;;
+  bootout)
+    case "$FAKE_MODE" in
+      loaded_success) : >"$FAKE_STATE"; exit 0 ;;
+      loaded_fail) exit 1 ;;
+      sticky) exit 0 ;;
+      *) exit 64 ;;
+    esac
+    ;;
+esac
+exit 64
+"#,
+    )?;
+    let mut permissions = std::fs::metadata(&fake_launchctl)?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_launchctl, permissions)?;
+    let fake_tmux = directory.path().join("tmux-empty");
+    std::fs::write(&fake_tmux, "#!/bin/sh\nexit 0\n")?;
+    let fake_pgrep = directory.path().join("pgrep-empty");
+    std::fs::write(&fake_pgrep, "#!/bin/sh\nexit 1\n")?;
+    for path in [&fake_tmux, &fake_pgrep] {
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions)?;
+    }
+
+    for (mode, succeeds) in [
+        ("absent", true),
+        ("loaded_success", true),
+        ("loaded_fail", false),
+        ("sticky", false),
+    ] {
+        let root = directory.path().join(mode);
+        std::fs::create_dir_all(&root)?;
+        std::fs::create_dir_all(root.join("runtime"))?;
+        let mut arguments = Vec::new();
+        let mut targets = Vec::new();
+        for index in 0..5 {
+            let staged = root.join(format!(".candidate-{index}"));
+            let target = root.join(format!("target-{index}"));
+            std::fs::write(&staged, format!("new-{index}"))?;
+            std::fs::write(&target, format!("old-{index}"))?;
+            arguments.push(staged);
+            arguments.push(target.clone());
+            targets.push(target);
+        }
+        let status = Command::new("sh")
+            .arg("deploy/publish_ths_sim_staged.sh")
+            .args(&arguments)
+            .env("GRIDEDGE_LAUNCHCTL_BIN", &fake_launchctl)
+            .env("GRIDEDGE_LAUNCHD_DOMAIN", "gui/501")
+            .env("GRIDEDGE_DEPLOYMENT_ROOT", &root)
+            .env("GRIDEDGE_TMUX_BIN", &fake_tmux)
+            .env("GRIDEDGE_PGREP_BIN", &fake_pgrep)
+            .env("GRIDEDGE_SLEEP_BIN", "/usr/bin/true")
+            .env("FAKE_MODE", mode)
+            .env("FAKE_STATE", root.join("unloaded"))
+            .status()?;
+        assert_eq!(status.success(), succeeds, "unexpected result for {mode}");
+        for (index, target) in targets.iter().enumerate() {
+            let expected = if succeeds {
+                format!("new-{index}")
+            } else {
+                format!("old-{index}")
+            };
+            assert_eq!(std::fs::read_to_string(target)?, expected, "mode={mode}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn trusted_guard_handoff_stops_old_owner_without_spending_the_breaker() -> Result<()> {
+    let directory = tempdir()?;
+    let runtime = directory.path().join("runtime");
+    std::fs::create_dir_all(&runtime)?;
+    let breaker = runtime.join("android-runner-failures");
+    std::fs::write(&breaker, "2026-09-03 2\n")?;
+    let state = directory.path().join("stopped");
+    let fake_tmux = directory.path().join("tmux");
+    std::fs::write(
+        &fake_tmux,
+        r#"#!/bin/sh
+case "$*" in
+  *list-sessions*) [ -f "$FAKE_STATE" ] || echo ths_worker; exit 0 ;;
+  *kill-session*) : >"$FAKE_STATE"; exit 0 ;;
+esac
+exit 64
+"#,
+    )?;
+    let fake_pgrep = directory.path().join("pgrep");
+    std::fs::write(
+        &fake_pgrep,
+        r#"#!/bin/sh
+[ -f "$FAKE_STATE" ] && exit 1
+echo 4242
+exit 0
+"#,
+    )?;
+    for path in [&fake_tmux, &fake_pgrep] {
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions)?;
+    }
+
+    let status = Command::new("sh")
+        .arg("deploy/quiesce_ths_runtime.sh")
+        .env("GRIDEDGE_DEPLOYMENT_ROOT", directory.path())
+        .env("GRIDEDGE_TMUX_BIN", &fake_tmux)
+        .env("GRIDEDGE_PGREP_BIN", &fake_pgrep)
+        .env("GRIDEDGE_SLEEP_BIN", "/usr/bin/true")
+        .env("FAKE_STATE", &state)
+        .status()?;
+    assert!(status.success());
+    assert!(state.exists(), "old tmux owner was not stopped");
+    assert_eq!(std::fs::read_to_string(breaker)?, "2026-09-03 2\n");
+    Ok(())
+}
+
+#[test]
+fn trusted_guard_handoff_does_not_mistake_tmux_server_argv_for_a_guard() -> Result<()> {
+    let directory = tempdir()?;
+    let runtime = directory.path().join("runtime");
+    std::fs::create_dir_all(&runtime)?;
+    std::fs::write(runtime.join("android-runner-failures"), "2026-09-04 2\n")?;
+    let fake_tmux = directory.path().join("tmux-empty");
+    std::fs::write(&fake_tmux, "#!/bin/sh\nexit 0\n")?;
+    let fake_pgrep = directory.path().join("pgrep-checks-guard-pattern");
+    std::fs::write(
+        &fake_pgrep,
+        r#"#!/bin/sh
+pattern=$2
+case "$pattern" in
+  *gridedge_ths_live*) exit 1 ;;
+esac
+case "$pattern" in
+  '^'*) ;;
+  *) echo 4242; exit 0 ;;
+esac
+case "$pattern" in
+  *'(sh|bash|zsh)'*'/bin/run_ths_trusted_session_guard\.sh'*) exit 1 ;;
+  *) echo 4242; exit 0 ;;
+esac
+"#,
+    )?;
+    for path in [&fake_tmux, &fake_pgrep] {
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions)?;
+    }
+
+    let status = Command::new("sh")
+        .arg("deploy/quiesce_ths_runtime.sh")
+        .env("GRIDEDGE_DEPLOYMENT_ROOT", directory.path())
+        .env("GRIDEDGE_TMUX_BIN", &fake_tmux)
+        .env("GRIDEDGE_PGREP_BIN", &fake_pgrep)
+        .env("GRIDEDGE_SLEEP_BIN", "/usr/bin/true")
+        .status()?;
+    assert!(status.success());
+    assert_eq!(
+        std::fs::read_to_string(runtime.join("android-runner-failures"))?,
+        "2026-09-04 2\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn trusted_guard_handoff_rejects_every_full_breaker_byte_change() -> Result<()> {
+    let directory = tempdir()?;
+    let runtime = directory.path().join("runtime");
+    std::fs::create_dir_all(&runtime)?;
+    let fake_tmux = directory.path().join("tmux-empty");
+    std::fs::write(&fake_tmux, "#!/bin/sh\nexit 0\n")?;
+    let fake_pgrep = directory.path().join("pgrep-mutates-breaker");
+    std::fs::write(
+        &fake_pgrep,
+        r#"#!/bin/sh
+if [ ! -f "$FAKE_MARKER" ]; then
+  case "$FAKE_MUTATION" in
+    append) printf 'tail\n' >>"$FAKE_BREAKER" ;;
+    delete) rm -f "$FAKE_BREAKER" ;;
+    create) printf 'created\n' >"$FAKE_BREAKER" ;;
+    newline) printf '2026-09-03 2' >"$FAKE_BREAKER" ;;
+  esac
+  : >"$FAKE_MARKER"
+fi
+exit 1
+"#,
+    )?;
+    for path in [&fake_tmux, &fake_pgrep] {
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions)?;
+    }
+    for mutation in ["append", "delete", "create", "newline"] {
+        let breaker = runtime.join("android-runner-failures");
+        if mutation == "create" {
+            let _ = std::fs::remove_file(&breaker);
+        } else {
+            std::fs::write(&breaker, "2026-09-03 2\n")?;
+        }
+        let marker = runtime.join(format!("mutation-{mutation}"));
+        let status = Command::new("sh")
+            .arg("deploy/quiesce_ths_runtime.sh")
+            .env("GRIDEDGE_DEPLOYMENT_ROOT", directory.path())
+            .env("GRIDEDGE_TMUX_BIN", &fake_tmux)
+            .env("GRIDEDGE_PGREP_BIN", &fake_pgrep)
+            .env("GRIDEDGE_SLEEP_BIN", "/usr/bin/true")
+            .env("FAKE_MUTATION", mutation)
+            .env("FAKE_BREAKER", &breaker)
+            .env("FAKE_MARKER", marker)
+            .status()?;
+        assert!(
+            !status.success(),
+            "breaker mutation {mutation} was accepted"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn deployment_lock_rejects_a_guard_reappearing_after_first_quiescence() -> Result<()> {
+    let directory = tempdir()?;
+    let runtime = directory.path().join("runtime");
+    std::fs::create_dir_all(&runtime)?;
+    std::fs::write(runtime.join("android-runner-failures"), "2026-09-03 2\n")?;
+    let race_marker = directory.path().join("race");
+    let fake_launchctl = directory.path().join("launchctl-absent");
+    std::fs::write(
+        &fake_launchctl,
+        "#!/bin/sh\necho 'Could not find service' >&2\nexit 113\n",
+    )?;
+    let fake_tmux = directory.path().join("tmux-empty");
+    std::fs::write(&fake_tmux, "#!/bin/sh\nexit 0\n")?;
+    let fake_pgrep = directory.path().join("pgrep-race");
+    std::fs::write(
+        &fake_pgrep,
+        "#!/bin/sh\n[ -f \"$FAKE_RACE_MARKER\" ] || exit 1\necho 4242\nexit 0\n",
+    )?;
+    let hook = directory.path().join("inject-race");
+    std::fs::write(&hook, "#!/bin/sh\n: >\"$FAKE_RACE_MARKER\"\n")?;
+    for path in [&fake_launchctl, &fake_tmux, &fake_pgrep, &hook] {
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions)?;
+    }
+    let mut arguments = Vec::new();
+    let mut targets = Vec::new();
+    for index in 0..5 {
+        let staged = directory.path().join(format!(".candidate-{index}"));
+        let target = directory.path().join(format!("target-{index}"));
+        std::fs::write(&staged, format!("new-{index}"))?;
+        std::fs::write(&target, format!("old-{index}"))?;
+        arguments.push(staged);
+        arguments.push(target.clone());
+        targets.push(target);
+    }
+    let status = Command::new("sh")
+        .arg("deploy/publish_ths_sim_staged.sh")
+        .args(arguments)
+        .env("GRIDEDGE_DEPLOYMENT_ROOT", directory.path())
+        .env("GRIDEDGE_LAUNCHD_DOMAIN", "gui/501")
+        .env("GRIDEDGE_LAUNCHCTL_BIN", &fake_launchctl)
+        .env("GRIDEDGE_TMUX_BIN", &fake_tmux)
+        .env("GRIDEDGE_PGREP_BIN", &fake_pgrep)
+        .env("GRIDEDGE_SLEEP_BIN", "/usr/bin/true")
+        .env("GRIDEDGE_DEPLOY_TEST_MODE", "1")
+        .env("GRIDEDGE_DEPLOY_TEST_AFTER_QUIESCE_HOOK", &hook)
+        .env("FAKE_RACE_MARKER", &race_marker)
+        .status()?;
+    assert!(!status.success());
+    for (index, target) in targets.iter().enumerate() {
+        assert_eq!(std::fs::read_to_string(target)?, format!("old-{index}"));
+    }
+    Ok(())
+}
+
+#[test]
+fn trusted_session_guard_survives_the_ai_app_and_preserves_fail_closed_startup() {
+    let guard = std::fs::read_to_string("deploy/run_ths_trusted_session_guard.sh")
+        .expect("reviewed app-independent trusted-session guard");
+
+    for required in [
+        "GRIDEDGE_DEPLOYMENT_ROOT",
+        "GRIDEDGE_ANDROID_SDK_ROOT",
+        "GRIDEDGE_MARKET_HOST",
+        "GRIDEDGE_ANDROID_MASKED_ACCOUNT",
+        "GRIDEDGE_REVIEWED_SESSION_DATE",
+        "run_ths_android_sim.sh",
+        "--allow-partial-session-resume-boundary",
+        "--android-money-actions-enabled",
+        "--maximum-unchanged-seconds",
+        "android-runner-failures",
+        "$pgrep_bin -f",
+        "multiple formal workers",
+        "09:00",
+        "11:30",
+        "12:55",
+        "15:05",
+    ] {
+        assert!(
+            guard.contains(required),
+            "missing guard contract {required}"
+        );
+    }
+    assert!(guard.contains("trap stop_guard HUP INT TERM"));
+    let dependency_gate = guard
+        .find("worker_deferred dependency=")
+        .expect("trusted guard must defer before spending the Android breaker");
+    let runner_start = guard
+        .find("worker_start mode=READ_ONLY_FIRST")
+        .expect("trusted guard worker start");
+    assert!(dependency_gate < runner_start);
+    for required in [
+        "adb devices",
+        "sys.boot_completed",
+        "ro.boot.qemu.avd_name",
+        "THSP_API_32",
+        "pgrep_bin=/usr/bin/pgrep",
+        "$pgrep_bin -x \"Google Chrome\"",
+        "nc_bin=/usr/bin/nc",
+        "$nc_bin -z -w 3",
+        "breaker_unchanged=true",
+    ] {
+        assert!(
+            guard.contains(required),
+            "missing dependency gate {required}"
+        );
+    }
+    assert!(
+        guard.contains("hour=${hour#0}") && guard.contains("minute=${minute#0}"),
+        "guard must parse zero-padded clock fields without a command whose zero result exits under set -e"
+    );
+    assert!(
+        !guard.contains("expr \"$hour\" + 0") && !guard.contains("expr \"$minute\" + 0"),
+        "POSIX expr exits nonzero when the value is 0 and would kill the guard at every top of hour"
+    );
+
+    for forbidden in [
+        "launchctl",
+        "osascript",
+        "-wipe-data",
+        "rm -f \"$failure_state\"",
+        "android-runner-failures.*0",
+    ] {
+        assert!(
+            !guard.contains(forbidden),
+            "trusted-session guard must not bypass {forbidden}"
+        );
+    }
+
+    let project_contract = std::fs::read_to_string("AGENTS.md").expect("project contract");
+    assert!(project_contract.contains("heartbeat scheduler are supervisory tools"));
+    assert!(project_contract.contains("app-independent reviewed guard"));
+    assert!(project_contract.contains("solely to a future heartbeat"));
+    let starter = std::fs::read_to_string("deploy/start_ths_trusted_session.sh")
+        .expect("reviewed trusted-session starter");
+    assert!(starter.contains("ths-deployment-coordination.lock"));
+    assert!(starter.contains("ths-deployment-maintenance"));
+    assert!(starter.contains("new-session -d -s \"$tmux_session\""));
+    assert!(starter.contains("has-session -t \"$tmux_session\""));
+    assert!(starter.contains("-e \"GRIDEDGE_DEPLOYMENT_ROOT=$deployment_root\""));
+    assert!(starter.contains("ths-trusted-session-guard.lock/ready"));
+    assert!(guard.contains("guard_lock/ready"));
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn guard_dependency_deferrals_never_run_worker_or_change_breaker_bytes() -> Result<()> {
+    let current_date = String::from_utf8(Command::new("date").arg("+%Y-%m-%d").output()?.stdout)?;
+    let current_date = current_date.trim();
+    for (mode, expected_reason) in [
+        ("android_offline", "ANDROID_NOT_READY"),
+        ("android_extra_unauthorized", "ANDROID_NOT_READY"),
+        ("android_wrong_serial", "ANDROID_NOT_READY"),
+        ("android_not_booted", "ANDROID_NOT_READY"),
+        ("android_wrong_avd", "ANDROID_NOT_READY"),
+        ("chrome_missing", "CHROME_NOT_RUNNING"),
+        ("mqtt_missing", "MARKET_MQTT_UNREACHABLE"),
+    ] {
+        let directory = tempfile::Builder::new()
+            .prefix("gridedge-guard-test-")
+            .tempdir_in("/tmp")?;
+        let deployment_root = directory.path();
+        let bin = deployment_root.join("bin");
+        let runtime = deployment_root.join("runtime");
+        let logs = deployment_root.join("logs");
+        let sdk = deployment_root.join("sdk");
+        let platform_tools = sdk.join("platform-tools");
+        std::fs::create_dir_all(&bin)?;
+        std::fs::create_dir_all(&runtime)?;
+        std::fs::create_dir_all(&logs)?;
+        std::fs::create_dir_all(&platform_tools)?;
+
+        let guard = bin.join("run_ths_trusted_session_guard.sh");
+        std::fs::copy("deploy/run_ths_trusted_session_guard.sh", &guard)?;
+        let worker_marker = runtime.join("worker-ran");
+        let runner = bin.join("run_ths_android_sim.sh");
+        std::fs::write(
+            &runner,
+            format!("#!/bin/sh\ntouch {:?}\nexit 99\n", worker_marker),
+        )?;
+        let adb = platform_tools.join("adb");
+        std::fs::write(
+            &adb,
+            r#"#!/bin/sh
+if [ "$1" = devices ]; then
+  printf 'List of devices attached\n'
+  case "$GRIDEDGE_GUARD_TEST_CASE" in
+    android_offline) printf 'emulator-5554\toffline\n' ;;
+    android_extra_unauthorized)
+      printf 'emulator-5554\tdevice\nother-device\tunauthorized\n'
+      ;;
+    android_wrong_serial) printf 'emulator-5556\tdevice\n' ;;
+    *) printf 'emulator-5554\tdevice\n' ;;
+  esac
+  exit 0
+fi
+case "$*" in
+  *get-state*)
+    [ "$GRIDEDGE_GUARD_TEST_CASE" = android_offline ] && printf 'offline\n' || printf 'device\n'
+    ;;
+  *sys.boot_completed*)
+    [ "$GRIDEDGE_GUARD_TEST_CASE" = android_not_booted ] && printf '0\n' || printf '1\n'
+    ;;
+  *ro.boot.qemu.avd_name*)
+    [ "$GRIDEDGE_GUARD_TEST_CASE" = android_wrong_avd ] && printf 'OTHER_AVD\n' || printf 'THSP_API_32\n'
+    ;;
+  *) exit 1 ;;
+esac
+"#,
+        )?;
+        let fake_pgrep = deployment_root.join("pgrep");
+        std::fs::write(
+            &fake_pgrep,
+            r#"#!/bin/sh
+if [ "$1" = -f ]; then exit 1; fi
+if [ "$GRIDEDGE_GUARD_TEST_CASE" = chrome_missing ]; then exit 1; fi
+exit 0
+"#,
+        )?;
+        let fake_nc = deployment_root.join("nc");
+        std::fs::write(
+            &fake_nc,
+            r#"#!/bin/sh
+[ "$GRIDEDGE_GUARD_TEST_CASE" = mqtt_missing ] && exit 1
+exit 0
+"#,
+        )?;
+        for path in [&guard, &runner, &adb, &fake_pgrep, &fake_nc] {
+            let mut permissions = std::fs::metadata(path)?.permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions)?;
+        }
+
+        let breaker = runtime.join("android-runner-failures");
+        let breaker_bytes = format!("{current_date} 2\n").into_bytes();
+        std::fs::write(&breaker, &breaker_bytes)?;
+        let status = Command::new(&guard)
+            .env("GRIDEDGE_DEPLOYMENT_ROOT", deployment_root)
+            .env("GRIDEDGE_ANDROID_SDK_ROOT", &sdk)
+            .env("GRIDEDGE_MARKET_HOST", "market.invalid")
+            .env("GRIDEDGE_ANDROID_MASKED_ACCOUNT", "**0208")
+            .env("GRIDEDGE_REVIEWED_SESSION_DATE", current_date)
+            .env("GRIDEDGE_USER_HOME", "/Users/example")
+            .env("GRIDEDGE_DEPLOY_TEST_MODE", "1")
+            .env("GRIDEDGE_GUARD_DEPENDENCY_TEST_MODE", "1")
+            .env("GRIDEDGE_GUARD_TEST_PGREP_BIN", &fake_pgrep)
+            .env("GRIDEDGE_GUARD_TEST_NC_BIN", &fake_nc)
+            .env("GRIDEDGE_GUARD_TEST_CASE", mode)
+            .status()?;
+        assert!(status.success(), "guard dependency case {mode} failed");
+        assert!(!worker_marker.exists(), "{mode} invoked the formal runner");
+        assert_eq!(
+            std::fs::read(&breaker)?,
+            breaker_bytes,
+            "{mode} changed breaker bytes"
+        );
+        let log = std::fs::read_to_string(logs.join("trusted-session-guard.log"))?;
+        assert!(
+            log.contains(&format!(
+                "worker_deferred dependency={expected_reason} breaker_unchanged=true"
+            )),
+            "{mode} logged the wrong dependency deferral: {log}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn android_breaker_counts_only_failures_before_the_read_only_preflight_handshake() -> Result<()> {
+    let current_date = String::from_utf8(Command::new("date").arg("+%Y-%m-%d").output()?.stdout)?;
+    let current_date = current_date.trim();
+    for (mode, expected_count) in [
+        ("before_preflight", 2),
+        ("forged_preflight_pid", 2),
+        ("forged_preflight_extra_line", 2),
+        ("after_preflight", 1),
+    ] {
+        let directory = tempfile::Builder::new()
+            .prefix("gridedge-runner-test-")
+            .tempdir_in("/tmp")?;
+        let deployment_root = directory.path();
+        let bin = deployment_root.join("bin");
+        let runtime = deployment_root.join("runtime");
+        let logs = deployment_root.join("logs");
+        let sdk = deployment_root.join("sdk");
+        let platform_tools = sdk.join("platform-tools");
+        let emulator_dir = sdk.join("emulator");
+        std::fs::create_dir_all(&bin)?;
+        std::fs::create_dir_all(&runtime)?;
+        std::fs::create_dir_all(&logs)?;
+        std::fs::create_dir_all(deployment_root.join("android-ths"))?;
+        std::fs::create_dir_all(&platform_tools)?;
+        std::fs::create_dir_all(&emulator_dir)?;
+        std::fs::write(
+            deployment_root.join("android-ths/confirmation-account.sha256"),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+        )?;
+
+        let runner = bin.join("run_ths_android_sim.sh");
+        std::fs::copy("deploy/run_ths_android_sim.sh", &runner)?;
+        let adb = platform_tools.join("adb");
+        std::fs::write(
+            &adb,
+            r#"#!/bin/sh
+if [ "$1" = devices ]; then printf 'List of devices attached\nemulator-5554\tdevice\n'; exit 0; fi
+case "$*" in
+  *get-state*) printf 'device\n' ;;
+  *sys.boot_completed*) printf '1\n' ;;
+  *ro.boot.qemu.avd_name*) printf 'THSP_API_32\n' ;;
+  *) exit 0 ;;
+esac
+"#,
+        )?;
+        let emulator = emulator_dir.join("emulator");
+        std::fs::write(&emulator, "#!/bin/sh\nexit 99\n")?;
+        let worker = bin.join("gridedge_ths_live");
+        std::fs::write(
+            &worker,
+            r#"#!/bin/sh
+handshake=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --android-preflight-handshake-file ]; then handshake=$2; shift 2; continue; fi
+  shift
+done
+if [ "$GRIDEDGE_RUNNER_TEST_MODE" = after_preflight ]; then
+  printf 'GRIDEDGE_ANDROID_PREFLIGHT_OK_V1 %s\n' "$$" >"$handshake"
+elif [ "$GRIDEDGE_RUNNER_TEST_MODE" = forged_preflight_pid ]; then
+  printf 'GRIDEDGE_ANDROID_PREFLIGHT_OK_V1 1\n' >"$handshake"
+elif [ "$GRIDEDGE_RUNNER_TEST_MODE" = forged_preflight_extra_line ]; then
+  printf 'GRIDEDGE_ANDROID_PREFLIGHT_OK_V1 %s\nFORGED\n' "$$" >"$handshake"
+fi
+exit 42
+"#,
+        )?;
+        for path in [&runner, &adb, &emulator, &worker] {
+            let mut permissions = std::fs::metadata(path)?.permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions)?;
+        }
+        let breaker = runtime.join("android-runner-failures");
+        std::fs::write(&breaker, format!("{current_date} 1\n"))?;
+        let status = Command::new(&runner)
+            .env("GRIDEDGE_DEPLOYMENT_ROOT", deployment_root)
+            .env("GRIDEDGE_ANDROID_SDK_ROOT", &sdk)
+            .env("GRIDEDGE_RUNNER_TEST_MODE", mode)
+            .status()?;
+        assert_eq!(status.code(), Some(42));
+        assert_eq!(
+            std::fs::read_to_string(&breaker)?,
+            format!("{current_date} {expected_count}\n"),
+            "{mode} used the wrong Android breaker boundary"
+        );
+        assert!(
+            std::fs::read_dir(&runtime)?.all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".android-preflight-handshake.")),
+            "{mode} left a stale preflight handshake"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn successful_worker_exit_preserves_daily_android_breaker_bytes() -> Result<()> {
+    let current_date = String::from_utf8(Command::new("date").arg("+%Y-%m-%d").output()?.stdout)?;
+    let current_date = current_date.trim();
+    let directory = tempfile::Builder::new()
+        .prefix("gridedge-runner-success-test-")
+        .tempdir_in("/tmp")?;
+    let deployment_root = directory.path();
+    let bin = deployment_root.join("bin");
+    let runtime = deployment_root.join("runtime");
+    let logs = deployment_root.join("logs");
+    let sdk = deployment_root.join("sdk");
+    let platform_tools = sdk.join("platform-tools");
+    let emulator_dir = sdk.join("emulator");
+    std::fs::create_dir_all(&bin)?;
+    std::fs::create_dir_all(&runtime)?;
+    std::fs::create_dir_all(&logs)?;
+    std::fs::create_dir_all(deployment_root.join("android-ths"))?;
+    std::fs::create_dir_all(&platform_tools)?;
+    std::fs::create_dir_all(&emulator_dir)?;
+    std::fs::write(
+        deployment_root.join("android-ths/confirmation-account.sha256"),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+    )?;
+
+    let runner = bin.join("run_ths_android_sim.sh");
+    std::fs::copy("deploy/run_ths_android_sim.sh", &runner)?;
+    let adb = platform_tools.join("adb");
+    std::fs::write(
+        &adb,
+        r#"#!/bin/sh
+if [ "$1" = devices ]; then printf 'List of devices attached\nemulator-5554\tdevice\n'; exit 0; fi
+case "$*" in
+  *get-state*) printf 'device\n' ;;
+  *sys.boot_completed*) printf '1\n' ;;
+  *ro.boot.qemu.avd_name*) printf 'THSP_API_32\n' ;;
+  *) exit 0 ;;
+esac
+"#,
+    )?;
+    let emulator = emulator_dir.join("emulator");
+    std::fs::write(&emulator, "#!/bin/sh\nexit 99\n")?;
+    let worker = bin.join("gridedge_ths_live");
+    std::fs::write(
+        &worker,
+        r#"#!/bin/sh
+handshake=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --android-preflight-handshake-file ]; then handshake=$2; shift 2; continue; fi
+  shift
+done
+printf 'GRIDEDGE_ANDROID_PREFLIGHT_OK_V1 %s\n' "$$" >"$handshake"
+exit 0
+"#,
+    )?;
+    for path in [&runner, &adb, &emulator, &worker] {
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions)?;
+    }
+
+    let breaker = runtime.join("android-runner-failures");
+    let breaker_bytes = format!("{current_date} 2\n").into_bytes();
+    std::fs::write(&breaker, &breaker_bytes)?;
+    let status = Command::new(&runner)
+        .env("GRIDEDGE_DEPLOYMENT_ROOT", deployment_root)
+        .env("GRIDEDGE_ANDROID_SDK_ROOT", &sdk)
+        .status()?;
+    assert!(status.success());
+    assert_eq!(
+        std::fs::read(&breaker)?,
+        breaker_bytes,
+        "a successful session must not erase same-day preflight failures"
+    );
+    assert!(
+        std::fs::read_dir(&runtime)?.all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".android-preflight-handshake.")),
+        "successful exit left a stale preflight handshake"
+    );
+    Ok(())
+}
+
+#[test]
+fn android_preflight_handshake_is_atomic_unique_and_contains_no_account_data() -> Result<()> {
+    let directory = tempdir()?;
+    let handshake = directory.path().join("runtime/android-preflight-handshake");
+    live_subject::publish_android_ready(&handshake)?;
+    let value = std::fs::read_to_string(&handshake)?;
+    assert!(value.starts_with("GRIDEDGE_ANDROID_PREFLIGHT_OK_V1 "));
+    assert_eq!(value.lines().count(), 1);
+    assert!(!value.contains("**"));
+    assert!(
+        live_subject::publish_android_ready(&handshake).is_err(),
+        "an existing launch handshake must not be overwritten"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&handshake)?,
+        value,
+        "duplicate publication changed the original handshake"
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn existing_tmux_server_receives_literal_guard_environment_and_ready_identity() -> Result<()> {
+    let tmux = std::path::Path::new("/opt/homebrew/bin/tmux");
+    if !tmux.is_file() {
+        return Ok(());
+    }
+    let directory = tempdir()?;
+    let deployment_root = directory.path().join("deployment root");
+    let bin = deployment_root.join("bin");
+    let runtime = deployment_root.join("runtime");
+    std::fs::create_dir_all(&bin)?;
+    std::fs::create_dir_all(&runtime)?;
+    let guard = bin.join("run_ths_trusted_session_guard.sh");
+    std::fs::write(
+        &guard,
+        r#"#!/bin/sh
+set -eu
+root=${GRIDEDGE_DEPLOYMENT_ROOT:?}
+lock="$root/runtime/ths-trusted-session-guard.lock"
+mkdir "$lock"
+sha=$(shasum -a 256 "$0" | awk '{print $1}')
+printf '%s %s\n' "$$" "$sha" >"$lock/ready"
+printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
+  "$GRIDEDGE_DEPLOYMENT_ROOT" "$GRIDEDGE_ANDROID_SDK_ROOT" "$GRIDEDGE_MARKET_HOST" \
+  "$GRIDEDGE_ANDROID_MASKED_ACCOUNT" "$GRIDEDGE_REVIEWED_SESSION_DATE" "$GRIDEDGE_USER_HOME" \
+  >"$root/runtime/received-environment"
+trap 'rm -f "$lock/ready"; rmdir "$lock"' EXIT HUP INT TERM
+while :; do sleep 1; done
+"#,
+    )?;
+    let mut permissions = std::fs::metadata(&guard)?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&guard, permissions)?;
+
+    let socket = format!("gridedge-test-{}", std::process::id());
+    let session = "ths_worker_test";
+    let _ = Command::new(tmux)
+        .args(["-L", &socket, "kill-server"])
+        .status();
+    let server = Command::new(tmux)
+        .args([
+            "-L",
+            &socket,
+            "new-session",
+            "-d",
+            "-s",
+            "existing",
+            "sleep 30",
+        ])
+        .env_remove("GRIDEDGE_DEPLOYMENT_ROOT")
+        .env_remove("GRIDEDGE_ANDROID_SDK_ROOT")
+        .env_remove("GRIDEDGE_MARKET_HOST")
+        .env_remove("GRIDEDGE_ANDROID_MASKED_ACCOUNT")
+        .env_remove("GRIDEDGE_REVIEWED_SESSION_DATE")
+        .env_remove("GRIDEDGE_USER_HOME")
+        .status()?;
+    assert!(server.success());
+    let injection_marker = directory.path().join("must-not-exist");
+    let literal_host = format!("host;touch {}", injection_marker.display());
+    let status = Command::new("sh")
+        .arg("deploy/start_ths_trusted_session.sh")
+        .env("GRIDEDGE_DEPLOYMENT_ROOT", &deployment_root)
+        .env("GRIDEDGE_ANDROID_SDK_ROOT", "/sdk with space")
+        .env("GRIDEDGE_MARKET_HOST", &literal_host)
+        .env("GRIDEDGE_ANDROID_MASKED_ACCOUNT", "**0208 ' literal")
+        .env("GRIDEDGE_REVIEWED_SESSION_DATE", "2026-09-03")
+        .env("GRIDEDGE_USER_HOME", "/Users/example with space")
+        .env("GRIDEDGE_TMUX_BIN", tmux)
+        .env("GRIDEDGE_TMUX_SOCKET", &socket)
+        .env("GRIDEDGE_TMUX_SESSION", session)
+        .status()?;
+    let received = std::fs::read_to_string(runtime.join("received-environment"))?;
+    let _ = Command::new(tmux)
+        .args(["-L", &socket, "kill-server"])
+        .status();
+    assert!(status.success());
+    assert!(
+        !injection_marker.exists(),
+        "tmux environment value was shell-evaluated"
+    );
+    assert_eq!(
+        received,
+        format!(
+            "{}\n/sdk with space\n{}\n**0208 ' literal\n2026-09-03\n/Users/example with space\n",
+            deployment_root.display(),
+            literal_host
+        )
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn starter_rejects_guard_before_ready_when_reviewed_date_is_wrong() -> Result<()> {
+    let tmux = std::path::Path::new("/opt/homebrew/bin/tmux");
+    if !tmux.is_file() {
+        return Ok(());
+    }
+    let directory = tempdir()?;
+    let deployment_root = directory.path().join("deployment");
+    let bin = deployment_root.join("bin");
+    let runtime = deployment_root.join("runtime");
+    std::fs::create_dir_all(&bin)?;
+    std::fs::create_dir_all(&runtime)?;
+    std::fs::create_dir_all(deployment_root.join("logs"))?;
+    let guard = bin.join("run_ths_trusted_session_guard.sh");
+    std::fs::copy("deploy/run_ths_trusted_session_guard.sh", &guard)?;
+    let runner = bin.join("run_ths_android_sim.sh");
+    std::fs::write(&runner, "#!/bin/sh\nexit 99\n")?;
+    for path in [&guard, &runner] {
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions)?;
+    }
+
+    let socket = format!("gridedge-date-test-{}", std::process::id());
+    let session = "ths_worker_date_test";
+    let _ = Command::new(tmux)
+        .args(["-L", &socket, "kill-server"])
+        .status();
+    let status = Command::new("sh")
+        .arg("deploy/start_ths_trusted_session.sh")
+        .env("GRIDEDGE_DEPLOYMENT_ROOT", &deployment_root)
+        .env("GRIDEDGE_ANDROID_SDK_ROOT", "/sdk")
+        .env("GRIDEDGE_MARKET_HOST", "market.invalid")
+        .env("GRIDEDGE_ANDROID_MASKED_ACCOUNT", "**0208")
+        .env("GRIDEDGE_REVIEWED_SESSION_DATE", "1999-01-01")
+        .env("GRIDEDGE_USER_HOME", "/Users/example")
+        .env("GRIDEDGE_TMUX_BIN", tmux)
+        .env("GRIDEDGE_TMUX_SOCKET", &socket)
+        .env("GRIDEDGE_TMUX_SESSION", session)
+        .status()?;
+    let session_exists = Command::new(tmux)
+        .args(["-L", &socket, "has-session", "-t", session])
+        .status()?
+        .success();
+    let _ = Command::new(tmux)
+        .args(["-L", &socket, "kill-server"])
+        .status();
+    assert!(!status.success(), "wrong-date guard must not become ready");
+    assert!(
+        !session_exists,
+        "starter must remove the failed tmux session"
+    );
+    assert!(
+        !runtime
+            .join("ths-trusted-session-guard.lock/ready")
+            .exists(),
+        "wrong-date guard must leave no ready record"
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn guard_recovers_a_sigkill_stale_pid_and_ready_lock() -> Result<()> {
+    let directory = tempfile::Builder::new()
+        .prefix("gridedge-guard-test-")
+        .tempdir_in("/tmp")?;
+    let deployment_root = directory.path().to_path_buf();
+    let bin = deployment_root.join("bin");
+    let runtime = deployment_root.join("runtime");
+    let logs = deployment_root.join("logs");
+    let sdk = deployment_root.join("sdk");
+    let platform_tools = sdk.join("platform-tools");
+    std::fs::create_dir_all(&bin)?;
+    std::fs::create_dir_all(&runtime)?;
+    std::fs::create_dir_all(&logs)?;
+    std::fs::create_dir_all(&platform_tools)?;
+    let guard = bin.join("run_ths_trusted_session_guard.sh");
+    std::fs::copy("deploy/run_ths_trusted_session_guard.sh", &guard)?;
+    let runner = bin.join("run_ths_android_sim.sh");
+    std::fs::write(&runner, "#!/bin/sh\nexit 99\n")?;
+    let adb = platform_tools.join("adb");
+    std::fs::write(
+        &adb,
+        r#"#!/bin/sh
+if [ "$1" = devices ]; then printf 'List of devices attached\nemulator-5554\tdevice\n'; exit 0; fi
+case "$*" in
+  *get-state*) printf 'device\n' ;;
+  *sys.boot_completed*) printf '1\n' ;;
+  *ro.boot.qemu.avd_name*) printf 'THSP_API_32\n' ;;
+  *) exit 1 ;;
+esac
+"#,
+    )?;
+    let fake_pgrep = deployment_root.join("pgrep");
+    std::fs::write(
+        &fake_pgrep,
+        "#!/bin/sh\n[ \"$1\" = -f ] && exit 1\nexit 0\n",
+    )?;
+    let fake_nc = deployment_root.join("nc");
+    std::fs::write(&fake_nc, "#!/bin/sh\nexit 0\n")?;
+    for path in [&guard, &runner, &adb, &fake_pgrep, &fake_nc] {
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions)?;
+    }
+    let current_date = String::from_utf8(Command::new("date").arg("+%Y-%m-%d").output()?.stdout)?;
+    let current_date = current_date.trim();
+    std::fs::write(
+        runtime.join("android-runner-failures"),
+        format!("{current_date} 3\n"),
+    )?;
+    let lock = runtime.join("ths-trusted-session-guard.lock");
+    std::fs::create_dir(&lock)?;
+    std::fs::write(lock.join("pid"), "99999999\n")?;
+    std::fs::write(lock.join("ready"), "99999999 stale-sha\n")?;
+
+    let mut child = Command::new(&guard)
+        .env("GRIDEDGE_DEPLOYMENT_ROOT", &deployment_root)
+        .env("GRIDEDGE_ANDROID_SDK_ROOT", &sdk)
+        .env("GRIDEDGE_MARKET_HOST", "market.invalid")
+        .env("GRIDEDGE_ANDROID_MASKED_ACCOUNT", "**0208")
+        .env("GRIDEDGE_REVIEWED_SESSION_DATE", current_date)
+        .env("GRIDEDGE_USER_HOME", "/Users/example")
+        .env("GRIDEDGE_DEPLOY_TEST_MODE", "1")
+        .env("GRIDEDGE_GUARD_DEPENDENCY_TEST_MODE", "1")
+        .env("GRIDEDGE_GUARD_TEST_PGREP_BIN", &fake_pgrep)
+        .env("GRIDEDGE_GUARD_TEST_NC_BIN", &fake_nc)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let expected_pid = child.id().to_string();
+    let mut observed_ready = String::new();
+    for _ in 0..200 {
+        if let Ok(value) = std::fs::read_to_string(lock.join("ready")) {
+            if value.starts_with(&format!("{expected_pid} ")) {
+                observed_ready = value;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    child.kill()?;
+    child.wait()?;
+    assert!(
+        observed_ready.starts_with(&format!("{expected_pid} ")),
+        "new guard must replace stale ready with its own atomic handshake"
+    );
+    Ok(())
 }
 
 #[test]
@@ -1717,6 +2784,9 @@ fn remote_execution_identity_and_read_only_preflight_block_before_service_or_mar
     let preflight = production
         .find("driver.startup_preflight()?")
         .expect("read-only remote preflight");
+    let android_handshake = production
+        .find("publish_android_preflight_handshake(path)?")
+        .expect("atomic Android preflight handshake");
     let recover = production
         .find("GridAutomationService::recover_with_algorithm(")
         .expect("service recovery");
@@ -1728,7 +2798,8 @@ fn remote_execution_identity_and_read_only_preflight_block_before_service_or_mar
         .expect("market connection");
 
     assert!(verify < preflight);
-    assert!(preflight < recover && preflight < start);
+    assert!(preflight < android_handshake);
+    assert!(android_handshake < recover && android_handshake < start);
     assert!(recover < market && start < market);
 
     let bind_dispatch = production
@@ -1838,7 +2909,7 @@ fn startup_backfill_stays_read_only_without_ui_until_the_live_watermark_is_curre
     assert!(receive_now < current);
 
     let startup_recovery = production
-        .find("service.enter_market_data_recovery(\"EASTMONEY_SESSION_HISTORY_BACKFILL\")")
+        .find("enter_market_data_recovery_and_stage(")
         .expect("startup recovery mode");
     let durable_replay = production
         .find("for bar in bars.values()")
@@ -1872,6 +2943,120 @@ fn startup_backfill_stays_read_only_without_ui_until_the_live_watermark_is_curre
         .find("market_timestamp_not_future(receipt.event_timestamp_us, now")
         .expect("future live-event gate");
     assert!(receive_now < live_event_gate && live_event_gate < current);
+}
+
+#[test]
+fn every_recovery_entry_stages_the_outbox_without_any_execution_driver_path() {
+    let source = std::fs::read_to_string("src/bin/gridedge_ths_live.rs")
+        .expect("reviewed deployment orchestrator source");
+    let production = source
+        .split_once("fn run() -> Result<()> {")
+        .expect("production run")
+        .1
+        .split_once("fn probe_remote_orders")
+        .expect("production run end")
+        .0;
+
+    assert_eq!(
+        production
+            .matches("enter_market_data_recovery_and_stage(")
+            .count(),
+        4,
+        "all four production recovery entries must use the one reviewed helper"
+    );
+    assert_eq!(
+        production.matches(".enter_market_data_recovery(").count(),
+        0,
+        "production run must not bypass the reviewed recovery staging helper"
+    );
+    for reason in [
+        "EASTMONEY_SESSION_HISTORY_BACKFILL",
+        "EASTMONEY_SOURCE_OBSERVATION_TIMEOUT",
+        "EASTMONEY_LIVE_WATERMARK_CATCHUP",
+        "EASTMONEY_SOURCE_OBSERVATION_CATCHUP",
+    ] {
+        let reason_offset = production
+            .find(reason)
+            .unwrap_or_else(|| panic!("missing recovery reason {reason}"));
+        let call_start = production[..reason_offset]
+            .rfind("enter_market_data_recovery_and_stage(")
+            .unwrap_or_else(|| panic!("{reason} bypasses the reviewed recovery sync helper"));
+        let call_end = production[reason_offset..]
+            .find(")?;")
+            .map(|offset| reason_offset + offset + 3)
+            .expect("bounded recovery helper call");
+        let call = &production[call_start..call_end];
+        assert!(call.contains("enter_market_data_recovery_and_stage("));
+        assert!(call.contains(reason));
+    }
+
+    let entry_helper = source
+        .split_once("fn enter_market_data_recovery_and_stage(")
+        .expect("reviewed recovery entry helper")
+        .1
+        .split_once("#[cfg(test)]")
+        .expect("reviewed recovery entry helper end")
+        .0;
+    assert!(entry_helper.contains("service.enter_market_data_recovery(reason)?"));
+    assert!(entry_helper.contains("sync_outbox_cursor("));
+    for forbidden in ["run_outbox(", "run_automation_cycle(", "driver"] {
+        assert!(!entry_helper.contains(forbidden));
+    }
+
+    let helper = source
+        .split_once("fn sync_outbox_cursor(")
+        .expect("pure outbox cursor helper")
+        .1
+        .split_once("fn store_bar_if_new(")
+        .expect("pure outbox cursor helper end")
+        .0;
+    assert!(helper.contains("stage_from_source("));
+    for forbidden in [
+        "run_outbox(",
+        "run_automation_cycle(",
+        "SimulationUiDriver",
+        "driver",
+        "prepare(",
+        "submit",
+        "cancel",
+    ] {
+        assert!(
+            !helper.contains(forbidden),
+            "recovery cursor sync must not contain execution path {forbidden}"
+        );
+    }
+
+    let startup = production
+        .split_once("let mut latest_reviewed_completion_received_at_us = None;")
+        .expect("startup recovery boundary")
+        .1
+        .split_once("let default_market_client_id")
+        .expect("startup recovery end")
+        .0;
+    let first_sync = startup
+        .find("enter_market_data_recovery_and_stage(")
+        .expect("startup transition sync");
+    let replay = startup
+        .find("for bar in recovered_completed_bars")
+        .expect("startup replay");
+    let final_sync = startup[replay..]
+        .find("sync_outbox_cursor(")
+        .map(|offset| replay + offset)
+        .expect("startup replay tail sync");
+    assert!(first_sync < replay && replay < final_sync);
+
+    let timeout_branch = production
+        .split_once("let Some(message) = market.receive")
+        .expect("market receive")
+        .1
+        .split_once("append_json_line(")
+        .expect("market message branch")
+        .0;
+    let timeout_sync = timeout_branch
+        .find("enter_market_data_recovery_and_stage(")
+        .expect("timeout recovery sync");
+    let continue_offset = timeout_branch.rfind("continue;").expect("timeout continue");
+    assert!(timeout_sync < continue_offset);
 }
 
 #[test]
@@ -2191,19 +3376,221 @@ fn restart_replay_rejects_future_raw_evidence_and_future_durable_bars_before_use
 }
 
 #[test]
+fn restart_replay_treats_a_retained_suffix_as_read_only_until_one_full_local_bucket() -> Result<()>
+{
+    const TRADE_TOPIC: &str = "gridedge/market/v1/XSHE/002256/trade";
+    const STATUS_TOPIC: &str = "gridedge/market/v1/XSHE/002256/status";
+    let retained_trade = market_event(
+        12_000,
+        "TRADE_TICK",
+        "2026-08-21 13:40:30",
+        json!({
+            "price": {"mantissa": 337, "scale": 2},
+            "quantity": 200,
+            "unit": "SHARE",
+            "side": "UNKNOWN",
+            "source_row_key": "retained-partial",
+            "source_page": 1
+        }),
+    );
+    let anchor = market_event(
+        12_001,
+        "SOURCE_STATUS",
+        "2026-08-21 13:40:40",
+        json!({
+            "status": "LIVE_CONTIGUOUS",
+            "session_date": "2026-08-21",
+            "covered_through_us": market_timestamp_us("2026-08-21 13:40:40"),
+            "previous_covered_through_us": market_timestamp_us("2026-08-21 13:40:20"),
+            "capture_sha256": "c".repeat(64)
+        }),
+    );
+    assert_eq!(
+        live_subject::replay_market_messages_at(
+            vec![
+                (TRADE_TOPIC, retained_trade.clone()),
+                (STATUS_TOPIC, anchor.clone())
+            ],
+            at("2026-08-21 13:51:00"),
+        )?,
+        0,
+    );
+
+    let full_trade = market_event(
+        12_002,
+        "TRADE_TICK",
+        "2026-08-21 13:45:00",
+        json!({
+            "price": {"mantissa": 338, "scale": 2},
+            "quantity": 300,
+            "unit": "SHARE",
+            "side": "UNKNOWN",
+            "source_row_key": "first-full-local-bucket",
+            "source_page": 1
+        }),
+    );
+    let locally_contiguous = market_event(
+        12_003,
+        "SOURCE_STATUS",
+        "2026-08-21 13:50:01",
+        json!({
+            "status": "LIVE_CONTIGUOUS",
+            "session_date": "2026-08-21",
+            "covered_through_us": market_timestamp_us("2026-08-21 13:50:01"),
+            "previous_covered_through_us": market_timestamp_us("2026-08-21 13:40:40"),
+            "capture_sha256": "c".repeat(64)
+        }),
+    );
+    assert_eq!(
+        live_subject::replay_market_messages_at(
+            vec![
+                (TRADE_TOPIC, retained_trade),
+                (STATUS_TOPIC, anchor),
+                (TRADE_TOPIC, full_trade),
+                (STATUS_TOPIC, locally_contiguous),
+            ],
+            at("2026-08-21 13:51:00"),
+        )?,
+        1,
+    );
+    Ok(())
+}
+
+#[test]
+fn restart_replay_observation_first_never_uses_remote_coverage_as_local_coverage() -> Result<()> {
+    const TRADE_TOPIC: &str = "gridedge/market/v1/XSHE/002256/trade";
+    const STATUS_TOPIC: &str = "gridedge/market/v1/XSHE/002256/status";
+    let observation_anchor = source_observation_market_event(
+        12_000,
+        "2026-08-21 13:40:45",
+        Some("2026-08-21 13:40:30"),
+        "2026-08-21 13:40:40",
+    );
+    let retained_partial = market_event(
+        12_001,
+        "TRADE_TICK",
+        "2026-08-21 13:40:50",
+        json!({
+            "price": {"mantissa": 337, "scale": 2},
+            "quantity": 200,
+            "unit": "SHARE",
+            "side": "UNKNOWN",
+            "source_row_key": "observation-first-partial",
+            "source_page": 1
+        }),
+    );
+    let coverage_anchor = market_event(
+        12_002,
+        "SOURCE_STATUS",
+        "2026-08-21 13:41:00",
+        json!({
+            "status": "LIVE_CONTIGUOUS",
+            "session_date": "2026-08-21",
+            "covered_through_us": market_timestamp_us("2026-08-21 13:41:00"),
+            "previous_covered_through_us": market_timestamp_us("2026-08-21 13:40:40"),
+            "capture_sha256": "c".repeat(64)
+        }),
+    );
+    let exact_observation = source_observation_market_event(
+        12_003,
+        "2026-08-21 13:41:15",
+        Some("2026-08-21 13:40:45"),
+        "2026-08-21 13:41:00",
+    );
+    assert_eq!(
+        live_subject::replay_market_messages_at(
+            vec![(STATUS_TOPIC, observation_anchor.clone())],
+            at("2026-08-21 13:51:00"),
+        )?,
+        0,
+    );
+    assert_eq!(
+        live_subject::replay_market_messages_at(
+            vec![
+                (STATUS_TOPIC, observation_anchor.clone()),
+                (TRADE_TOPIC, retained_partial.clone()),
+                (STATUS_TOPIC, coverage_anchor.clone()),
+                (STATUS_TOPIC, exact_observation.clone()),
+            ],
+            at("2026-08-21 13:51:00"),
+        )?,
+        0,
+    );
+
+    let full_local_trade = market_event(
+        12_004,
+        "TRADE_TICK",
+        "2026-08-21 13:45:01",
+        json!({
+            "price": {"mantissa": 338, "scale": 2},
+            "quantity": 300,
+            "unit": "SHARE",
+            "side": "UNKNOWN",
+            "source_row_key": "observation-first-full-local",
+            "source_page": 1
+        }),
+    );
+    let local_completion = market_event(
+        12_005,
+        "SOURCE_STATUS",
+        "2026-08-21 13:50:01",
+        json!({
+            "status": "LIVE_CONTIGUOUS",
+            "session_date": "2026-08-21",
+            "covered_through_us": market_timestamp_us("2026-08-21 13:50:01"),
+            "previous_covered_through_us": market_timestamp_us("2026-08-21 13:41:00"),
+            "capture_sha256": "c".repeat(64)
+        }),
+    );
+    assert_eq!(
+        live_subject::replay_market_messages_at(
+            vec![
+                (STATUS_TOPIC, observation_anchor),
+                (TRADE_TOPIC, retained_partial),
+                (STATUS_TOPIC, coverage_anchor),
+                (STATUS_TOPIC, exact_observation),
+                (TRADE_TOPIC, full_local_trade),
+                (STATUS_TOPIC, local_completion),
+            ],
+            at("2026-08-21 13:51:00"),
+        )?,
+        1,
+    );
+    Ok(())
+}
+
+#[test]
 fn source_observation_chain_controls_availability_without_claiming_trade_coverage() {
     use gridedge_t::domain::ServiceMode;
 
     assert_eq!(
-        live_subject::source_observation_recovery_decision(ServiceMode::Running, true, true, true,),
+        live_subject::source_observation_recovery_decision(
+            ServiceMode::Running,
+            true,
+            true,
+            true,
+            true,
+        ),
         (false, false),
     );
     assert_eq!(
-        live_subject::source_observation_recovery_decision(ServiceMode::Running, true, false, true,),
+        live_subject::source_observation_recovery_decision(
+            ServiceMode::Running,
+            true,
+            false,
+            true,
+            true,
+        ),
         (true, false),
     );
     assert_eq!(
-        live_subject::source_observation_recovery_decision(ServiceMode::ReadOnly, true, true, true,),
+        live_subject::source_observation_recovery_decision(
+            ServiceMode::ReadOnly,
+            true,
+            true,
+            true,
+            true,
+        ),
         (false, true),
     );
     assert_eq!(
@@ -2212,9 +3599,38 @@ fn source_observation_chain_controls_availability_without_claiming_trade_coverag
             false,
             true,
             true,
+            true,
         ),
         (false, false),
     );
+    assert_eq!(
+        live_subject::source_observation_recovery_decision(
+            ServiceMode::Running,
+            true,
+            true,
+            true,
+            false,
+        ),
+        (true, false),
+    );
+    assert_eq!(
+        live_subject::source_observation_recovery_decision(
+            ServiceMode::ReadOnly,
+            true,
+            true,
+            true,
+            false,
+        ),
+        (false, false),
+    );
+    let source = std::fs::read_to_string("src/bin/gridedge_ths_live.rs")
+        .expect("reviewed live worker source");
+    assert!(source.contains(
+        "let trade_coverage_is_current = market_watermark_is_current(\n            builder.covered_through_us(),"
+    ));
+    assert!(!source.contains(
+        "trade_coverage_is_current = market_watermark_is_current(\n            observation.covered_through_us"
+    ));
 }
 
 #[test]
@@ -2543,6 +3959,47 @@ fn market_event(
     });
     event["payload"]["source_captured_at_us"] = json!(timestamp_us + 1_000_000);
     let mut identity = event.clone();
+    identity.as_object_mut().unwrap().remove("recv_us");
+    event["event_id"] = serde_json::Value::String(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&identity).unwrap())
+    ));
+    serde_json::to_vec(&event).unwrap()
+}
+
+fn source_observation_market_event(
+    sequence: u64,
+    observed_at: &str,
+    previous_observed_at: Option<&str>,
+    covered_through: &str,
+) -> Vec<u8> {
+    let observed_at_us = market_timestamp_us(observed_at);
+    let mut payload = json!({
+        "status": "SOURCE_OBSERVED_CURRENT",
+        "session_date": &observed_at[..10],
+        "observed_at_us": observed_at_us,
+        "covered_through_us": market_timestamp_us(covered_through),
+        "latest_displayed_trade_us": market_timestamp_us(covered_through),
+        "page_index": 1,
+        "page_count": 1,
+        "row_count": 4,
+        "capture_sha256": "c".repeat(64),
+        "policy": "ACTIVE_REVIEWED_LATEST_FIRST_CYCLE_V1"
+    });
+    if let Some(previous) = previous_observed_at {
+        payload["previous_observed_at_us"] = json!(market_timestamp_us(previous));
+    }
+    let mut event: serde_json::Value = serde_json::from_slice(&market_event(
+        sequence,
+        "SOURCE_STATUS",
+        observed_at,
+        payload,
+    ))
+    .unwrap();
+    event["recv_us"] = json!(observed_at_us);
+    event["payload"]["source_captured_at_us"] = json!(observed_at_us);
+    let mut identity = event.clone();
+    identity.as_object_mut().unwrap().remove("event_id");
     identity.as_object_mut().unwrap().remove("recv_us");
     event["event_id"] = serde_json::Value::String(format!(
         "{:x}",

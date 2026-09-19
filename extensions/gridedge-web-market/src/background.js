@@ -3,9 +3,12 @@
 importScripts(
   "../vendor/mqtt.min.js",
   "shared.js",
+  "mqtt_namespace.js",
   "durable.js",
   "mqtt_ack.js",
   "outbox_delivery.js",
+  "flush_coordinator.js",
+  "source_heartbeat.js",
 );
 
 const DEFAULT_SETTINGS = Object.freeze({
@@ -13,20 +16,72 @@ const DEFAULT_SETTINGS = Object.freeze({
   mqtt_url: "ws://192.168.1.201:9001/mqtt",
   mqtt_username: "gridedge-publisher",
   mqtt_password: "",
+  deployment_mode: "PRODUCTION",
+  mqtt_namespace: "gridedge",
+  mqtt_client_id: "",
+  initialization_policy: "FULL_HISTORY_OR_REVIEWED_FALLBACK_V1",
 });
 
-let flushInFlight = null;
+let flushCoordinator = null;
+const OUTBOX_ALARM = "gridedge-mqtt-outbox";
+const SOURCE_HEARTBEAT_TIMEOUT_MS = 10_000;
+const REVIEWED_BUILD_ID = "collector-0.6.51-stale-trade-coverage-only-v1";
+
+async function ensurePeriodicAlarms() {
+  await chrome.alarms.create(OUTBOX_ALARM, { periodInMinutes: 1 });
+}
+
+function runtimeIdentity() {
+  return {
+    manifest_version: chrome.runtime.getManifest().version,
+    reviewed_build_id: REVIEWED_BUILD_ID,
+  };
+}
+
+const reviewedTabRecovery = GridEdgeSourceHeartbeat.createReviewedTabRecovery({
+  getTab: async (tabId) => await chrome.tabs.get(tabId),
+  reloadTab: async (tabId, options) => await chrome.tabs.reload(tabId, options),
+  loadCooldown: async (key) => {
+    const stored = await chrome.storage.session.get(key);
+    return stored[key] ?? null;
+  },
+  saveCooldown: async (key, value) => await chrome.storage.session.set({ [key]: value }),
+});
+
+async function dispatchSourceHeartbeat() {
+  return await GridEdgeSourceHeartbeat.dispatchSourceHeartbeat({
+    queryTabs: async () => await chrome.tabs.query({
+      url: "https://quote.eastmoney.com/f1.html*",
+    }),
+    sendMessage: async (tabId, message) => await chrome.tabs.sendMessage(tabId, message),
+    recoverTab: async (tab, response) => response.reason === "STALE_TRADE_COVERAGE" &&
+      await reviewedTabRecovery.request(tab, response),
+    timeoutMs: SOURCE_HEARTBEAT_TIMEOUT_MS,
+  });
+}
+
+const sourceHeartbeatCoordinator =
+  GridEdgeSourceHeartbeat.createSourceHeartbeatCoordinator(dispatchSourceHeartbeat);
+GridEdgeSourceHeartbeat.installSourceHeartbeatAlarmWatchdog({
+  alarms: chrome.alarms,
+  runtime: chrome.runtime,
+  coordinator: sourceHeartbeatCoordinator,
+});
 
 async function settings() {
   const stored = await chrome.storage.local.get(Object.keys(DEFAULT_SETTINGS));
-  return { ...DEFAULT_SETTINGS, ...stored };
+  const current = { ...DEFAULT_SETTINGS, ...stored };
+  if (!current.mqtt_client_id && current.deployment_mode === "PRODUCTION") {
+    current.mqtt_client_id = `gridedge-web-market-${chrome.runtime.id}`;
+  }
+  return current;
 }
 
-async function setStatus(status) {
+async function setStatus(status, storeGeneration = GridEdgeDurable.DATABASE_NAME) {
   await chrome.storage.local.set({
     last_status: {
       ...status,
-      store_generation: GridEdgeDurable.DATABASE_NAME,
+      store_generation: storeGeneration,
       at: Date.now(),
     },
   });
@@ -42,24 +97,16 @@ function allowedSender(sender) {
 }
 
 function validateMqttSettings(current) {
-  const url = new URL(current.mqtt_url);
-  if (url.protocol !== "ws:" || url.hostname !== "192.168.1.201" ||
-      url.port !== "9001" || url.pathname !== "/mqtt") {
-    throw new Error("MQTT WebSocket must be ws://192.168.1.201:9001/mqtt");
-  }
-  if (current.mqtt_username !== "gridedge-publisher" || !current.mqtt_password) {
-    throw new Error("MQTT publisher credentials are incomplete");
-  }
-  return url.href;
+  return GridEdgeMqttNamespace.validateSettings(current);
 }
 
 function connectMqtt(current) {
-  const url = validateMqttSettings(current);
+  const resolved = validateMqttSettings(current);
   return new Promise((resolve, reject) => {
-    const client = mqtt.connect(url, {
+    const client = mqtt.connect(resolved.url, {
       protocolVersion: 5,
       clean: true,
-      clientId: `gridedge-web-market-${chrome.runtime.id}`,
+      clientId: resolved.clientId,
       username: current.mqtt_username,
       password: current.mqtt_password,
       keepalive: 20,
@@ -69,7 +116,7 @@ function connectMqtt(current) {
     });
     let settled = false;
     client.once("connect", () => {
-      void GridEdgeMqttAck.subscribe(client).then(() => {
+      void GridEdgeMqttAck.subscribe(client, resolved.ackRoot).then(() => {
         settled = true;
         resolve(client);
       }).catch((error) => {
@@ -108,7 +155,8 @@ function publishWithPuback(client, event) {
 async function doFlushOutbox() {
   const current = await settings();
   if (!current.enabled) return { ok: false, reason: "COLLECTOR_DISABLED" };
-  const database = await GridEdgeDurable.openDatabase();
+  const resolved = validateMqttSettings(current);
+  const database = await GridEdgeDurable.openDatabase(indexedDB, resolved.databaseName);
   let pending = await GridEdgeDurable.pendingEvents(database);
   if (pending.length === 0) {
     return { ok: true, published: 0, store: await GridEdgeDurable.status(database) };
@@ -120,47 +168,83 @@ async function doFlushOutbox() {
       database,
       client,
       durable: GridEdgeDurable,
-      mqttAck: GridEdgeMqttAck,
+      mqttAck: GridEdgeMqttAck.withAckRoot(resolved.ackRoot),
       publishWithPuback,
+      maxInFlight: 16,
     });
   } finally {
     client.end(true);
   }
   const store = await GridEdgeDurable.status(database);
-  await setStatus({ ok: true, kind: "DATABASE_COMMIT_ACK", published, store });
+  await setStatus({ ok: true, kind: "DATABASE_COMMIT_ACK", published, store },
+    resolved.databaseName);
   return { ok: true, published, store };
 }
 
 function flushOutbox() {
-  if (!flushInFlight) {
-    flushInFlight = doFlushOutbox().finally(() => { flushInFlight = null; });
+  if (!flushCoordinator) {
+    flushCoordinator = GridEdgeFlushCoordinator.createFlushCoordinator(doFlushOutbox, {
+      async onError(error) {
+        const current = await settings();
+        const resolved = validateMqttSettings(current);
+        const database = await GridEdgeDurable.openDatabase(indexedDB, resolved.databaseName);
+        const store = await GridEdgeDurable.status(database);
+        await setStatus({
+          ok: false,
+          kind: "MQTT_QUEUED",
+          error: String(error?.message ?? error),
+          store,
+        }, resolved.databaseName);
+      },
+    });
   }
-  return flushInFlight;
+  return flushCoordinator.request();
 }
 
-async function deliverCapture(message, sender, resumeBoundary = false) {
+async function deliverCapture(
+  message,
+  sender,
+  { resumeBoundary = false, discontinuityBoundary = false, completeHistoryBridge = false } = {},
+) {
   if (!allowedSender(sender)) throw new Error("capture sender is outside the reviewed page allowlist");
   const current = await settings();
   if (!current.enabled) return { ok: false, reason: "COLLECTOR_DISABLED" };
-  validateMqttSettings(current);
-  const database = await GridEdgeDurable.openDatabase();
-  const stored = resumeBoundary
+  const resolved = validateMqttSettings(current);
+  const database = await GridEdgeDurable.openDatabase(indexedDB, resolved.databaseName);
+  if ([resumeBoundary, discontinuityBoundary, completeHistoryBridge].filter(Boolean).length > 1) {
+    throw new Error("capture delivery cannot select multiple recovery policies");
+  }
+  const stored = discontinuityBoundary
+    ? await GridEdgeDurable.ingestDiscontinuityBoundary(
+      database,
+      message.capture,
+      message.capture_sha256,
+      { mqttTopicRoot: resolved.topicRoot, deadlineAtMs: message.deadline_at_ms },
+    )
+    : resumeBoundary
     ? await GridEdgeDurable.ingestResumeBoundary(
       database,
       message.capture,
       message.capture_sha256,
+      { mqttTopicRoot: resolved.topicRoot },
     )
     : await GridEdgeDurable.ingestCapture(database, message.capture, message.capture_sha256, {
-      sourceObservationPolicy: message.source_observation_policy ?? null,
-    });
-  try {
-    const delivery = await flushOutbox();
-    return { ok: true, stored, delivery };
-  } catch (error) {
-    const store = await GridEdgeDurable.status(database);
-    await setStatus({ ok: false, kind: "MQTT_QUEUED", error: String(error?.message ?? error), store });
-    return { ok: true, stored, delivery: { ok: false, queued: store.pending_events } };
-  }
+        requireCompleteHistoryBridge: completeHistoryBridge,
+        sourceObservationPolicy: message.source_observation_policy ?? null,
+        sourceObservationOnly: message.source_observation_policy != null,
+        mqttTopicRoot: resolved.topicRoot,
+      });
+  const store = await GridEdgeDurable.status(database);
+  void flushOutbox().catch(async (error) => {
+    const failedStore = await GridEdgeDurable.status(database);
+    await setStatus({
+      ok: false,
+      kind: "MQTT_QUEUED",
+      error: String(error?.message ?? error),
+      store: failedStore,
+    }, resolved.databaseName);
+  });
+  return { ok: true, stored, delivery: { ok: false, queued: store.pending_events } };
 }
 
 async function scanActiveTab() {
@@ -175,43 +259,67 @@ chrome.runtime.onInstalled.addListener(async () => {
   const current = await chrome.storage.local.get(Object.keys(DEFAULT_SETTINGS));
   const missing = Object.fromEntries(Object.entries(DEFAULT_SETTINGS).filter(([key]) => current[key] === undefined));
   if (Object.keys(missing).length > 0) await chrome.storage.local.set(missing);
-  await chrome.alarms.create("gridedge-mqtt-outbox", { periodInMinutes: 1 });
+  await ensurePeriodicAlarms();
 });
 
-chrome.runtime.onStartup.addListener(() => void flushOutbox().catch((error) =>
-  setStatus({ ok: false, kind: "MQTT_RETRY_ERROR", error: String(error?.message ?? error) })));
+chrome.runtime.onStartup.addListener(() => {
+  void ensurePeriodicAlarms();
+  void flushOutbox().catch((error) =>
+    setStatus({ ok: false, kind: "MQTT_RETRY_ERROR", error: String(error?.message ?? error) }));
+});
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "gridedge-mqtt-outbox") {
+  if (alarm.name === OUTBOX_ALARM) {
     void flushOutbox().catch((error) =>
       setStatus({ ok: false, kind: "MQTT_RETRY_ERROR", error: String(error?.message ?? error) }));
   }
 });
 
+// Alarm persistence is not guaranteed across browser restarts or extension
+// updates. Reassert both schedules whenever the service worker is evaluated.
+void ensurePeriodicAlarms();
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const run = async () => {
     switch (message?.type) {
       case "GRIDEDGE_CAPTURE_BATCH": return await deliverCapture(message, sender);
-      case "GRIDEDGE_RESUME_BOUNDARY": return await deliverCapture(message, sender, true);
+      case "GRIDEDGE_COMPLETE_HISTORY_BRIDGE":
+        return await deliverCapture(message, sender, { completeHistoryBridge: true });
+      case "GRIDEDGE_DISCONTINUITY_BOUNDARY":
+        return await deliverCapture(message, sender, { discontinuityBoundary: true });
+      case "GRIDEDGE_RESUME_BOUNDARY":
+        return await deliverCapture(message, sender, { resumeBoundary: true });
       case "GRIDEDGE_CAPTURE_ERROR":
         await setStatus({ ok: false, kind: "CAPTURE_ERROR", provider: message.provider, page_url: message.page_url, error: message.message });
         return { ok: true };
       case "GRIDEDGE_GET_STATUS": {
         const current = await settings();
+        const resolved = validateMqttSettings(current);
         const { last_status: lastStatus = null } = await chrome.storage.local.get("last_status");
-        const database = await GridEdgeDurable.openDatabase();
-        const effectiveStatus = lastStatus?.store_generation === GridEdgeDurable.DATABASE_NAME
+        const database = await GridEdgeDurable.openDatabase(indexedDB, resolved.databaseName);
+        const effectiveStatus = lastStatus?.store_generation === resolved.databaseName
           ? lastStatus
-          : { ok: false, kind: "STORE_GENERATION_CHANGED", store_generation: GridEdgeDurable.DATABASE_NAME };
-        return { settings: { ...current, mqtt_password: current.mqtt_password ? "***" : "" }, store: await GridEdgeDurable.status(database), last_status: effectiveStatus };
+          : { ok: false, kind: "STORE_GENERATION_CHANGED", store_generation: resolved.databaseName };
+        return {
+          runtime_identity: runtimeIdentity(),
+          settings: { ...current, mqtt_password: current.mqtt_password ? "***" : "" },
+          store: await GridEdgeDurable.status(database),
+          last_status: effectiveStatus,
+        };
       }
       case "GRIDEDGE_GET_CAPTURE_STATE": {
         if (!allowedSender(sender)) throw new Error("capture-state sender is outside the reviewed page allowlist");
-        const database = await GridEdgeDurable.openDatabase();
+        const current = await settings();
+        const resolved = validateMqttSettings(current);
+        const database = await GridEdgeDurable.openDatabase(indexedDB, resolved.databaseName);
         try {
-          return { ok: true, state: await GridEdgeDurable.sourceState(database, message.instrument) };
+          return {
+            ok: true,
+            state: await GridEdgeDurable.sourceState(database, message.instrument),
+            initialization_policy: resolved.initializationPolicy,
+          };
         } catch (error) {
           if (String(error?.message ?? error) === "source state does not exist") {
-            return { ok: true, state: null };
+            return { ok: true, state: null, initialization_policy: resolved.initializationPolicy };
           }
           throw error;
         }

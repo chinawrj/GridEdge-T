@@ -13,7 +13,12 @@
   const AUDITED_LEGACY_SOURCE_KEY = `${SOURCE_ID}|XSHE|002256`;
   const AUDITED_LEGACY_SOURCE_INSTANCE = "8101d65c-bdba-4de3-83e0-8983506f159e";
   const AUDITED_LEGACY_NEXT_SEQUENCE = 2764;
-  const SOURCE_OBSERVATION_POLICY = "ACTIVE_REVIEWED_LATEST_FIRST_CYCLE_V1";
+  const LEGACY_SOURCE_OBSERVATION_POLICY = "ACTIVE_REVIEWED_LATEST_FIRST_CYCLE_V1";
+  const PAGE_CLOCK_SOURCE_OBSERVATION_POLICY = "REVIEWED_SOURCE_CLOCK_LATEST_FIRST_V2";
+  const SOURCE_OBSERVATION_POLICY = "REVIEWED_EASTMONEY_HTTPS_DATE_LATEST_FIRST_V3";
+  const PRODUCTION_TOPIC_ROOT = "gridedge/market/v1";
+  const E2E_UUID_V4 = "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+  const ISOLATED_TOPIC_ROOT = new RegExp(`^gridedge-e2e/e2e-0629-${E2E_UUID_V4}/market/v1$`);
   let writerTail = Promise.resolve();
 
   function request(requestObject) {
@@ -137,45 +142,25 @@
     return capture;
   }
 
-  function shanghaiSecondOfDay(timestampUs) {
-    if (!Number.isSafeInteger(timestampUs) || timestampUs < 0) return null;
-    const parts = new Intl.DateTimeFormat("en-GB", {
-      timeZone: "Asia/Shanghai",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      hourCycle: "h23",
-    }).formatToParts(new Date(timestampUs / 1000));
-    const value = Object.fromEntries(parts.map((part) => [part.type, part.value]));
-    return Number(value.hour) * 3600 + Number(value.minute) * 60 + Number(value.second);
-  }
-
   function isReviewedAshareSaleTimestamp(timestampUs) {
-    const secondOfDay = shanghaiSecondOfDay(timestampUs);
-    return secondOfDay !== null &&
-      ((secondOfDay >= 9 * 3600 + 25 * 60 && secondOfDay <= 11 * 3600 + 30 * 60) ||
-       (secondOfDay >= 13 * 3600 && secondOfDay <= 15 * 3600));
+    return core.isReviewedAshareSaleTimestamp(timestampUs);
   }
 
-  function stableRowEvidence(row) {
-    const {
-      source_table_ordinal: _sourceTableOrdinal,
-      source_row_ordinal: _sourceRowOrdinal,
-      source_same_second_ordinal: _sourceSameSecondOrdinal,
-      raw_cells: _rawCells,
-      ...evidence
-    } = row;
-    return evidence;
+  function reviewedTopicRoot(value) {
+    if (value === PRODUCTION_TOPIC_ROOT || ISOLATED_TOPIC_ROOT.test(value ?? "")) return value;
+    throw new Error("MQTT topic root is outside the reviewed production/E2E namespaces");
   }
 
-  async function canonicalEvent(capture, row, sourceInstanceId, sourceSequence, sourceId = SOURCE_ID) {
+  async function canonicalEvent(capture, row, sourceInstanceId, sourceSequence, sourceId = SOURCE_ID,
+    mqttTopicRoot = PRODUCTION_TOPIC_ROOT) {
+    const topicRoot = reviewedTopicRoot(mqttTopicRoot);
     const evidence = {
       provider: capture.provider,
       provider_version: capture.provider_version,
       source_url: capture.source_url,
       session_date: capture.session_date,
       captured_at_us: capture.captured_at_us,
-      row: stableRowEvidence(row),
+      row: core.stableMarketRowEvidence(row),
     };
     const document = {
       spec: "gridedge.market",
@@ -210,7 +195,7 @@
       event_id: eventId,
       source_key: `${sourceId}|${capture.instrument.venue}|${capture.instrument.symbol}`,
       source_sequence: sourceSequence,
-      mqtt_topic: `gridedge/market/v1/${capture.instrument.venue}/${capture.instrument.symbol}/trade`,
+      mqtt_topic: `${topicRoot}/${capture.instrument.venue}/${capture.instrument.symbol}/trade`,
       payload: core.canonicalJson(document),
       state: "PENDING",
       attempts: 0,
@@ -218,7 +203,9 @@
     };
   }
 
-  async function canonicalStatusEvent(capture, captureSha256, sourceInstanceId, sourceSequence, sourceId = SOURCE_ID) {
+  async function canonicalStatusEvent(capture, captureSha256, sourceInstanceId, sourceSequence,
+    sourceId = SOURCE_ID, mqttTopicRoot = PRODUCTION_TOPIC_ROOT) {
+    const topicRoot = reviewedTopicRoot(mqttTopicRoot);
     const proof = capture.completeness;
     const payload = {
       status: "SESSION_HISTORY_COMPLETE",
@@ -264,7 +251,7 @@
       event_id: eventId,
       source_key: `${sourceId}|${capture.instrument.venue}|${capture.instrument.symbol}`,
       source_sequence: sourceSequence,
-      mqtt_topic: `gridedge/market/v1/${capture.instrument.venue}/${capture.instrument.symbol}/status`,
+      mqtt_topic: `${topicRoot}/${capture.instrument.venue}/${capture.instrument.symbol}/status`,
       payload: core.canonicalJson(document),
       state: "PENDING",
       attempts: 0,
@@ -281,7 +268,9 @@
     coveredThroughUs,
     livePageOverlap,
     sourceId = SOURCE_ID,
+    mqttTopicRoot = PRODUCTION_TOPIC_ROOT,
   ) {
+    const topicRoot = reviewedTopicRoot(mqttTopicRoot);
     const payload = {
       status: "LIVE_CONTIGUOUS",
       session_date: capture.session_date,
@@ -324,7 +313,7 @@
       event_id: eventId,
       source_key: `${sourceId}|${capture.instrument.venue}|${capture.instrument.symbol}`,
       source_sequence: sourceSequence,
-      mqtt_topic: `gridedge/market/v1/${capture.instrument.venue}/${capture.instrument.symbol}/status`,
+      mqtt_topic: `${topicRoot}/${capture.instrument.venue}/${capture.instrument.symbol}/status`,
       payload: core.canonicalJson(document),
       state: "PENDING",
       attempts: 0,
@@ -340,8 +329,11 @@
     previousObservedAtUs,
     coveredThroughUs,
     latestDisplayedTradeUs,
+    policy = SOURCE_OBSERVATION_POLICY,
     sourceId = SOURCE_ID,
+    mqttTopicRoot = PRODUCTION_TOPIC_ROOT,
   ) {
+    const topicRoot = reviewedTopicRoot(mqttTopicRoot);
     const payload = {
       status: "SOURCE_OBSERVED_CURRENT",
       session_date: capture.session_date,
@@ -353,8 +345,14 @@
       row_count: capture.rows.length,
       capture_sha256: captureSha256,
       source_captured_at_us: capture.captured_at_us,
-      policy: SOURCE_OBSERVATION_POLICY,
+      policy,
     };
+    if (policy === PAGE_CLOCK_SOURCE_OBSERVATION_POLICY) {
+      payload.source_page_observed_at_us = capture.source_page_observed_at_us;
+    } else if (policy === SOURCE_OBSERVATION_POLICY) {
+      payload.source_server_observed_at_us = capture.source_server_observed_at_us;
+      payload.source_clock_origin = capture.source_clock_origin;
+    }
     if (previousObservedAtUs !== undefined) {
       payload.previous_observed_at_us = previousObservedAtUs;
     }
@@ -388,7 +386,7 @@
       event_id: eventId,
       source_key: `${sourceId}|${capture.instrument.venue}|${capture.instrument.symbol}`,
       source_sequence: sourceSequence,
-      mqtt_topic: `gridedge/market/v1/${capture.instrument.venue}/${capture.instrument.symbol}/status`,
+      mqtt_topic: `${topicRoot}/${capture.instrument.venue}/${capture.instrument.symbol}/status`,
       payload: core.canonicalJson(document),
       state: "PENDING",
       attempts: 0,
@@ -402,7 +400,10 @@
     sourceInstanceId,
     sourceSequence,
     sourceId = SOURCE_ID,
+    mqttTopicRoot = PRODUCTION_TOPIC_ROOT,
+    { discontinuityPreviousCoveredThroughUs = null } = {},
   ) {
+    const topicRoot = reviewedTopicRoot(mqttTopicRoot);
     const capture = validateCapture(captureValue);
     if (capture.completeness.session_complete || capture.completeness.page_index !== 1) {
       throw new Error("session resume boundary requires one partial Eastmoney page-one capture");
@@ -429,8 +430,17 @@
       row_count: capture.rows.length,
       capture_sha256: captureSha256,
       source_captured_at_us: capture.captured_at_us,
-      policy: "INCOMPLETE_EASTMONEY_HISTORY_EXPLICIT_POLICY_V1",
+      policy: discontinuityPreviousCoveredThroughUs === null
+        ? "INCOMPLETE_EASTMONEY_HISTORY_EXPLICIT_POLICY_V1"
+        : "SAME_DAY_DISCONTINUITY_BOUNDARY_V2",
     };
+    if (discontinuityPreviousCoveredThroughUs !== null) {
+      if (!Number.isSafeInteger(discontinuityPreviousCoveredThroughUs) ||
+          discontinuityPreviousCoveredThroughUs >= coveredFromUs) {
+        throw new Error("same-day discontinuity boundary requires a strict prior watermark");
+      }
+      payload.previous_covered_through_us = discontinuityPreviousCoveredThroughUs;
+    }
     const document = {
       spec: "gridedge.market",
       schema_version: 1,
@@ -461,7 +471,7 @@
       event_id: eventId,
       source_key: `${sourceId}|${capture.instrument.venue}|${capture.instrument.symbol}`,
       source_sequence: sourceSequence,
-      mqtt_topic: `gridedge/market/v1/${capture.instrument.venue}/${capture.instrument.symbol}/status`,
+      mqtt_topic: `${topicRoot}/${capture.instrument.venue}/${capture.instrument.symbol}/status`,
       payload: core.canonicalJson(document),
       state: "PENDING",
       attempts: 0,
@@ -473,14 +483,39 @@
     database,
     captureValue,
     claimedCaptureSha256,
-    { createResumeBoundary = false, sourceObservationPolicy = null } = {},
+    { createResumeBoundary = false, createDiscontinuityBoundary = false,
+      requireCompleteHistoryBridge = false,
+      sourceObservationPolicy = null, sourceObservationOnly = false,
+      mqttTopicRoot = PRODUCTION_TOPIC_ROOT, deadlineAtMs = null } = {},
   ) {
-    if (sourceObservationPolicy !== null && sourceObservationPolicy !== SOURCE_OBSERVATION_POLICY) {
+    const topicRoot = reviewedTopicRoot(mqttTopicRoot);
+    if (deadlineAtMs !== null && (!Number.isSafeInteger(deadlineAtMs) || deadlineAtMs <= 0)) {
+      throw new Error("capture delivery deadline is invalid");
+    }
+    if (sourceObservationPolicy !== null &&
+        ![LEGACY_SOURCE_OBSERVATION_POLICY, PAGE_CLOCK_SOURCE_OBSERVATION_POLICY,
+          SOURCE_OBSERVATION_POLICY]
+          .includes(sourceObservationPolicy)) {
       throw new Error("source observation policy is not reviewed");
     }
     const capture = validateCapture(captureValue, {
-      allowStaleLatest: sourceObservationPolicy === SOURCE_OBSERVATION_POLICY,
+      allowStaleLatest: sourceObservationPolicy !== null,
     });
+    if (sourceObservationOnly && sourceObservationPolicy === null) {
+      throw new Error("atomic source observation requires a reviewed policy");
+    }
+    if (createResumeBoundary && createDiscontinuityBoundary) {
+      throw new Error("capture cannot create two boundary policies");
+    }
+    const createBoundary = createResumeBoundary || createDiscontinuityBoundary;
+    if (sourceObservationOnly && (createBoundary || capture.completeness.session_complete)) {
+      throw new Error("atomic source observation requires an active partial page-one capture");
+    }
+    if (sourceObservationPolicy === PAGE_CLOCK_SOURCE_OBSERVATION_POLICY) {
+      core.validateClockBoundSourceObservationTiming(capture);
+    } else if (sourceObservationPolicy === SOURCE_OBSERVATION_POLICY) {
+      core.validateServerClockBoundSourceObservationTiming(capture);
+    }
     const canonicalCapture = core.canonicalJson(capture);
     const captureSha256 = await core.sha256Hex(canonicalCapture);
     if (captureSha256 !== claimedCaptureSha256) {
@@ -490,7 +525,7 @@
     const preparedRows = [];
     for (const row of capture.rows) {
       const identity = `${capture.provider}|${capture.instrument.venue}|${capture.instrument.symbol}|${capture.session_date}|${row.source_row_key}`;
-      const rowJson = core.canonicalJson(stableRowEvidence(row));
+      const rowJson = core.canonicalJson(core.stableMarketRowEvidence(row));
       preparedRows.push({ identity, row, rowJson, evidenceSha256: await core.sha256Hex(rowJson) });
     }
 
@@ -506,6 +541,13 @@
     const state = observedState
       ? { ...observedState }
       : { key: sourceKey, source_instance_id: crypto.randomUUID(), next_sequence: 1 };
+    const existingTopicRoot = observedState
+      ? state.mqtt_topic_root ?? PRODUCTION_TOPIC_ROOT
+      : topicRoot;
+    if (existingTopicRoot !== topicRoot) {
+      throw new Error("durable source state cannot change MQTT topic namespace");
+    }
+    state.mqtt_topic_root = existingTopicRoot;
     const conflicts = [];
     const duplicates = [];
     const pendingRows = [];
@@ -519,14 +561,60 @@
         conflicts.push({ identity: prepared.identity, existing_evidence_sha256: existing.evidence_sha256, conflicting_evidence_sha256: prepared.evidenceSha256, conflicting_raw_json: prepared.rowJson, capture_sha256: captureSha256, created_at_us: core.unixMicrosNow() });
       }
     }
+    if (sourceObservationOnly && conflicts.length > 0) {
+      throw new Error("atomic source observation conflicts with durable trade evidence");
+    }
+    if (requireCompleteHistoryBridge && conflicts.length > 0) {
+      throw new Error("complete history bridge conflicts with durable trade evidence");
+    }
+    if (createDiscontinuityBoundary && conflicts.length > 0) {
+      throw new Error("same-day discontinuity boundary conflicts with durable trade evidence");
+    }
+    if (sourceObservationOnly && pendingRows.length > 0) {
+      throw new Error("atomic source observation contains unseen trade evidence");
+    }
 
     const events = [];
     const statusEvents = [];
     if (conflicts.length === 0) {
       const previousCoveredThroughUs = state.covered_through_us;
+      const discontinuityCoveredThroughUs = createDiscontinuityBoundary
+        ? Math.max(...capture.rows.map((row) =>
+            core.eventTimeUs(capture.session_date, row.source_trade_time)))
+        : null;
+      const exactDiscontinuityRetry = createDiscontinuityBoundary &&
+        state.discontinuity_boundary_session_date === capture.session_date &&
+        state.resume_boundary_capture_sha256 === captureSha256 &&
+        state.covered_through_us === discontinuityCoveredThroughUs &&
+        Number.isSafeInteger(state.discontinuity_previous_covered_through_us) &&
+        state.discontinuity_previous_covered_through_us < discontinuityCoveredThroughUs;
       let livePageOverlap = 0;
       let liveCoveredThroughUs = null;
       const activeSessionDate = state.complete_session_date ?? state.resume_boundary_session_date;
+      if (requireCompleteHistoryBridge) {
+        if (createBoundary || sourceObservationOnly || !capture.completeness.session_complete) {
+          throw new Error("complete history bridge requires a complete trade capture");
+        }
+        if (state.complete_session_date !== capture.session_date ||
+            previousCoveredThroughUs === undefined) {
+          throw new Error("complete history bridge requires same-day durable complete evidence");
+        }
+        const hasExactWatermarkOverlap = preparedRows.some((prepared) => {
+          const existing = observedRows.get(prepared.identity);
+          return existing && existing.evidence_sha256 === prepared.evidenceSha256 &&
+            existing.raw_json === prepared.rowJson &&
+            core.eventTimeUs(capture.session_date, prepared.row.source_trade_time) ===
+              previousCoveredThroughUs;
+        });
+        if (!hasExactWatermarkOverlap) {
+          throw new Error("complete history bridge has no durable overlap at its prior watermark");
+        }
+        const pendingTimes = pendingRows.map((pending) =>
+          core.eventTimeUs(capture.session_date, pending.row.source_trade_time));
+        if (pendingTimes.some((timestamp) => timestamp <= previousCoveredThroughUs)) {
+          throw new Error("complete history bridge introduced unseen trade behind its prior watermark");
+        }
+      }
       if (capture.completeness.session_complete && activeSessionDate) {
         if (capture.session_date < activeSessionDate ||
             (capture.session_date === activeSessionDate &&
@@ -535,7 +623,7 @@
           throw new Error("complete history capture moved behind the durable market watermark");
         }
       }
-      if (activeSessionDate && !capture.completeness.session_complete && !createResumeBoundary) {
+      if (activeSessionDate && !capture.completeness.session_complete && !createBoundary) {
         if (capture.session_date !== activeSessionDate) {
           throw new Error("a new session requires a complete history capture before live ingestion");
         }
@@ -559,7 +647,8 @@
         }
       }
       for (const pending of pendingRows) {
-        events.push(await canonicalEvent(capture, pending.row, state.source_instance_id, state.next_sequence));
+        events.push(await canonicalEvent(capture, pending.row, state.source_instance_id,
+          state.next_sequence, SOURCE_ID, topicRoot));
         state.next_sequence += 1;
       }
       if (capture.completeness.session_complete && state.complete_capture_sha256 !== captureSha256) {
@@ -568,19 +657,31 @@
           captureSha256,
           state.source_instance_id,
           state.next_sequence,
+          SOURCE_ID,
+          topicRoot,
         ));
         state.next_sequence += 1;
         state.complete_capture_sha256 = captureSha256;
         state.complete_session_date = capture.session_date;
         delete state.resume_boundary_capture_sha256;
         delete state.resume_boundary_session_date;
+        delete state.discontinuity_boundary_session_date;
+        delete state.discontinuity_previous_covered_through_us;
         state.covered_through_us = capture.completeness.covered_through_us;
-      } else if (createResumeBoundary) {
+      } else if (createBoundary) {
         if (capture.completeness.session_complete || capture.completeness.page_index !== 1) {
           throw new Error("session resume boundary requires a partial Eastmoney page-one capture");
         }
-        if (state.complete_session_date === capture.session_date) {
+        if (!createDiscontinuityBoundary && state.complete_session_date === capture.session_date) {
           throw new Error("a complete session cannot be replaced by a partial resume boundary");
+        }
+        if (createDiscontinuityBoundary && !exactDiscontinuityRetry &&
+            state.complete_session_date !== capture.session_date) {
+          throw new Error("same-day discontinuity boundary requires durable complete evidence");
+        }
+        if (createDiscontinuityBoundary && exactDiscontinuityRetry &&
+            (pendingRows.length !== 0 || duplicates.length !== preparedRows.length)) {
+          throw new Error("same-day discontinuity retry disagrees with its durable boundary");
         }
         if (state.resume_boundary_capture_sha256 !== captureSha256) {
           const boundaryCoveredThroughUs = Math.max(...capture.rows.map((row) =>
@@ -589,15 +690,38 @@
               boundaryCoveredThroughUs <= previousCoveredThroughUs) {
             throw new Error("session resume boundary must strictly advance its durable watermark");
           }
+          if (createDiscontinuityBoundary) {
+            if (previousCoveredThroughUs === undefined || pendingRows.length === 0 ||
+                duplicates.length !== 0 ||
+                pendingRows.some((pending) =>
+                  core.eventTimeUs(capture.session_date, pending.row.source_trade_time) <=
+                    previousCoveredThroughUs)) {
+              throw new Error("same-day discontinuity boundary may only add rows after its prior watermark");
+            }
+          }
           statusEvents.push(await canonicalResumeBoundaryEvent(
             capture,
             captureSha256,
             state.source_instance_id,
             state.next_sequence,
+            SOURCE_ID,
+            topicRoot,
+            { discontinuityPreviousCoveredThroughUs: createDiscontinuityBoundary
+              ? previousCoveredThroughUs
+              : null },
           ));
           state.next_sequence += 1;
           state.resume_boundary_capture_sha256 = captureSha256;
           state.resume_boundary_session_date = capture.session_date;
+          if (createDiscontinuityBoundary) {
+            state.discontinuity_boundary_session_date = capture.session_date;
+            state.discontinuity_previous_covered_through_us = previousCoveredThroughUs;
+            delete state.source_observed_at_us;
+            delete state.source_observed_session_date;
+          } else {
+            delete state.discontinuity_boundary_session_date;
+            delete state.discontinuity_previous_covered_through_us;
+          }
           delete state.complete_capture_sha256;
           delete state.complete_session_date;
           state.covered_through_us = boundaryCoveredThroughUs;
@@ -611,17 +735,27 @@
           previousCoveredThroughUs,
           liveCoveredThroughUs,
           livePageOverlap,
+          SOURCE_ID,
+          topicRoot,
         ));
         state.next_sequence += 1;
         state.covered_through_us = liveCoveredThroughUs;
       }
-      if (sourceObservationPolicy === SOURCE_OBSERVATION_POLICY) {
+      // The collector is allowed to warm up from 12:59 so the first afternoon
+      // rows are ready at 13:00, but that minute is not a reviewed sale-time
+      // watermark.  Publishing an observation there makes the first 13:00
+      // observation declare an out-of-session predecessor and the strict Rust
+      // consumer must reject the stream.  Keep warmup read-only and detach once
+      // from durable poison written by an older build.
+      if (sourceObservationPolicy !== null &&
+          isReviewedAshareSaleTimestamp(capture.captured_at_us)) {
         const observationSession = state.complete_session_date ?? state.resume_boundary_session_date;
         if (capture.completeness.session_complete || capture.completeness.page_index !== 1 ||
             observationSession !== capture.session_date || state.covered_through_us === undefined) {
           throw new Error("source observation lacks an active reviewed page-one session watermark");
         }
-        const previousObservedAtUs = state.source_observed_session_date === capture.session_date
+        const previousObservedAtUs = state.source_observed_session_date === capture.session_date &&
+          isReviewedAshareSaleTimestamp(state.source_observed_at_us)
           ? state.source_observed_at_us
           : undefined;
         if (previousObservedAtUs !== undefined && capture.captured_at_us <= previousObservedAtUs) {
@@ -640,6 +774,9 @@
           previousObservedAtUs,
           state.covered_through_us,
           latestDisplayedTradeUs,
+          sourceObservationPolicy,
+          SOURCE_ID,
+          topicRoot,
         ));
         state.next_sequence += 1;
         state.source_observed_at_us = capture.captured_at_us;
@@ -669,13 +806,20 @@
         throw new Error("source row changed during capture preparation");
       }
     }
+    if (deadlineAtMs !== null && Date.now() >= deadlineAtMs) {
+      writeTx.abort();
+      await writeDone.catch(() => undefined);
+      throw new Error("capture delivery exceeded its reviewed deadline");
+    }
     if (conflicts.length > 0) {
       for (const conflict of conflicts) conflictStore.add(conflict);
       batchStore.put({ capture_sha256: captureSha256, canonical_json: canonicalCapture, outcome: "CONFLICT", created_at_us: core.unixMicrosNow() });
       await writeDone;
       return { accepted: 0, duplicates: duplicates.length, conflicts: conflicts.length, event_ids: [] };
     }
-    for (const duplicate of duplicates) rowStore.put(duplicate);
+    if (!sourceObservationOnly) {
+      for (const duplicate of duplicates) rowStore.put(duplicate);
+    }
     const eventIds = [];
     for (let index = 0; index < pendingRows.length; index += 1) {
       const pending = pendingRows[index];
@@ -707,10 +851,21 @@
     return operation;
   }
 
-  function ingestResumeBoundary(database, captureValue, claimedCaptureSha256) {
+  function ingestResumeBoundary(database, captureValue, claimedCaptureSha256, options = {}) {
     const operation = writerTail.then(() =>
       ingestCaptureImpl(database, captureValue, claimedCaptureSha256, {
+        ...options,
         createResumeBoundary: true,
+      }));
+    writerTail = operation.catch(() => undefined);
+    return operation;
+  }
+
+  function ingestDiscontinuityBoundary(database, captureValue, claimedCaptureSha256, options = {}) {
+    const operation = writerTail.then(() =>
+      ingestCaptureImpl(database, captureValue, claimedCaptureSha256, {
+        ...options,
+        createDiscontinuityBoundary: true,
       }));
     writerTail = operation.catch(() => undefined);
     return operation;
@@ -822,7 +977,12 @@
       throw new Error("stored replay sequence or timestamp is invalid");
     }
     const expectedSourceKey = `${SOURCE_ID}|${instrument.venue}|${instrument.symbol}`;
-    const expectedTopic = `gridedge/market/v1/${instrument.venue}/${instrument.symbol}/${
+    const topicMatch = new RegExp(
+      `^(gridedge/market/v1|gridedge-e2e/e2e-0629-${E2E_UUID_V4}/market/v1)/`,
+    )
+      .exec(event.mqtt_topic ?? "");
+    if (!topicMatch) throw new Error("stored replay topic namespace is invalid");
+    const expectedTopic = `${topicMatch[1]}/${instrument.venue}/${instrument.symbol}/${
       document.event_type === "TRADE_TICK" ? "trade" : "status"
     }`;
     if (event.source_key !== expectedSourceKey) throw new Error("stored replay source key is invalid");
@@ -866,7 +1026,28 @@
            document.payload.page_index !== 1 ||
            !Number.isSafeInteger(document.payload.page_count) || document.payload.page_count < 1 ||
            !Number.isSafeInteger(document.payload.row_count) || document.payload.row_count < 1 ||
-           document.payload.policy !== SOURCE_OBSERVATION_POLICY ||
+           ![LEGACY_SOURCE_OBSERVATION_POLICY, PAGE_CLOCK_SOURCE_OBSERVATION_POLICY,
+             SOURCE_OBSERVATION_POLICY]
+             .includes(document.payload.policy) ||
+           (document.payload.policy === PAGE_CLOCK_SOURCE_OBSERVATION_POLICY &&
+            (!Number.isSafeInteger(document.payload.source_page_observed_at_us) ||
+             document.payload.source_page_observed_at_us > document.payload.observed_at_us ||
+             document.payload.observed_at_us - document.payload.source_page_observed_at_us >
+               15_000_000 ||
+             core.shanghaiSessionDate(document.payload.source_page_observed_at_us) !==
+               sessionDate)) ||
+           (document.payload.policy === SOURCE_OBSERVATION_POLICY &&
+            (!Number.isSafeInteger(document.payload.source_server_observed_at_us) ||
+             document.payload.source_clock_origin !== "EASTMONEY_HTTPS_DATE_HEADER" ||
+             document.payload.source_server_observed_at_us > document.payload.observed_at_us ||
+             document.payload.observed_at_us - document.payload.source_server_observed_at_us >
+               15_000_000 ||
+             core.shanghaiSessionDate(document.payload.source_server_observed_at_us) !==
+               sessionDate)) ||
+           (document.payload.policy === LEGACY_SOURCE_OBSERVATION_POLICY &&
+            (document.payload.source_page_observed_at_us !== undefined ||
+             document.payload.source_server_observed_at_us !== undefined ||
+             document.payload.source_clock_origin !== undefined)) ||
            (document.payload.previous_observed_at_us !== undefined &&
             (!Number.isSafeInteger(document.payload.previous_observed_at_us) ||
              document.payload.previous_observed_at_us >= document.payload.observed_at_us)))) {
@@ -881,7 +1062,12 @@
            document.payload.page_index !== 1 ||
            !Number.isSafeInteger(document.payload.page_count) || document.payload.page_count < 1 ||
            !Number.isSafeInteger(document.payload.row_count) || document.payload.row_count < 1 ||
-           document.payload.policy !== "INCOMPLETE_EASTMONEY_HISTORY_EXPLICIT_POLICY_V1")) {
+           !["INCOMPLETE_EASTMONEY_HISTORY_EXPLICIT_POLICY_V1",
+             "SAME_DAY_DISCONTINUITY_BOUNDARY_V2"].includes(document.payload.policy) ||
+           (document.payload.policy === "SAME_DAY_DISCONTINUITY_BOUNDARY_V2" &&
+            (!Number.isSafeInteger(document.payload.previous_covered_through_us) ||
+             document.payload.previous_covered_through_us >=
+               document.payload.covered_from_us)))) {
         throw new Error("stored replay partial boundary proof is invalid");
       }
       if (document.payload.status === "LIVE_CONTIGUOUS" &&
@@ -939,5 +1125,5 @@
     };
   }
 
-  return { DATABASE_NAME: DB_NAME, SOURCE_ID, acknowledge, canonicalEvent, canonicalResumeBoundaryEvent, ingestCapture, ingestResumeBoundary, openDatabase, pendingEvents, replayExport, sourceState, status, validateCapture };
+  return { DATABASE_NAME: DB_NAME, SOURCE_ID, acknowledge, canonicalEvent, canonicalResumeBoundaryEvent, ingestCapture, ingestDiscontinuityBoundary, ingestResumeBoundary, openDatabase, pendingEvents, replayExport, sourceState, status, validateCapture };
 });

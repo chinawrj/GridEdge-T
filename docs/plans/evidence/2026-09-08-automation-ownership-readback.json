@@ -1,0 +1,53 @@
+{
+  "schema": "gridedge.automation-ownership-readback.v1",
+  "checked_at": "2026-09-08T15:47:33.822+08:00",
+  "mutation_api": "codex_app.automation_update",
+  "mutation_result": {
+    "automation_id": "goal",
+    "mode": "update",
+    "status": "PAUSED"
+  },
+  "pre_update_regression": {
+    "exit_code": 1,
+    "assertion": "standalone post-close goal must remain PAUSED while delivery owner is ACTIVE",
+    "actual": "ACTIVE",
+    "expected": "PAUSED"
+  },
+  "post_update_regression": {
+    "exit_code": 0,
+    "script": "docs/plans/verify-automation-ownership.cjs",
+    "automations": [
+      {
+        "id": "automation-2",
+        "kind": "heartbeat",
+        "status": "ACTIVE",
+        "next_run_at": 1788912008000,
+        "next_run_at_asia_shanghai": "2026-09-09T08:00:08+08:00",
+        "target_thread_id": "01a00079-b837-7750-9e60-1dbe3f803685"
+      },
+      {
+        "id": "goal",
+        "kind": "cron",
+        "status": "PAUSED",
+        "next_run_at": null,
+        "target_thread_id": null
+      },
+      {
+        "id": "gridedge",
+        "kind": "heartbeat",
+        "status": "ACTIVE",
+        "next_run_at": 1788855032000,
+        "next_run_at_asia_shanghai": "2026-09-08T16:10:32+08:00",
+        "target_thread_id": "01a07ed4-8d58-7110-8382-181d52c59e1a"
+      }
+    ]
+  },
+  "scheduler_boundary_regression": {
+    "exit_code": 0,
+    "script": "docs/plans/verify-delivery-schedule.cjs",
+    "cases_passed": 5,
+    "system_timezone": "Asia/Shanghai"
+  },
+  "direct_file_or_database_edit": false,
+  "formal_runtime_mutation": false
+}

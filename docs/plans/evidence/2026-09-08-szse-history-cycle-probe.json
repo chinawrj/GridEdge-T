@@ -1,0 +1,21 @@
+{
+  "checked_at": "2026-09-08T21:11:00+08:00",
+  "scope": "Two bounded read-only HTTPS requests; no production publication",
+  "endpoint": "https://www.szse.cn/api/market/ssjjhq/getHistoryData",
+  "instrument": "002256",
+  "marketId": 1,
+  "experimental_cycleType_2": {
+    "semantics_documented": false,
+    "response_code": "0",
+    "picupdata_count": 0,
+    "picdowndata_count": 0
+  },
+  "official_page_daily_control_cycleType_32": {
+    "response_code": "0",
+    "picupdata_count": 201,
+    "first_date": "2025-11-13",
+    "last_date": "2026-09-08"
+  },
+  "conclusion": "Endpoint works for the documented daily cycle. Experimental cycle 2 returned no rows; it does not establish a minute OHLC route. Do not infer all minute services are unavailable or assign undocumented semantics to cycle 2.",
+  "admitted": false
+}

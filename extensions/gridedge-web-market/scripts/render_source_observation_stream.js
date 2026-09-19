@@ -45,13 +45,17 @@ async function main() {
   );
   await durable.ingestCapture(database, history, await digest(history));
   const observation = structuredClone(initial);
+  observation.source_row_order = "LATEST_FIRST";
   observation.captured_at_us = history.completeness.covered_through_us + 30_000_000;
+  observation.source_server_observed_at_us = observation.captured_at_us - 5_000_000;
+  observation.source_clock_origin = "EASTMONEY_HTTPS_DATE_HEADER";
   await durable.ingestCapture(database, observation, await digest(observation), {
-    sourceObservationPolicy: "ACTIVE_REVIEWED_LATEST_FIRST_CYCLE_V1",
+    sourceObservationPolicy: "REVIEWED_EASTMONEY_HTTPS_DATE_LATEST_FIRST_V3",
   });
   observation.captured_at_us += 30_000_000;
+  observation.source_server_observed_at_us += 30_000_000;
   await durable.ingestCapture(database, observation, await digest(observation), {
-    sourceObservationPolicy: "ACTIVE_REVIEWED_LATEST_FIRST_CYCLE_V1",
+    sourceObservationPolicy: "REVIEWED_EASTMONEY_HTTPS_DATE_LATEST_FIRST_V3",
   });
 
   for (const event of await durable.pendingEvents(database, 20)) {

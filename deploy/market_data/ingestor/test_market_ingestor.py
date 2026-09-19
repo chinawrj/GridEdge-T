@@ -63,6 +63,29 @@ class FakeMessage:
 
 
 class MarketEventValidationTest(unittest.TestCase):
+    def test_topic_namespace_is_atomic_between_production_and_isolated_e2e(self) -> None:
+        isolated = "gridedge-e2e/e2e-0629-123e4567-e89b-42d3-a456-426614174000"
+        self.assertEqual(market_ingestor.validate_topic_namespace("gridedge"), "gridedge")
+        self.assertEqual(market_ingestor.validate_topic_namespace(isolated), isolated)
+        with self.assertRaisesRegex(ValueError, "namespace"):
+            market_ingestor.validate_topic_namespace("gridedge-e2e/not-reviewed")
+        with self.assertRaisesRegex(market_ingestor.RejectedEvent, "namespace"):
+            market_ingestor.validate_document(event(), "gridedge/market/v1/XSHE/002256/trade", isolated)
+
+    def test_isolated_ack_and_committed_topics_never_match_production(self) -> None:
+        isolated = "gridedge-e2e/e2e-0629-123e4567-e89b-42d3-a456-426614174000"
+        raw = event()
+        topic = f"{isolated}/market/v1/XSHE/002256/trade"
+        validated = market_ingestor.validate_document(raw, topic, isolated)
+        ack_topic, _ = market_ingestor.application_ack(validated, "inserted", isolated)
+        committed_topic, _ = market_ingestor.committed_market_event(
+            validated, topic, raw, isolated
+        )
+        self.assertTrue(ack_topic.startswith(f"{isolated}/market-ack/v1/"))
+        self.assertTrue(committed_topic.startswith(f"{isolated}/market-committed/v1/"))
+        self.assertFalse(ack_topic.startswith("gridedge/market-ack/v1/"))
+        self.assertFalse(committed_topic.startswith("gridedge/market-committed/v1/"))
+
     def test_qos1_database_publication_requires_broker_puback_not_local_acceptance(self):
         class Result:
             rc = 0

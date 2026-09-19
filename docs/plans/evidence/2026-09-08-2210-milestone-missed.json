@@ -1,0 +1,33 @@
+{
+  "deadline": "2026-09-08T22:10:00+08:00",
+  "trigger_time": "2026-09-08T22:12:08.718+08:00",
+  "first_actual_check_time": "2026-09-09T03:48:57+08:00",
+  "latest_check_time": "2026-09-09T04:02:13+08:00",
+  "result": "MISSED",
+  "reason": "No admitted complete OHLC source or validated source-to-ACK-to-strategy-to-outbox repair exists. Research capture and passing tests do not satisfy the milestone.",
+  "outstanding": [
+    "True OHLC and documented completion/revision semantics",
+    "Two full isolated replay/recovery runs for an admissible source",
+    "Required independent review and real read-only preflight",
+    "Remote cash/fee evidence for the 3797.790 cash-basis difference"
+  ],
+  "formal_head": 1958,
+  "outbox_cursor": 1958,
+  "mode": "READ_ONLY",
+  "source_sequence": 36657,
+  "source_fresh": false,
+  "unresolved_orders": 0,
+  "supervisor_pid": 95789,
+  "observer_pid": 38883,
+  "supervisor_window": "CLOSED",
+  "supervisor_action": "BLOCKED_UNLOCKED",
+  "emulator_count": 0,
+  "observer_phase": "WAITING_FOR_RESEARCH_WINDOW",
+  "overnight_continuity_proven": false,
+  "overnight_note": "Observed supervisor log has multi-minute gaps, including 02:17:40 to 02:50:16. Surviving PIDs do not prove continuous execution. Cause not established.",
+  "next_operations_run_epoch_ms": 1788912008000,
+  "next_delivery_run_epoch_ms": 1788912614000,
+  "next_observer_window": "2026-09-09 09:29-11:32 Asia/Shanghai",
+  "production_mutation": false,
+  "deadline_extended": false
+}

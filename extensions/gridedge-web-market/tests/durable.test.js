@@ -10,6 +10,7 @@ globalThis.indexedDB = indexedDB;
 require("../src/shared.js");
 const provider = require("../src/providers/eastmoney.js");
 const durable = require("../src/durable.js");
+const pageStability = require("../src/page_stability.js");
 
 const fixture = JSON.parse(fs.readFileSync(path.join(__dirname, "../fixtures/eastmoney-time-sales-page1.json"), "utf8"));
 
@@ -91,6 +92,21 @@ async function allOutboxEvents(database) {
   return events.sort((left, right) => left.source_sequence - right.source_sequence);
 }
 
+async function allStoreRows(database, storeName) {
+  const transaction = database.transaction(storeName, "readonly");
+  const request = transaction.objectStore(storeName).getAll();
+  const rows = await new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  await new Promise((resolve, reject) => {
+    transaction.oncomplete = resolve;
+    transaction.onabort = () => reject(transaction.error);
+    transaction.onerror = () => reject(transaction.error);
+  });
+  return rows;
+}
+
 async function replaceOutboxEvent(database, previousEventId, event) {
   const transaction = database.transaction("market_event_outbox", "readwrite");
   const store = transaction.objectStore("market_event_outbox");
@@ -139,6 +155,29 @@ test("IndexedDB owns raw row identity, source sequence, and a persistent MQTT ou
   assert.equal((await durable.pendingEvents(database)).length, 4, "worker restart must not lose unacknowledged events");
   for (const event of await durable.pendingEvents(database)) await durable.acknowledge(database, event.event_id, "TEST_ONLY");
   assert.deepEqual(await durable.status(database), { accepted_rows: 4, conflicts: 0, pending_events: 0, acknowledged_events: 4 });
+  database.close();
+});
+
+test("isolated E2E store emits only its nonce topic and cannot switch to production", async () => {
+  const nonce = `e2e-0629-${crypto.randomUUID()}`;
+  const topicRoot = `gridedge-e2e/${nonce}/market/v1`;
+  const database = await durable.openDatabase(indexedDB, `gridedge-web-market-v6-${nonce}`);
+  const input = await capture();
+  await durable.ingestCapture(database, input.value, input.sha, { mqttTopicRoot: topicRoot });
+  const pending = await durable.pendingEvents(database);
+  assert.equal(pending.length, 4);
+  assert.deepEqual(pending.map((event) => event.source_sequence), [1, 2, 3, 4]);
+  assert.notEqual(JSON.parse(pending[0].payload).source.source_instance_id,
+    "8101d65c-bdba-4de3-83e0-8983506f159e");
+  assert.ok(pending.every((event) => event.mqtt_topic.startsWith(`${topicRoot}/`)));
+  assert.ok(pending.every((event) => !event.mqtt_topic.startsWith("gridedge/market/v1/")));
+  await assert.rejects(
+    () => durable.ingestCapture(database, input.value, input.sha,
+      { mqttTopicRoot: "gridedge/market/v1" }),
+    /cannot change MQTT topic namespace/,
+  );
+  assert.equal((await durable.pendingEvents(database)).length, 4,
+    "a rejected mode switch cannot enqueue cross-namespace events");
   database.close();
 });
 
@@ -244,6 +283,67 @@ test("same-second ordinal relocation is presentation-only while durable sequence
     events.map((event) => JSON.parse(event.payload).payload.price.mantissa),
     [334, 335, 336, 337],
   );
+  database.close();
+});
+
+test("production rolling evidence tolerates DOM relocation and arrows before one exact live advance", async () => {
+  const database = await durable.openDatabase(indexedDB, `gridedge-test-${crypto.randomUUID()}`);
+  const header = [
+    { text: "时间", class_name: "" },
+    { text: "成交价", class_name: "" },
+    { text: "手数", class_name: "" },
+  ];
+  const domRow = (time, price, hands) => [
+    { text: time, class_name: "" },
+    { text: price, class_name: "" },
+    { text: hands, class_name: "" },
+  ];
+  const firstSnapshot = {
+    ...structuredClone(fixture),
+    rowOrder: "LATEST_FIRST",
+    bodyText: "时间 成交价 手数 1/1页",
+    capturedAtUs: GridEdgeMarket.eventTimeUs("2026-08-20", "09:35:04"),
+    tables: [[header,
+      domRow("09:35:03", "3.36", "30"),
+      domRow("09:35:00", "3.35", "20"),
+      domRow("09:35:00", "3.34", "10"),
+    ]],
+  };
+  const first = provider.parseSnapshot(firstSnapshot);
+  const firstSha = await GridEdgeMarket.sha256Hex(GridEdgeMarket.canonicalJson(first));
+  await durable.ingestResumeBoundary(database, first, firstSha);
+
+  const secondSnapshot = {
+    ...structuredClone(firstSnapshot),
+    capturedAtUs: GridEdgeMarket.eventTimeUs("2026-08-20", "09:35:07"),
+    tables: [[[ { text: "not the reviewed table", class_name: "" } ]], [header,
+      domRow("09:35:06", "3.37", "40"),
+      domRow("09:35:03", "3.36↑", "30"),
+      domRow("09:35:00", "3.35", "20"),
+    ]],
+  };
+  const second = provider.parseSnapshot(secondSnapshot);
+  assert.notEqual(first.rows.at(-1).source_table_ordinal, second.rows.at(-2).source_table_ordinal);
+  assert.notEqual(
+    first.rows.find((row) => row.price === "3.35").source_same_second_ordinal,
+    second.rows.find((row) => row.price === "3.35").source_same_second_ordinal,
+  );
+  const merged = pageStability.mergeRollingPageCaptures(first, second, {
+    rowIdentity: (row) => row.source_row_key,
+    rowEvidence: (row) => GridEdgeMarket.canonicalJson(GridEdgeMarket.stableMarketRowEvidence(row)),
+  });
+  const mergedSha = await GridEdgeMarket.sha256Hex(GridEdgeMarket.canonicalJson(merged));
+  const result = await durable.ingestCapture(database, merged, mergedSha);
+  assert.deepEqual(
+    { accepted: result.accepted, duplicates: result.duplicates, conflicts: result.conflicts,
+      status: result.status_events },
+    { accepted: 1, duplicates: 3, conflicts: 0, status: 1 },
+  );
+  const documents = (await durable.pendingEvents(database, 20)).map((event) => JSON.parse(event.payload));
+  const live = documents.filter((event) => event.payload?.status === "LIVE_CONTIGUOUS");
+  assert.equal(live.length, 1);
+  const state = await durable.sourceState(database, first.instrument);
+  assert.equal(state.covered_through_us, GridEdgeMarket.eventTimeUs(first.session_date, "09:35:06"));
   database.close();
 });
 
@@ -387,6 +487,206 @@ test("active unchanged captures append source observations without inventing tic
   database.close();
 });
 
+test("lunch warmup never poisons the afternoon source observation predecessor", async () => {
+  const database = await durable.openDatabase(indexedDB, `gridedge-test-${crypto.randomUUID()}`);
+  const history = await completeSessionCapture();
+  await durable.ingestCapture(database, history.value, history.sha);
+
+  const stateBeforeLunch = await durable.sourceState(database, history.value.instrument);
+  const outboxBeforeLunch = await allOutboxEvents(database);
+
+  const lunch = await capture();
+  lunch.value.captured_at_us = GridEdgeMarket.eventTimeUs(lunch.value.session_date, "12:59:59");
+  lunch.value.source_server_observed_at_us = lunch.value.captured_at_us - 1_000_000;
+  lunch.value.source_clock_origin = "EASTMONEY_HTTPS_DATE_HEADER";
+  lunch.value.source_row_order = "LATEST_FIRST";
+  lunch.sha = await GridEdgeMarket.sha256Hex(GridEdgeMarket.canonicalJson(lunch.value));
+  const lunchResult = await durable.ingestCapture(database, lunch.value, lunch.sha, {
+    sourceObservationPolicy: "REVIEWED_EASTMONEY_HTTPS_DATE_LATEST_FIRST_V3",
+  });
+  assert.equal(lunchResult.status_events, 0);
+  assert.deepEqual(await durable.sourceState(database, history.value.instrument), stateBeforeLunch);
+  assert.deepEqual(await allOutboxEvents(database), outboxBeforeLunch);
+
+  // Simulate the durable poison left by builds that emitted a 12:59 warmup
+  // observation.  The first reviewed afternoon observation must detach from it.
+  const poisonTx = database.transaction("source_state", "readwrite");
+  const poisonStore = poisonTx.objectStore("source_state");
+  const states = await new Promise((resolve, reject) => {
+    const request = poisonStore.getAll();
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  assert.equal(states.length, 1);
+  states[0].source_observed_at_us = lunch.value.captured_at_us;
+  states[0].source_observed_session_date = lunch.value.session_date;
+  poisonStore.put(states[0]);
+  await new Promise((resolve, reject) => {
+    poisonTx.oncomplete = resolve;
+    poisonTx.onabort = () => reject(poisonTx.error);
+    poisonTx.onerror = () => reject(poisonTx.error);
+  });
+
+  const afternoon = structuredClone(lunch.value);
+  afternoon.captured_at_us = GridEdgeMarket.eventTimeUs(afternoon.session_date, "13:00:11");
+  afternoon.source_server_observed_at_us = afternoon.captured_at_us - 1_000_000;
+  const afternoonSha = await GridEdgeMarket.sha256Hex(GridEdgeMarket.canonicalJson(afternoon));
+  const afternoonResult = await durable.ingestCapture(database, afternoon, afternoonSha, {
+    sourceObservationPolicy: "REVIEWED_EASTMONEY_HTTPS_DATE_LATEST_FIRST_V3",
+  });
+  assert.equal(afternoonResult.status_events, 1);
+
+  const nextAfternoon = structuredClone(afternoon);
+  nextAfternoon.captured_at_us = GridEdgeMarket.eventTimeUs(nextAfternoon.session_date, "13:00:23");
+  nextAfternoon.source_server_observed_at_us = nextAfternoon.captured_at_us - 1_000_000;
+  const nextAfternoonSha = await GridEdgeMarket.sha256Hex(
+    GridEdgeMarket.canonicalJson(nextAfternoon),
+  );
+  const nextAfternoonResult = await durable.ingestCapture(
+    database,
+    nextAfternoon,
+    nextAfternoonSha,
+    { sourceObservationPolicy: "REVIEWED_EASTMONEY_HTTPS_DATE_LATEST_FIRST_V3" },
+  );
+  assert.equal(nextAfternoonResult.status_events, 1);
+
+  const observations = (await durable.pendingEvents(database, 20))
+    .map((event) => JSON.parse(event.payload))
+    .filter((event) => event.payload?.status === "SOURCE_OBSERVED_CURRENT");
+  assert.equal(observations.length, 2);
+  assert.equal(observations[0].payload.observed_at_us, afternoon.captured_at_us);
+  assert.equal(observations[0].payload.previous_observed_at_us, undefined);
+  assert.equal(observations[0].payload.policy, "REVIEWED_EASTMONEY_HTTPS_DATE_LATEST_FIRST_V3");
+  assert.equal(observations[1].payload.observed_at_us, nextAfternoon.captured_at_us);
+  assert.equal(observations[1].payload.previous_observed_at_us, afternoon.captured_at_us);
+  database.close();
+});
+
+test("V2 source observations bind a fresh reviewed page clock while V1 replay remains intact", async () => {
+  const database = await durable.openDatabase(indexedDB, `gridedge-test-${crypto.randomUUID()}`);
+  const history = await completeSessionCapture();
+  await durable.ingestCapture(database, history.value, history.sha);
+  const coveredThroughUs = history.value.completeness.covered_through_us;
+
+  const live = await capture();
+  live.value.captured_at_us = coveredThroughUs + 30_000_000;
+  live.value.source_page_observed_at_us = live.value.captured_at_us - 3_000_000;
+  live.value.source_row_order = "LATEST_FIRST";
+  live.sha = await GridEdgeMarket.sha256Hex(GridEdgeMarket.canonicalJson(live.value));
+  await durable.ingestCapture(database, live.value, live.sha, {
+    sourceObservationPolicy: "REVIEWED_SOURCE_CLOCK_LATEST_FIRST_V2",
+  });
+
+  const documents = (await durable.pendingEvents(database, 20)).map((event) => JSON.parse(event.payload));
+  const observation = documents.find((event) =>
+    event.payload?.status === "SOURCE_OBSERVED_CURRENT" &&
+    event.payload?.policy === "REVIEWED_SOURCE_CLOCK_LATEST_FIRST_V2");
+  assert.equal(observation.payload.source_page_observed_at_us, live.value.source_page_observed_at_us);
+  assert.equal(observation.payload.observed_at_us, live.value.captured_at_us);
+  assert.equal(observation.payload.covered_through_us, coveredThroughUs);
+
+  const before = await allOutboxEvents(database);
+  const stale = structuredClone(live.value);
+  stale.captured_at_us += 30_000_000;
+  stale.source_page_observed_at_us = stale.captured_at_us - 16_000_000;
+  const staleSha = await GridEdgeMarket.sha256Hex(GridEdgeMarket.canonicalJson(stale));
+  await assert.rejects(
+    () => durable.ingestCapture(database, stale, staleSha, {
+      sourceObservationPolicy: "REVIEWED_SOURCE_CLOCK_LATEST_FIRST_V2",
+    }),
+    /source page clock is stale/,
+  );
+  assert.deepEqual(await allOutboxEvents(database), before);
+  database.close();
+});
+
+test("V3 source observations bind the reviewed Eastmoney HTTPS clock and reject stale proof", async () => {
+  const database = await durable.openDatabase(indexedDB, `gridedge-test-${crypto.randomUUID()}`);
+  const history = await completeSessionCapture();
+  await durable.ingestCapture(database, history.value, history.sha);
+  const coveredThroughUs = history.value.completeness.covered_through_us;
+  const live = await capture();
+  live.value.captured_at_us = coveredThroughUs + 30_000_000;
+  live.value.source_server_observed_at_us = live.value.captured_at_us - 2_000_000;
+  live.value.source_clock_origin = "EASTMONEY_HTTPS_DATE_HEADER";
+  live.value.source_row_order = "LATEST_FIRST";
+  live.sha = await GridEdgeMarket.sha256Hex(GridEdgeMarket.canonicalJson(live.value));
+  await durable.ingestCapture(database, live.value, live.sha, {
+    sourceObservationPolicy: "REVIEWED_EASTMONEY_HTTPS_DATE_LATEST_FIRST_V3",
+  });
+
+  const documents = (await durable.pendingEvents(database, 20)).map((event) => JSON.parse(event.payload));
+  const observation = documents.find((event) =>
+    event.payload?.policy === "REVIEWED_EASTMONEY_HTTPS_DATE_LATEST_FIRST_V3");
+  assert.equal(
+    observation.payload.source_server_observed_at_us,
+    live.value.source_server_observed_at_us,
+  );
+  assert.equal(observation.payload.source_clock_origin, "EASTMONEY_HTTPS_DATE_HEADER");
+  assert.equal(observation.payload.covered_through_us, coveredThroughUs);
+
+  const before = await allOutboxEvents(database);
+  const stale = structuredClone(live.value);
+  stale.captured_at_us += 30_000_000;
+  stale.source_server_observed_at_us = stale.captured_at_us - 16_000_000;
+  const staleSha = await GridEdgeMarket.sha256Hex(GridEdgeMarket.canonicalJson(stale));
+  await assert.rejects(
+    () => durable.ingestCapture(database, stale, staleSha, {
+      sourceObservationPolicy: "REVIEWED_EASTMONEY_HTTPS_DATE_LATEST_FIRST_V3",
+    }),
+    /source HTTPS clock is stale/,
+  );
+  assert.deepEqual(await allOutboxEvents(database), before);
+  database.close();
+});
+
+test("an atomic V3 heartbeat is status-only and cannot ingest unseen trades or advance coverage", async () => {
+  const database = await durable.openDatabase(indexedDB, `gridedge-test-${crypto.randomUUID()}`);
+  const history = await completeSessionCapture();
+  await durable.ingestCapture(database, history.value, history.sha);
+  const stateBefore = await durable.sourceState(database, history.value.instrument);
+  const eventsBefore = await allOutboxEvents(database);
+
+  const unseen = await laterLiveCapture();
+  unseen.value.source_server_observed_at_us = unseen.value.captured_at_us - 2_000_000;
+  unseen.value.source_clock_origin = "EASTMONEY_HTTPS_DATE_HEADER";
+  unseen.value.source_row_order = "LATEST_FIRST";
+  unseen.sha = await GridEdgeMarket.sha256Hex(GridEdgeMarket.canonicalJson(unseen.value));
+  await assert.rejects(
+    () => durable.ingestCapture(database, unseen.value, unseen.sha, {
+      sourceObservationPolicy: "REVIEWED_EASTMONEY_HTTPS_DATE_LATEST_FIRST_V3",
+      sourceObservationOnly: true,
+    }),
+    /atomic source observation contains unseen trade evidence/,
+  );
+  assert.deepEqual(await durable.sourceState(database, history.value.instrument), stateBefore);
+  assert.deepEqual(await allOutboxEvents(database), eventsBefore);
+
+  const duplicate = await capture();
+  duplicate.value.captured_at_us = stateBefore.covered_through_us + 30_000_000;
+  duplicate.value.source_server_observed_at_us = duplicate.value.captured_at_us - 2_000_000;
+  duplicate.value.source_clock_origin = "EASTMONEY_HTTPS_DATE_HEADER";
+  duplicate.value.source_row_order = "LATEST_FIRST";
+  duplicate.sha = await GridEdgeMarket.sha256Hex(GridEdgeMarket.canonicalJson(duplicate.value));
+  const observed = await durable.ingestCapture(database, duplicate.value, duplicate.sha, {
+    sourceObservationPolicy: "REVIEWED_EASTMONEY_HTTPS_DATE_LATEST_FIRST_V3",
+    sourceObservationOnly: true,
+  });
+  assert.deepEqual(
+    { accepted: observed.accepted, duplicates: observed.duplicates, status: observed.status_events },
+    { accepted: 0, duplicates: duplicate.value.rows.length, status: 1 },
+  );
+  const afterObservation = await durable.sourceState(database, history.value.instrument);
+  assert.equal(afterObservation.covered_through_us, stateBefore.covered_through_us);
+
+  const regular = await durable.ingestCapture(database, unseen.value, unseen.sha);
+  assert.equal(regular.accepted, 1);
+  assert.equal(regular.status_events, 1);
+  const afterRegular = await durable.sourceState(database, history.value.instrument);
+  assert.ok(afterRegular.covered_through_us > stateBefore.covered_through_us);
+  database.close();
+});
+
 test("a source observation rejects an old page behind durable trade coverage without mutation", async () => {
   const database = await durable.openDatabase(indexedDB, `gridedge-test-${crypto.randomUUID()}`);
   const history = await completeSessionCapture();
@@ -453,6 +753,196 @@ test("an explicit partial-session boundary is canonical, signed, and distinct fr
   assert.equal(document.payload.source_captured_at_us, document.recv_us);
   assert.equal(event.source_sequence, 2_764);
   assert.equal(event.mqtt_topic, "gridedge/market/v1/XSHE/002256/status");
+});
+
+test("same-day complete evidence may only advance through an explicit discontinuity boundary", async () => {
+  const database = await durable.openDatabase(indexedDB, `gridedge-test-${crypto.randomUUID()}`);
+  const complete = await completeSessionCapture();
+  await durable.ingestCapture(database, complete.value, complete.sha);
+  const observation = structuredClone(complete.value);
+  observation.page_kind = "TIME_SALES";
+  observation.completeness = {
+    ...observation.completeness,
+    session_complete: false,
+    page_index: 1,
+    row_count: observation.rows.length,
+  };
+  observation.captured_at_us += 1_000_000;
+  observation.source_server_observed_at_us = observation.captured_at_us - 1_000_000;
+  observation.source_clock_origin = "EASTMONEY_HTTPS_DATE_HEADER";
+  observation.source_row_order = "LATEST_FIRST";
+  const observationSha = await GridEdgeMarket.sha256Hex(GridEdgeMarket.canonicalJson(observation));
+  await durable.ingestCapture(database, observation, observationSha, {
+    sourceObservationPolicy: "REVIEWED_EASTMONEY_HTTPS_DATE_LATEST_FIRST_V3",
+    sourceObservationOnly: true,
+  });
+  assert.equal((await durable.sourceState(database, complete.value.instrument))
+    .source_observed_session_date, complete.value.session_date);
+  const completeEventCount = (await allOutboxEvents(database)).length;
+  const boundary = await retimedCapture(["10:50:00", "10:50:01", "10:50:02", "10:50:03"]);
+
+  await assert.rejects(
+    () => durable.ingestResumeBoundary(database, boundary.value, boundary.sha),
+    /complete session cannot be replaced/,
+  );
+  const result = await durable.ingestDiscontinuityBoundary(database, boundary.value, boundary.sha);
+  assert.equal(result.conflicts, 0);
+  assert.equal(result.status_events, 1);
+  const state = await durable.sourceState(database, boundary.value.instrument);
+  assert.equal(state.complete_session_date, undefined);
+  assert.equal(state.resume_boundary_session_date, boundary.value.session_date);
+  assert.equal(state.discontinuity_boundary_session_date, boundary.value.session_date);
+  assert.equal(state.source_observed_at_us, undefined);
+  assert.equal(state.source_observed_session_date, undefined);
+  const event = JSON.parse((await durable.pendingEvents(database, 100)).at(-1).payload);
+  assert.equal(event.payload.status, "SESSION_RESUME_BOUNDARY");
+  assert.equal(event.payload.policy, "SAME_DAY_DISCONTINUITY_BOUNDARY_V2");
+  assert.equal(event.payload.previous_covered_through_us,
+    complete.value.completeness.covered_through_us);
+  const boundaryEvents = (await allOutboxEvents(database)).slice(completeEventCount)
+    .map((stored) => JSON.parse(stored.payload));
+  assert.deepEqual(boundaryEvents.map((document) => document.event_type),
+    ["TRADE_TICK", "TRADE_TICK", "TRADE_TICK", "TRADE_TICK", "SOURCE_STATUS"]);
+  assert.deepEqual(boundaryEvents.map((document) => document.source_sequence),
+    [...boundaryEvents.map((document) => document.source_sequence)].sort((a, b) => a - b));
+
+  const eventsAfterCommit = await allOutboxEvents(database);
+  const stateAfterCommit = await durable.sourceState(database, boundary.value.instrument);
+  const retry = await durable.ingestDiscontinuityBoundary(database, boundary.value, boundary.sha);
+  assert.deepEqual(
+    { accepted: retry.accepted, status: retry.status_events },
+    { accepted: 0, status: 0 },
+  );
+  assert.deepEqual(await allOutboxEvents(database), eventsAfterCommit);
+  assert.deepEqual(await durable.sourceState(database, boundary.value.instrument), stateAfterCommit);
+
+  const live = structuredClone(boundary.value);
+  const newRow = structuredClone(live.rows.at(-1));
+  newRow.source_trade_time = "10:50:04";
+  newRow.raw_cells[0] = newRow.source_trade_time;
+  newRow.source_row_key = `${live.session_date}|10:50:04|${newRow.price}|${
+    newRow.quantity_hands}|${newRow.side}|1`;
+  live.rows.push(newRow);
+  live.completeness.row_count = live.rows.length;
+  live.captured_at_us += 1_000_000;
+  const liveSha = await GridEdgeMarket.sha256Hex(GridEdgeMarket.canonicalJson(live));
+  await durable.ingestCapture(database, live, liveSha);
+  await assert.rejects(
+    () => durable.ingestDiscontinuityBoundary(database, boundary.value, boundary.sha),
+    /requires durable complete evidence/,
+  );
+
+  const completed = structuredClone(live);
+  completed.page_kind = "TIME_SALES_SESSION";
+  completed.completeness = {
+    ...completed.completeness,
+    session_complete: true,
+    pages_captured: [1],
+    page_count: 1,
+    history_page_sha256: ["4".repeat(64)],
+    final_live_page_sha256: "5".repeat(64),
+    live_page_overlap: completed.rows.length,
+    covered_from_us: GridEdgeMarket.eventTimeUs(
+      completed.session_date, completed.rows[0].source_trade_time,
+    ),
+    covered_through_us: GridEdgeMarket.eventTimeUs(
+      completed.session_date, completed.rows.at(-1).source_trade_time,
+    ),
+  };
+  const completedSha = await GridEdgeMarket.sha256Hex(GridEdgeMarket.canonicalJson(completed));
+  await durable.ingestCapture(database, completed, completedSha);
+  const completedState = await durable.sourceState(database, completed.instrument);
+  assert.equal(completedState.complete_session_date, completed.session_date);
+  assert.equal(completedState.discontinuity_boundary_session_date, undefined);
+  assert.equal(completedState.discontinuity_previous_covered_through_us, undefined);
+  database.close();
+});
+
+test("same-day discontinuity rejects missing complete state and unseen older rows without mutation", async () => {
+  const emptyDatabase = await durable.openDatabase(indexedDB, `gridedge-test-${crypto.randomUUID()}`);
+  const boundary = await retimedCapture(["10:50:00", "10:50:01", "10:50:02", "10:50:03"]);
+  await assert.rejects(
+    () => durable.ingestDiscontinuityBoundary(emptyDatabase, boundary.value, boundary.sha),
+    /requires durable complete evidence/,
+  );
+  assert.deepEqual(await durable.status(emptyDatabase), {
+    accepted_rows: 0, conflicts: 0, pending_events: 0, acknowledged_events: 0,
+  });
+  emptyDatabase.close();
+
+  const database = await durable.openDatabase(indexedDB, `gridedge-test-${crypto.randomUUID()}`);
+  const complete = await completeSessionCapture();
+  await durable.ingestCapture(database, complete.value, complete.sha);
+  const invalid = await retimedCapture(["09:30:00", "10:50:01", "10:50:02", "10:50:03"]);
+  invalid.value.rows[0].price = "9.99";
+  invalid.value.rows[0].raw_cells[1] = "9.99";
+  invalid.value.rows[0].source_row_key = `${invalid.value.session_date}|09:30:00|9.99|${
+    invalid.value.rows[0].quantity_hands}|${invalid.value.rows[0].side}|1`;
+  invalid.sha = await GridEdgeMarket.sha256Hex(GridEdgeMarket.canonicalJson(invalid.value));
+  const stores = ["source_state", "capture_batches", "web_rows", "capture_conflicts", "market_event_outbox"];
+  const before = Object.fromEntries(await Promise.all(stores.map(async (name) =>
+    [name, await allStoreRows(database, name)])));
+  await assert.rejects(
+    () => durable.ingestDiscontinuityBoundary(database, invalid.value, invalid.sha),
+    /only add rows after its prior watermark/,
+  );
+  const after = Object.fromEntries(await Promise.all(stores.map(async (name) =>
+    [name, await allStoreRows(database, name)])));
+  assert.deepEqual(after, before);
+  database.close();
+});
+
+test("same-day discontinuity rejects mixed conflict and pending evidence before every write", async () => {
+  const database = await durable.openDatabase(indexedDB, `gridedge-test-${crypto.randomUUID()}`);
+  const complete = await completeSessionCapture();
+  await durable.ingestCapture(database, complete.value, complete.sha);
+  const mixed = await retimedCapture(["10:50:00", "10:50:01", "10:50:02", "10:50:03"]);
+  mixed.value.rows[0] = structuredClone(complete.value.rows[0]);
+  mixed.value.rows[0].price = "9.99";
+  mixed.value.rows[0].raw_cells[1] = "9.99";
+  mixed.sha = await GridEdgeMarket.sha256Hex(GridEdgeMarket.canonicalJson(mixed.value));
+  const stores = ["source_state", "capture_batches", "web_rows", "capture_conflicts", "market_event_outbox"];
+  const before = Object.fromEntries(await Promise.all(stores.map(async (name) =>
+    [name, await allStoreRows(database, name)])));
+  await assert.rejects(
+    () => durable.ingestDiscontinuityBoundary(database, mixed.value, mixed.sha),
+    /discontinuity boundary conflicts/,
+  );
+  const after = Object.fromEntries(await Promise.all(stores.map(async (name) =>
+    [name, await allStoreRows(database, name)])));
+  assert.deepEqual(after, before);
+  database.close();
+});
+
+test("same-day discontinuity rejects recovered overlap and an expired delivery before mutation", async () => {
+  const database = await durable.openDatabase(indexedDB, `gridedge-test-${crypto.randomUUID()}`);
+  const complete = await completeSessionCapture();
+  await durable.ingestCapture(database, complete.value, complete.sha);
+  const recovered = await laterLiveCapture();
+  const stores = ["source_state", "capture_batches", "web_rows", "capture_conflicts", "market_event_outbox"];
+  const before = Object.fromEntries(await Promise.all(stores.map(async (name) =>
+    [name, await allStoreRows(database, name)])));
+  await assert.rejects(
+    () => durable.ingestDiscontinuityBoundary(database, recovered.value, recovered.sha),
+    /only add rows after its prior watermark/,
+  );
+  assert.deepEqual(Object.fromEntries(await Promise.all(stores.map(async (name) =>
+    [name, await allStoreRows(database, name)]))), before);
+
+  const boundary = await retimedCapture(["10:50:00", "10:50:01", "10:50:02", "10:50:03"]);
+  await assert.rejects(
+    () => durable.ingestDiscontinuityBoundary(database, boundary.value, boundary.sha, {
+      deadlineAtMs: Date.now() - 1,
+    }),
+    /exceeded its reviewed deadline/,
+  );
+  assert.deepEqual(Object.fromEntries(await Promise.all(stores.map(async (name) =>
+    [name, await allStoreRows(database, name)]))), before);
+
+  const live = await durable.ingestCapture(database, recovered.value, recovered.sha);
+  assert.equal(live.accepted, 1);
+  assert.equal(live.status_events, 1);
+  database.close();
 });
 
 test("partial boundary accepts 09:25 auction evidence but rejects pre-auction and lunch poison atomically", async () => {
@@ -653,6 +1143,156 @@ test("a stale complete-history retry after live progress is rejected without dur
     /moved behind the durable market watermark/,
   );
   assert.deepEqual(await durable.sourceState(database, live.value.instrument), stateBefore);
+  assert.deepEqual(await durable.status(database), statusBefore);
+  assert.deepEqual(await allOutboxEvents(database), eventsBefore);
+  database.close();
+});
+
+test("complete-history bridge requires durable overlap and rejects a disjoint replacement atomically", async () => {
+  const database = await durable.openDatabase(indexedDB, `gridedge-test-${crypto.randomUUID()}`);
+  const initial = await completeSessionCapture();
+  await durable.ingestCapture(database, initial.value, initial.sha);
+  const stateBefore = await durable.sourceState(database, initial.value.instrument);
+  const eventsBefore = await allOutboxEvents(database);
+
+  const disjoint = structuredClone(initial.value);
+  const shifted = [initial.value.rows[0].source_trade_time, "10:44:01", "10:44:02", "10:44:03"];
+  for (let index = 1; index < disjoint.rows.length; index += 1) {
+    const row = disjoint.rows[index];
+    row.source_trade_time = shifted[index];
+    row.raw_cells[0] = shifted[index];
+    row.source_row_key = `${disjoint.session_date}|${shifted[index]}|${row.price}|${row.quantity_hands}|${row.side}|1`;
+  }
+  disjoint.completeness.covered_from_us = GridEdgeMarket.eventTimeUs(disjoint.session_date, shifted[0]);
+  disjoint.completeness.covered_through_us = GridEdgeMarket.eventTimeUs(disjoint.session_date, shifted.at(-1));
+  disjoint.captured_at_us = disjoint.completeness.covered_through_us + 1_000_000;
+  const disjointSha = await GridEdgeMarket.sha256Hex(GridEdgeMarket.canonicalJson(disjoint));
+  await assert.rejects(
+    () => durable.ingestCapture(database, disjoint, disjointSha, {
+      requireCompleteHistoryBridge: true,
+    }),
+    /complete history bridge has no durable overlap/,
+  );
+  assert.deepEqual(await durable.sourceState(database, initial.value.instrument), stateBefore);
+  assert.deepEqual(await allOutboxEvents(database), eventsBefore);
+
+  const bridged = structuredClone(initial.value);
+  const newRow = structuredClone(bridged.rows.at(-1));
+  newRow.source_trade_time = "10:44:04";
+  newRow.raw_cells[0] = newRow.source_trade_time;
+  newRow.source_row_key = `${bridged.session_date}|${newRow.source_trade_time}|${newRow.price}|${newRow.quantity_hands}|${newRow.side}|1`;
+  bridged.rows.push(newRow);
+  bridged.completeness.row_count = bridged.rows.length;
+  bridged.completeness.covered_through_us = GridEdgeMarket.eventTimeUs(
+    bridged.session_date,
+    newRow.source_trade_time,
+  );
+  bridged.captured_at_us = bridged.completeness.covered_through_us + 1_000_000;
+  const bridgedSha = await GridEdgeMarket.sha256Hex(GridEdgeMarket.canonicalJson(bridged));
+  const result = await durable.ingestCapture(database, bridged, bridgedSha, {
+    requireCompleteHistoryBridge: true,
+  });
+  assert.equal(result.accepted, 1);
+  assert.equal(result.conflicts, 0);
+  const state = await durable.sourceState(database, initial.value.instrument);
+  assert.equal(state.complete_session_date, initial.value.session_date);
+  assert.equal(state.resume_boundary_session_date, undefined);
+  assert.equal(state.covered_through_us, bridged.completeness.covered_through_us);
+  assert.equal((await allOutboxEvents(database)).filter((event) =>
+    JSON.parse(event.payload).payload.status === "SESSION_RESUME_BOUNDARY").length, 0);
+  database.close();
+});
+
+test("complete-history bridge rejects evidence conflict before mutating any durable store", async () => {
+  const database = await durable.openDatabase(indexedDB, `gridedge-test-${crypto.randomUUID()}`);
+  const initial = await completeSessionCapture();
+  await durable.ingestCapture(database, initial.value, initial.sha);
+  const storeNames = [
+    "source_state",
+    "capture_batches",
+    "web_rows",
+    "capture_conflicts",
+    "market_event_outbox",
+  ];
+  const before = Object.fromEntries(await Promise.all(storeNames.map(async (storeName) => [
+    storeName,
+    await allStoreRows(database, storeName),
+  ])));
+  const beforeStatus = await durable.status(database);
+
+  const conflicting = structuredClone(initial.value);
+  conflicting.rows[0].price = "9.99";
+  conflicting.captured_at_us += 1_000_000;
+  const conflictingSha = await GridEdgeMarket.sha256Hex(
+    GridEdgeMarket.canonicalJson(conflicting),
+  );
+  await assert.rejects(
+    () => durable.ingestCapture(database, conflicting, conflictingSha, {
+      requireCompleteHistoryBridge: true,
+    }),
+    /complete history bridge conflicts with durable trade evidence/,
+  );
+
+  for (const storeName of storeNames) {
+    assert.deepEqual(await allStoreRows(database, storeName), before[storeName], storeName);
+  }
+  assert.deepEqual(await durable.status(database), beforeStatus);
+  database.close();
+});
+
+test("complete-history bridge rejects incompatible modes and sessions without durable mutation", async () => {
+  const database = await durable.openDatabase(indexedDB, `gridedge-test-${crypto.randomUUID()}`);
+  const initial = await completeSessionCapture();
+  await durable.ingestCapture(database, initial.value, initial.sha);
+  const stateBefore = await durable.sourceState(database, initial.value.instrument);
+  const statusBefore = await durable.status(database);
+  const eventsBefore = await allOutboxEvents(database);
+
+  const partial = await capture();
+  await assert.rejects(
+    () => durable.ingestCapture(database, partial.value, partial.sha, {
+      requireCompleteHistoryBridge: true,
+    }),
+    /requires a complete trade capture/,
+  );
+  await assert.rejects(
+    () => durable.ingestCapture(database, initial.value, initial.sha, {
+      createResumeBoundary: true,
+      requireCompleteHistoryBridge: true,
+    }),
+    /requires a complete trade capture/,
+  );
+  await assert.rejects(
+    () => durable.ingestCapture(database, initial.value, initial.sha, {
+      requireCompleteHistoryBridge: true,
+      sourceObservationOnly: true,
+      sourceObservationPolicy: "REVIEWED_EASTMONEY_HTTPS_DATE_LATEST_FIRST_V3",
+    }),
+    /atomic source observation requires an active partial page-one capture/,
+  );
+  const crossDay = structuredClone(initial.value);
+  crossDay.session_date = "2026-08-21";
+  for (const row of crossDay.rows) {
+    row.source_row_key = row.source_row_key.replace(initial.value.session_date, crossDay.session_date);
+  }
+  crossDay.completeness.covered_from_us = GridEdgeMarket.eventTimeUs(
+    crossDay.session_date,
+    crossDay.rows[0].source_trade_time,
+  );
+  crossDay.completeness.covered_through_us = GridEdgeMarket.eventTimeUs(
+    crossDay.session_date,
+    crossDay.rows.at(-1).source_trade_time,
+  );
+  crossDay.captured_at_us = crossDay.completeness.covered_through_us + 1_000_000;
+  const crossDaySha = await GridEdgeMarket.sha256Hex(GridEdgeMarket.canonicalJson(crossDay));
+  await assert.rejects(
+    () => durable.ingestCapture(database, crossDay, crossDaySha, {
+      requireCompleteHistoryBridge: true,
+    }),
+    /requires same-day durable complete evidence/,
+  );
+
+  assert.deepEqual(await durable.sourceState(database, initial.value.instrument), stateBefore);
   assert.deepEqual(await durable.status(database), statusBefore);
   assert.deepEqual(await allOutboxEvents(database), eventsBefore);
   database.close();

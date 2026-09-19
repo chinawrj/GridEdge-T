@@ -1,0 +1,55 @@
+{
+  "schema": "gridedge.automation-ownership-watchdog-live-run.v1",
+  "heartbeat_triggered_at": "2026-09-08T16:16:51.468+08:00",
+  "automation_id": "gridedge",
+  "target_thread_id": "01a07fe5-075b-70a1-a22f-7072aa3131ba",
+  "scheduler_readback": {
+    "status": "ACTIVE",
+    "last_run_at": 1788855411456,
+    "last_run_at_asia_shanghai": "2026-09-08T16:16:51.456+08:00",
+    "next_run_at": 1788858681000,
+    "next_run_at_asia_shanghai": "2026-09-08T17:11:21+08:00"
+  },
+  "ownership_watchdog": {
+    "checked_at": "2026-09-08T16:17:34.153+08:00",
+    "script": "docs/plans/verify-automation-ownership.cjs",
+    "exit_code": 0,
+    "expected_owner_thread_id": "01a07fe5-075b-70a1-a22f-7072aa3131ba",
+    "automation_2_status": "ACTIVE",
+    "gridedge_status": "ACTIVE",
+    "gridedge_target_matches_current_goal": true,
+    "gridedge_prompt_sha256": "075c68b93478589cecedd5000afdd13e3945de678af737111d881cea0b2e8ed3",
+    "goal_status": "PAUSED",
+    "goal_next_run_at": null,
+    "repair_needed": false,
+    "repair_executed": false
+  },
+  "runtime_readback": {
+    "at": "2026-09-08T16:17:17.790206+08:00",
+    "supervisor_pid": 95789,
+    "window": "CLOSED",
+    "action": "OBSERVE_CLOSED",
+    "guards": 0,
+    "workers": 0,
+    "chrome": true,
+    "mqtt": true,
+    "reviewed_device": true,
+    "breaker_open": false,
+    "source_sequence": 36657,
+    "source_fresh": false,
+    "ledger_head": 1958,
+    "outbox_cursor": 1958,
+    "mode": "READ_ONLY",
+    "latest_bar": "2026-09-07 13:50:00",
+    "latest_bar_strategy_evaluated": false,
+    "unresolved": 0
+  },
+  "assessment": {
+    "heartbeat_actual_execution_proven": true,
+    "ownership_watchdog_actual_execution_proven": true,
+    "scheduler_target_busy_queue_cleared_after_task_idle": true,
+    "formal_runtime_mutation": false,
+    "production_restored": false,
+    "reason_not_restored": "The reviewed page user-presence challenge and qualified source completion/finality evidence remain unavailable."
+  }
+}

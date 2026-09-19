@@ -1,0 +1,49 @@
+{
+  "checked_at": "2026-09-10T09:17:02+08:00",
+  "kind": "ISOLATED_UPSTREAM_SOURCE_CODE_AUDIT_NOT_LIVE_ACCEPTANCE",
+  "candidate": "Longport OpenAPI SDK confirmed candlestick callback",
+  "admitted": false,
+  "formal_publication": false,
+  "upstream_commit": "72e9be585d2724358ddaf7d6afbb64bb9e01205d",
+  "files": [
+    {
+      "url": "https://raw.githubusercontent.com/longportapp/openapi/72e9be585d2724358ddaf7d6afbb64bb9e01205d/rust/src/quote/core.rs",
+      "sha256": "0589676d6147ec884fd7eda99202b28323dc545d97db85dbafb3d7df548206e9",
+      "observations": [
+        "merge_type falls back to Trade for ordinary stock intraday minute candles",
+        "merge_candlesticks_by_trade invokes local candle aggregation",
+        "update_and_push_candlestick emits is_confirmed=true from AppendNew.confirmed, not a native exchange completion receipt",
+        "generated candle PushEvent.sequence is zero"
+      ]
+    },
+    {
+      "url": "https://raw.githubusercontent.com/longportapp/openapi/72e9be585d2724358ddaf7d6afbb64bb9e01205d/rust/crates/candlesticks/src/market.rs",
+      "sha256": "2b70cdaf0c5de24f23ec4527887b91e8c6ba2d698d7249f46cd2a606b391f746",
+      "observations": [
+        "merge_trade receives a trade, not a clock-only completion input",
+        "Some(prev) if time > prev.time() produces AppendNew with confirmed: Some(prev)",
+        "this path does not independently close a last bucket when no subsequent trade arrives"
+      ]
+    }
+  ],
+  "access_inventory": {
+    "callable_longbridge_tools_found": false,
+    "longbridge_or_longport_cli_on_PATH": false,
+    "standard_dot_longbridge_or_dot_longport_directory_present": false,
+    "search_plugins_or_suggest_plugins_tools_available": false,
+    "recommended_plugin_present_but_not_installed": true,
+    "credentials_read": false,
+    "account_created_or_purchase_made": false
+  },
+  "scope_of_conclusion": "Reject the shortcut treating this SDK confirmed callback alone as a qualified quiet-tape/final-bucket completion proof. This does not reject all Longbridge data products, nor prove target-specific entitlement or live data quality.",
+  "remaining": [
+    "An authenticated 002256.SZ feed and exact entitlement are untested",
+    "Need independently supported stream continuity, late/revised trade policy, zero-trade periods and session-end completion semantics",
+    "Only after these are supported may two isolated replay/recovery runs and required review proceed"
+  ],
+  "official_documents": [
+    "https://open.longbridge.com/zh-CN/docs/qa/general",
+    "https://open.longbridge.com/zh-CN/docs/qa/broker",
+    "https://longportapp.github.io/openapi/python/reference_all/"
+  ]
+}

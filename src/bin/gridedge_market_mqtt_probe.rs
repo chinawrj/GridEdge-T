@@ -5,7 +5,7 @@ use std::{path::PathBuf, time::Duration};
 
 #[derive(Debug, Parser)]
 struct Args {
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, default_value = "192.168.1.201")]
     host: String,
     #[arg(long, default_value_t = 8883)]
     port: u16,
@@ -15,8 +15,10 @@ struct Args {
     password_file: PathBuf,
     #[arg(long)]
     ca_file: PathBuf,
-    #[arg(long, default_value = "gridedge-paper-002256")]
+    #[arg(long, default_value = "gridedge-paper-committed-002256-probe")]
     client_id: String,
+    #[arg(long, default_value = "gridedge")]
+    topic_namespace: String,
     #[arg(long, default_value = "XSHE")]
     venue: String,
     #[arg(long, default_value = "002256")]
@@ -37,6 +39,7 @@ fn main() -> Result<()> {
         &args.password_file,
         &args.ca_file,
         &args.client_id,
+        &args.topic_namespace,
         &args.venue,
         &args.symbol,
     )?;

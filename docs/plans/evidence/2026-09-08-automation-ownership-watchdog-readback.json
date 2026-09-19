@@ -1,0 +1,68 @@
+{
+  "schema": "gridedge.automation-ownership-watchdog-readback.v1",
+  "checked_at": "2026-09-08T15:59:09.645+08:00",
+  "current_goal_thread_id": "01a07fe5-075b-70a1-a22f-7072aa3131ba",
+  "supersedes_scheduler_state_after": "docs/plans/evidence/2026-09-08-automation-ownership-readback.json",
+  "previous_delivery_target": {
+    "thread_id": "01a07ed4-8d58-7110-8382-181d52c59e1a",
+    "status": "idle",
+    "last_updated_at_epoch_seconds": 1788852077
+  },
+  "red_regressions": [
+    {
+      "assertion": "delivery owner must execute the persisted ownership watchdog every turn",
+      "actual": false,
+      "expected": true
+    },
+    {
+      "assertion": "delivery heartbeat must target the current active Goal owner",
+      "actual": "01a07ed4-8d58-7110-8382-181d52c59e1a",
+      "expected": "01a07fe5-075b-70a1-a22f-7072aa3131ba"
+    }
+  ],
+  "supported_updates": [
+    {
+      "automation_id": "gridedge",
+      "change": "Add per-turn read-only ownership watchdog and bounded duplicate-writer recovery contract"
+    },
+    {
+      "automation_id": "gridedge",
+      "change": "Rebind heartbeat and prompt owner identity to the current active Goal thread"
+    }
+  ],
+  "post_update": {
+    "ownership_regression_exit_code": 0,
+    "scheduler_boundary_regression_exit_code": 0,
+    "scheduler_boundary_cases_passed": 5,
+    "gridedge": {
+      "status": "ACTIVE",
+      "target_thread_id": "01a07fe5-075b-70a1-a22f-7072aa3131ba",
+      "next_run_at": 1788855032000,
+      "next_run_at_asia_shanghai": "2026-09-08T16:10:32+08:00",
+      "prompt_sha256": "075c68b93478589cecedd5000afdd13e3945de678af737111d881cea0b2e8ed3",
+      "old_owner_mentions": 0,
+      "current_owner_mentions": 2,
+      "watchdog_command_mentions": 1,
+      "watchdog_owner_argument_mentions": 1
+    },
+    "goal": {
+      "status": "PAUSED",
+      "next_run_at": null
+    },
+    "automation_2": {
+      "status": "ACTIVE",
+      "next_run_at": 1788912008000,
+      "next_run_at_asia_shanghai": "2026-09-09T08:00:08+08:00"
+    }
+  },
+  "watchdog_behavior": {
+    "read_only_check_first": true,
+    "repairs_only_goal_active_or_next_run_drift": true,
+    "requires_gridedge_active_and_unique_owner_and_no_inflight_release": true,
+    "preserves_goal_configuration": true,
+    "reruns_regression_and_checks_null_next_run": true,
+    "direct_database_or_toml_edit_forbidden": true,
+    "replacement_timer_forbidden": true
+  },
+  "formal_runtime_mutation": false
+}

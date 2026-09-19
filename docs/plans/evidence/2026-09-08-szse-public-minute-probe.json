@@ -1,0 +1,91 @@
+{
+  "schema": "gridedge.szse-public-minute-probe.v1",
+  "observed_at": "2026-09-08T18:32:15.605524+08:00",
+  "scope": "isolated read-only research; no MQTT, PostgreSQL, ledger, account or order access",
+  "official_sources": {
+    "service_description": "https://www.szse.cn/English/services/dataServices/index.html",
+    "quote_page": "https://www.szse.cn/English/siteMarketData/siteMarketDatas/lookup/index.html",
+    "endpoint": "https://www.szse.cn/api/market/ssjjhq/getTimeData?marketId=1&code=002256",
+    "quote_page_loader": "https://res.static.szse.cn/modules/marketdata/trend/js/trend.min.js?version=1.2.221",
+    "quote_page_loader_sha256": "d2f26350ab8bef9940ddd915f0aa801ab35bfd5152b58227b38641c35614f2e4",
+    "chart_field_mapping": "https://res.static.szse.cn/modules/marketdata/trend/js/k.min.js?version=1.2.221",
+    "chart_field_mapping_sha256": "246926d9c3d4e16e421c7ef1032b751de45b7943ed04cbb746f2dc435a3b5be2"
+  },
+  "probe": {
+    "program": "src/bin/gridedge_szse_source_observation_probe.rs",
+    "program_sha256": "6b90c2c934a9b3ff07738e5f2f351fb5241c59412c96a205eb2022021b42a6e6",
+    "binary_sha256": "38a0c6835458ea496a0d8713f0493af3e618c3eb6625c7bf522f6d61e3666f4e",
+    "archive": "/Users/rjwang/Library/Application Support/GridEdge-T/runtime/source-probes/20260908-szse-public-1829-once",
+    "exit_code": 0,
+    "unit_tests_passed": 7,
+    "raw_sha256": "0e5c7dacc2b3d9d0521edbf6c0c05574c4c802901a904cfe7784b928f1c69a2a",
+    "identity_sha256": "d34c3e519572b1cedcbdc8693af2a62126d9c4e3c187a2a62322886cd16f95bd",
+    "receipt_sha256": "d127ba72b36e3ee853ebcf3efa5d01bae54e906fb2883dd5f4d0adafda0862ef",
+    "status_sha256": "712a2aca08a348457f94fb6e069c8bd22d2f6b1a8a19ccb72468fa256da75b0d"
+  },
+  "validation": {
+    "cargo_fmt_check": "PASS",
+    "strict_clippy_all_targets_all_features": "PASS",
+    "cargo_test_all_targets_all_features": {
+      "passed": 503,
+      "failed": 0,
+      "ignored_money_action_smokes": 2
+    },
+    "config_validation": "PASS",
+    "isolated_end_to_end_replay": {
+      "result": "PASS",
+      "event_count": 233,
+      "duplicate_events": 0,
+      "open_orders": 0,
+      "mode": "STOPPED"
+    },
+    "automation_ownership_watchdog": "PASS",
+    "installed_scheduler_boundary_cases_passed": 5,
+    "git_diff_check": "PASS"
+  },
+  "response": {
+    "code": "002256",
+    "name": "兆新股份",
+    "snapshot_at": "2026-09-08 15:30:00",
+    "market_time": "2026-09-08 15:30:00",
+    "row_count": 266,
+    "regular_session_rows": 241,
+    "after_hours_rows": 25,
+    "last_regular_label": "15:00",
+    "aggregate_volume_lots": 371092,
+    "regular_volume_lots": 371092,
+    "aggregate_amount": "125421833.19",
+    "regular_amount": "125421833.19",
+    "regular_session_totals_reconcile": true,
+    "all_rows_volume_lots": 371313,
+    "all_rows_amount": "125496752.19",
+    "after_hours_volume_lots": 221,
+    "after_hours_amount": "74919.00"
+  },
+  "field_semantics": {
+    "minute_row": [
+      "time",
+      "last",
+      "average",
+      "change",
+      "change_percent",
+      "volume_lots",
+      "amount"
+    ],
+    "confirmed_by_official_quote_page_javascript": true,
+    "ohlc_present": false,
+    "source_sequence_present": false,
+    "source_completion_marker_present": false,
+    "source_revision_semantics_present": false
+  },
+  "decision": {
+    "usable_without_new_account_or_credentials": true,
+    "instrument_identity_and_exact_amount_route_proven": true,
+    "post_close_regular_session_aggregate_conservation_proven_for_sample": true,
+    "live_timeliness_or_finality_proven": false,
+    "five_minute_ohlc_reconstruction_proven": false,
+    "admitted": false,
+    "formal_publication": false,
+    "next_decisive_evidence": "During the next live session, record this exact endpoint in isolation and determine whether an official OHLC/tick route plus documented completion/revision semantics exists; do not infer OHLC from minute last prices."
+  }
+}

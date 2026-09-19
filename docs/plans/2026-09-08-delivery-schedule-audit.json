@@ -1,0 +1,52 @@
+{
+  "recorded_at": "2026-09-08T00:19:00+08:00",
+  "kind": "DELIVERY_TIMER_TIMEZONE_REPAIR",
+  "automation_id": "gridedge",
+  "before_next_cst": "2026-09-08 01:11:07",
+  "after_next_cst": "2026-09-08 08:11:52",
+  "ops_next_cst_unchanged": "2026-09-08 08:01:28",
+  "mutation": "automation_update only; no direct application DB or TOML writes",
+  "regression": {
+    "kind": "READ_ONLY_INSTALLED_SCHEDULER_REGRESSION_NOT_TIMER_ACTIVATION",
+    "module": "src-VqXTPopo.js",
+    "module_sha256": "8d056524ea3f5714e5e0a254afd88f018d58465bc6ea026adee3c80ff7799e29",
+    "pure_sha256": "b2ba7a66688c320b133525117d84e98fde34e2ab56837c301b1b27b85dba16d1",
+    "system_timezone": "Asia/Shanghai",
+    "original_next_utc": "2026-09-07T17:10:00.000Z",
+    "corrected_rule": "DTSTART:20260908T001000Z\nRRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14;BYMINUTE=10;UNTIL=20260911T091500Z",
+    "cases": [
+      {
+        "at": "2026-09-08T00:11:17+08:00",
+        "expected": "2026-09-08T00:10:00.000Z",
+        "actual": "2026-09-08T00:10:00.000Z"
+      },
+      {
+        "at": "2026-09-08T08:10:01+08:00",
+        "expected": "2026-09-08T01:10:00.000Z",
+        "actual": "2026-09-08T01:10:00.000Z"
+      },
+      {
+        "at": "2026-09-08T22:11:00+08:00",
+        "expected": "2026-09-09T00:10:00.000Z",
+        "actual": "2026-09-09T00:10:00.000Z"
+      },
+      {
+        "at": "2026-09-11T16:11:00+08:00",
+        "expected": "2026-09-11T09:10:00.000Z",
+        "actual": "2026-09-11T09:10:00.000Z"
+      },
+      {
+        "at": "2026-09-11T17:11:00+08:00",
+        "expected": null,
+        "actual": null
+      }
+    ],
+    "excludes_app_jitter": true
+  },
+  "regression_script_sha256": "b65a5e1303af1963baa708896a3923647fef5cb1434000007db26e2cf331ca2b",
+  "model": null,
+  "reasoning_effort": null,
+  "notification_policy": null,
+  "formal_runtime_changed": false,
+  "scope": "Runtime scheduling proven by next_run_at readback; actual morning execution remains unproven"
+}

@@ -746,9 +746,12 @@ impl AdbExecutor for IdentityAdb {
         if joined.contains("dumpsys activity activities") {
             return Ok(self.activities.clone());
         }
-        if joined.contains("uiautomator dump") && self.dump_failures_remaining > 0 {
-            self.dump_failures_remaining -= 1;
-            bail!("transient uiautomator dump failure");
+        if joined.contains("uiautomator dump") {
+            if self.dump_failures_remaining > 0 {
+                self.dump_failures_remaining -= 1;
+                bail!("transient uiautomator dump failure");
+            }
+            return Ok("UI hierchary dumped to: /sdcard/gridedge-ths-window.xml\n".to_owned());
         }
         if joined.contains("exec-out cat") {
             return Ok(form_xml("模拟炒股", "**0000", ""));
@@ -872,6 +875,9 @@ impl AdbExecutor for ScriptedAdb {
                 "{}\n",
                 chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%z")
             ));
+        }
+        if joined.contains("uiautomator dump") {
+            return Ok("UI hierchary dumped to: /sdcard/gridedge-ths-window.xml\n".to_owned());
         }
         if joined.contains("exec-out cat") {
             return self

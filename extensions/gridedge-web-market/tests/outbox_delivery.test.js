@@ -31,6 +31,14 @@ function committedReceipt(event, overrides = {}) {
   }));
 }
 
+function pendingEvents(count) {
+  return Array.from({ length: count }, (_value, index) => ({
+    ...pendingEvent(),
+    event_id: String(index + 1).padStart(64, "0"),
+    source_sequence: 2764 + index,
+  }));
+}
+
 function harness() {
   const event = pendingEvent();
   const pending = [event];
@@ -110,4 +118,114 @@ test("exact database COMMITTED receipt is the only path to ACKNOWLEDGED", async 
     eventId: state.event.event_id,
     reason: "DB_COMMIT_ACK",
   }]);
+});
+
+test("ordered outbox delivery pipelines a bounded window before waiting for database ACKs", async () => {
+  const pending = pendingEvents(4);
+  const published = [];
+  const acknowledged = [];
+  const client = new EventEmitter();
+  const durable = {
+    pendingEvents: async () => [...pending],
+    acknowledge: async (_database, eventId, reason) => {
+      const index = pending.findIndex((event) => event.event_id === eventId);
+      assert.notEqual(index, -1);
+      acknowledged.push({ eventId, reason });
+      pending.splice(index, 1);
+    },
+  };
+
+  const delivered = await delivery.flushPending({
+    database: {},
+    client,
+    durable,
+    mqttAck,
+    maxInFlight: 4,
+    publishWithPuback: async (_client, event) => {
+      published.push(event.source_sequence);
+      if (published.length === 4) {
+        queueMicrotask(() => {
+          for (const pendingEvent of [...pending]) {
+            client.emit(
+              "message",
+              `${mqttAck.ACK_PREFIX}/${pendingEvent.event_id}`,
+              committedReceipt(pendingEvent),
+            );
+          }
+        });
+      }
+    },
+    ackTimeoutMs: 50,
+  });
+
+  assert.equal(delivered, 4);
+  assert.deepEqual(published, [2764, 2765, 2766, 2767]);
+  assert.deepEqual(
+    acknowledged.map(({ eventId }) => eventId),
+    pendingEvents(4).map(({ event_id }) => event_id),
+  );
+  assert.equal(pending.length, 0);
+});
+
+test("out-of-order committed receipts still acknowledge the durable prefix in source order", async () => {
+  const pending = pendingEvents(4);
+  const acknowledged = [];
+  const client = new EventEmitter();
+  const durable = {
+    pendingEvents: async () => [...pending],
+    acknowledge: async (_database, eventId) => {
+      const index = pending.findIndex((event) => event.event_id === eventId);
+      acknowledged.push(pending[index].source_sequence);
+      pending.splice(index, 1);
+    },
+  };
+  let publishes = 0;
+  await delivery.flushPending({
+    database: {}, client, durable, mqttAck, maxInFlight: 4, ackTimeoutMs: 50,
+    publishWithPuback: async () => {
+      publishes += 1;
+      if (publishes === 4) {
+        queueMicrotask(() => {
+          for (const event of [...pending].reverse()) {
+            client.emit("message", `${mqttAck.ACK_PREFIX}/${event.event_id}`,
+              committedReceipt(event));
+          }
+        });
+      }
+    },
+  });
+  assert.deepEqual(acknowledged, [2764, 2765, 2766, 2767]);
+  assert.equal(pending.length, 0);
+});
+
+test("a partial committed-ACK window advances only its exact durable prefix", async () => {
+  const pending = pendingEvents(3);
+  const acknowledged = [];
+  const original = [...pending];
+  const client = new EventEmitter();
+  const durable = {
+    pendingEvents: async () => [...pending],
+    acknowledge: async (_database, eventId) => {
+      const index = pending.findIndex((event) => event.event_id === eventId);
+      acknowledged.push(pending[index].source_sequence);
+      pending.splice(index, 1);
+    },
+  };
+  let publishes = 0;
+  await assert.rejects(delivery.flushPending({
+    database: {}, client, durable, mqttAck, maxInFlight: 3, ackTimeoutMs: 10,
+    publishWithPuback: async () => {
+      publishes += 1;
+      if (publishes === 3) {
+        queueMicrotask(() => {
+          for (const event of [original[2], original[0]]) {
+            client.emit("message", `${mqttAck.ACK_PREFIX}/${event.event_id}`,
+              committedReceipt(event));
+          }
+        });
+      }
+    },
+  }), /timed out/);
+  assert.deepEqual(acknowledged, [2764]);
+  assert.deepEqual(pending.map((event) => event.source_sequence), [2765, 2766]);
 });

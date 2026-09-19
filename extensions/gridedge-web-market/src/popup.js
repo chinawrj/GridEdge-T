@@ -23,10 +23,29 @@ async function message(type) {
   return response;
 }
 
+async function activeStoreName() {
+  const stored = await chrome.storage.local.get([
+    "deployment_mode", "mqtt_url", "mqtt_username", "mqtt_password",
+    "mqtt_namespace", "mqtt_client_id",
+  ]);
+  return GridEdgeMqttNamespace.validateSettings({
+    deployment_mode: stored.deployment_mode ?? "PRODUCTION",
+    mqtt_url: stored.mqtt_url ?? "ws://192.168.1.201:9001/mqtt",
+    mqtt_username: stored.mqtt_username ?? "gridedge-publisher",
+    mqtt_password: stored.mqtt_password ?? "",
+    mqtt_namespace: stored.mqtt_namespace ?? "gridedge",
+    mqtt_client_id: stored.mqtt_client_id ?? `gridedge-web-market-${chrome.runtime.id}`,
+  }).databaseName;
+}
+
 async function refresh() {
   const response = await message("GRIDEDGE_GET_STATUS");
   state.textContent = response.settings.enabled ? "采集已启用" : "采集已暂停";
-  detail.textContent = JSON.stringify({ store: response.store, last_status: response.last_status }, null, 2);
+  detail.textContent = JSON.stringify({
+    runtime_identity: response.runtime_identity,
+    store: response.store,
+    last_status: response.last_status,
+  }, null, 2);
 }
 
 document.querySelector("#scan").addEventListener("click", async () => {
@@ -50,9 +69,10 @@ exportButton.addEventListener("click", async () => {
   exportButton.disabled = true;
   try {
     const sessionDate = shanghaiDate();
-    database = await GridEdgeDurable.openDatabase();
+    const activeName = await activeStoreName();
+    database = await GridEdgeDurable.openDatabase(indexedDB, activeName);
     let exported = await GridEdgeDurable.replayExport(database, sessionDate);
-    let storeGeneration = GridEdgeDurable.DATABASE_NAME;
+    let storeGeneration = activeName;
     if (exported.record_count === 0) {
       database.close();
       database = undefined;

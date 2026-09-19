@@ -1,0 +1,2153 @@
+{
+  "admitted": false,
+  "bars": [
+    {
+      "first_observation_at_or_after_label_ms": 14598,
+      "first_seen_at": "2026-09-08T01:29:10.468251Z",
+      "first_seen_minus_label_ms": -349531,
+      "label": "2026-09-08T09:35:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 243,
+      "revisions": [
+        {
+          "changed_fields": [
+            "low",
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:30:41.476501Z",
+          "sequence": 3,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:31:11.805870Z",
+          "sequence": 4,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:31:42.124957Z",
+          "sequence": 5,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "high",
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:32:12.397185Z",
+          "sequence": 6,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "high",
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:32:42.663208Z",
+          "sequence": 7,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:33:13.063747Z",
+          "sequence": 8,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:33:43.411616Z",
+          "sequence": 9,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "high"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:34:13.793350Z",
+          "sequence": 10,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:34:44.204357Z",
+          "sequence": 11,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T01:35:14.598243Z",
+          "sequence": 12,
+          "volume_changed": true
+        }
+      ]
+    },
+    {
+      "first_observation_at_or_after_label_ms": 19145,
+      "first_seen_at": "2026-09-08T01:35:14.598243Z",
+      "first_seen_minus_label_ms": -285401,
+      "label": "2026-09-08T09:40:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 231,
+      "revisions": [
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:35:44.940845Z",
+          "sequence": 13,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:36:15.274656Z",
+          "sequence": 14,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:36:45.571172Z",
+          "sequence": 15,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "low"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:37:15.851838Z",
+          "sequence": 16,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:37:46.188689Z",
+          "sequence": 17,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:38:16.630831Z",
+          "sequence": 18,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:38:48.023670Z",
+          "sequence": 19,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:39:18.409107Z",
+          "sequence": 20,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:39:48.740016Z",
+          "sequence": 21,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T01:40:19.145126Z",
+          "sequence": 22,
+          "volume_changed": true
+        }
+      ]
+    },
+    {
+      "first_observation_at_or_after_label_ms": 22776,
+      "first_seen_at": "2026-09-08T01:40:19.145126Z",
+      "first_seen_minus_label_ms": -280854,
+      "label": "2026-09-08T09:45:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 221,
+      "revisions": [
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:40:49.551321Z",
+          "sequence": 23,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:41:19.981421Z",
+          "sequence": 24,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:41:50.347720Z",
+          "sequence": 25,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "low",
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:42:20.738046Z",
+          "sequence": 26,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:42:51.107896Z",
+          "sequence": 27,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:43:21.361581Z",
+          "sequence": 28,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:43:51.648606Z",
+          "sequence": 29,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:44:22.030133Z",
+          "sequence": 30,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:44:52.394451Z",
+          "sequence": 31,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T01:45:22.776748Z",
+          "sequence": 32,
+          "volume_changed": true
+        }
+      ]
+    },
+    {
+      "first_observation_at_or_after_label_ms": 26345,
+      "first_seen_at": "2026-09-08T01:45:22.776748Z",
+      "first_seen_minus_label_ms": -277223,
+      "label": "2026-09-08T09:50:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 211,
+      "revisions": [
+        {
+          "changed_fields": [
+            "low"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:45:53.122259Z",
+          "sequence": 33,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:46:23.572521Z",
+          "sequence": 34,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:46:53.913928Z",
+          "sequence": 35,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:47:24.249411Z",
+          "sequence": 36,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:47:54.499943Z",
+          "sequence": 37,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:48:24.803870Z",
+          "sequence": 38,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:48:55.179808Z",
+          "sequence": 39,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:49:25.561407Z",
+          "sequence": 40,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:49:55.898900Z",
+          "sequence": 41,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T01:50:26.345570Z",
+          "sequence": 42,
+          "volume_changed": true
+        }
+      ]
+    },
+    {
+      "first_observation_at_or_after_label_ms": 726,
+      "first_seen_at": "2026-09-08T01:50:26.345570Z",
+      "first_seen_minus_label_ms": -273654,
+      "label": "2026-09-08T09:55:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 201,
+      "revisions": [
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:50:56.669081Z",
+          "sequence": 43,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:51:28.042591Z",
+          "sequence": 44,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:51:58.341210Z",
+          "sequence": 45,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:52:28.954197Z",
+          "sequence": 46,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:52:59.335627Z",
+          "sequence": 47,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "high",
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:53:29.666267Z",
+          "sequence": 48,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:54:00.074161Z",
+          "sequence": 49,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:54:30.384850Z",
+          "sequence": 50,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T01:55:00.726437Z",
+          "sequence": 51,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T01:55:31.069165Z",
+          "sequence": 52,
+          "volume_changed": true
+        }
+      ]
+    },
+    {
+      "first_observation_at_or_after_label_ms": 4325,
+      "first_seen_at": "2026-09-08T01:55:31.069165Z",
+      "first_seen_minus_label_ms": -268930,
+      "label": "2026-09-08T10:00:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 191,
+      "revisions": [
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:56:01.373498Z",
+          "sequence": 53,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:56:31.855972Z",
+          "sequence": 54,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "low"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:57:02.212270Z",
+          "sequence": 55,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:57:32.598941Z",
+          "sequence": 56,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:58:02.994585Z",
+          "sequence": 57,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:58:33.383044Z",
+          "sequence": 58,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:59:03.725751Z",
+          "sequence": 59,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T01:59:34.033858Z",
+          "sequence": 60,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T02:00:04.325154Z",
+          "sequence": 61,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T02:00:34.621992Z",
+          "sequence": 62,
+          "volume_changed": true
+        }
+      ]
+    },
+    {
+      "first_observation_at_or_after_label_ms": 8217,
+      "first_seen_at": "2026-09-08T02:00:34.621992Z",
+      "first_seen_minus_label_ms": -265378,
+      "label": "2026-09-08T10:05:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 181,
+      "revisions": [
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:01:05.031876Z",
+          "sequence": 63,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "high",
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:01:35.415273Z",
+          "sequence": 64,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:02:05.870085Z",
+          "sequence": 65,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:02:36.254394Z",
+          "sequence": 66,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:03:06.682388Z",
+          "sequence": 67,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:03:37.082342Z",
+          "sequence": 68,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:04:07.476268Z",
+          "sequence": 69,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:04:37.817793Z",
+          "sequence": 70,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T02:05:08.217378Z",
+          "sequence": 71,
+          "volume_changed": true
+        }
+      ]
+    },
+    {
+      "first_observation_at_or_after_label_ms": 11711,
+      "first_seen_at": "2026-09-08T02:05:08.217378Z",
+      "first_seen_minus_label_ms": -291782,
+      "label": "2026-09-08T10:10:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 172,
+      "revisions": [
+        {
+          "changed_fields": [
+            "high",
+            "low",
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:05:38.591881Z",
+          "sequence": 72,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:06:08.979229Z",
+          "sequence": 73,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:06:39.358900Z",
+          "sequence": 74,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:07:09.737172Z",
+          "sequence": 75,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:07:39.985464Z",
+          "sequence": 76,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:08:10.311153Z",
+          "sequence": 77,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:08:40.635548Z",
+          "sequence": 78,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:09:10.979993Z",
+          "sequence": 79,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:09:41.334166Z",
+          "sequence": 80,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T02:10:11.711258Z",
+          "sequence": 81,
+          "volume_changed": true
+        }
+      ]
+    },
+    {
+      "first_observation_at_or_after_label_ms": 15292,
+      "first_seen_at": "2026-09-08T02:10:11.711258Z",
+      "first_seen_minus_label_ms": -288288,
+      "label": "2026-09-08T10:15:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 162,
+      "revisions": [
+        {
+          "changed_fields": [
+            "high",
+            "low"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:10:42.071240Z",
+          "sequence": 82,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:11:12.362918Z",
+          "sequence": 83,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:11:42.630089Z",
+          "sequence": 84,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:12:12.951703Z",
+          "sequence": 85,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:12:43.222215Z",
+          "sequence": 86,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:13:13.643560Z",
+          "sequence": 87,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:13:44.050340Z",
+          "sequence": 88,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:14:14.484620Z",
+          "sequence": 89,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:14:44.900389Z",
+          "sequence": 90,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T02:15:15.292888Z",
+          "sequence": 91,
+          "volume_changed": true
+        }
+      ]
+    },
+    {
+      "first_observation_at_or_after_label_ms": 19364,
+      "first_seen_at": "2026-09-08T02:15:15.292888Z",
+      "first_seen_minus_label_ms": -284707,
+      "label": "2026-09-08T10:20:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 152,
+      "revisions": [
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:15:45.682327Z",
+          "sequence": 92,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:16:16.123548Z",
+          "sequence": 93,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:16:46.490404Z",
+          "sequence": 94,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:17:16.943015Z",
+          "sequence": 95,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "low"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:17:47.343350Z",
+          "sequence": 96,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:18:17.716259Z",
+          "sequence": 97,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:18:48.143798Z",
+          "sequence": 98,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:19:18.563634Z",
+          "sequence": 99,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:19:48.945301Z",
+          "sequence": 100,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T02:20:19.364168Z",
+          "sequence": 101,
+          "volume_changed": true
+        }
+      ]
+    },
+    {
+      "first_observation_at_or_after_label_ms": 22940,
+      "first_seen_at": "2026-09-08T02:20:19.364168Z",
+      "first_seen_minus_label_ms": -280635,
+      "label": "2026-09-08T10:25:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 142,
+      "revisions": [
+        {
+          "changed_fields": [
+            "high",
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:20:49.749321Z",
+          "sequence": 102,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:21:50.455315Z",
+          "sequence": 104,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:22:20.833093Z",
+          "sequence": 105,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:22:51.209237Z",
+          "sequence": 106,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:23:21.615512Z",
+          "sequence": 107,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:23:51.908859Z",
+          "sequence": 108,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:24:52.499941Z",
+          "sequence": 110,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T02:25:22.940607Z",
+          "sequence": 111,
+          "volume_changed": true
+        }
+      ]
+    },
+    {
+      "first_observation_at_or_after_label_ms": 26367,
+      "first_seen_at": "2026-09-08T02:25:22.940607Z",
+      "first_seen_minus_label_ms": -277059,
+      "label": "2026-09-08T10:30:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 132,
+      "revisions": [
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:25:53.403580Z",
+          "sequence": 112,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "low"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:26:23.744191Z",
+          "sequence": 113,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:26:54.108080Z",
+          "sequence": 114,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:27:24.499660Z",
+          "sequence": 115,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:27:54.843954Z",
+          "sequence": 116,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:28:25.171129Z",
+          "sequence": 117,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:28:55.461358Z",
+          "sequence": 118,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:29:25.707969Z",
+          "sequence": 119,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:29:56.040623Z",
+          "sequence": 120,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T02:30:26.367475Z",
+          "sequence": 121,
+          "volume_changed": true
+        }
+      ]
+    },
+    {
+      "first_observation_at_or_after_label_ms": 13,
+      "first_seen_at": "2026-09-08T02:30:26.367475Z",
+      "first_seen_minus_label_ms": -273632,
+      "label": "2026-09-08T10:35:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 122,
+      "revisions": [
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:30:56.750734Z",
+          "sequence": 122,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:31:27.287995Z",
+          "sequence": 123,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:31:57.713122Z",
+          "sequence": 124,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:32:28.093921Z",
+          "sequence": 125,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:32:58.457436Z",
+          "sequence": 126,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:33:28.802648Z",
+          "sequence": 127,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:33:59.228057Z",
+          "sequence": 128,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:34:29.602058Z",
+          "sequence": 129,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T02:35:00.013321Z",
+          "sequence": 130,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T02:35:30.412614Z",
+          "sequence": 131,
+          "volume_changed": true
+        }
+      ]
+    },
+    {
+      "first_observation_at_or_after_label_ms": 3667,
+      "first_seen_at": "2026-09-08T02:35:30.412614Z",
+      "first_seen_minus_label_ms": -269587,
+      "label": "2026-09-08T10:40:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 112,
+      "revisions": [
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:36:00.760902Z",
+          "sequence": 132,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:36:31.073128Z",
+          "sequence": 133,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:37:01.379446Z",
+          "sequence": 134,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "low"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:37:31.679355Z",
+          "sequence": 135,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:38:02.080460Z",
+          "sequence": 136,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:38:32.460904Z",
+          "sequence": 137,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:39:02.889252Z",
+          "sequence": 138,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:39:33.283236Z",
+          "sequence": 139,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T02:40:03.667571Z",
+          "sequence": 140,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T02:40:34.039946Z",
+          "sequence": 141,
+          "volume_changed": true
+        }
+      ]
+    },
+    {
+      "first_observation_at_or_after_label_ms": 7293,
+      "first_seen_at": "2026-09-08T02:40:34.039946Z",
+      "first_seen_minus_label_ms": -265960,
+      "label": "2026-09-08T10:45:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 102,
+      "revisions": [
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:41:04.421891Z",
+          "sequence": 142,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:41:34.804058Z",
+          "sequence": 143,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:42:05.196785Z",
+          "sequence": 144,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:42:35.572326Z",
+          "sequence": 145,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:43:05.953246Z",
+          "sequence": 146,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:43:36.359666Z",
+          "sequence": 147,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:44:06.632535Z",
+          "sequence": 148,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:44:36.959301Z",
+          "sequence": 149,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T02:45:07.293585Z",
+          "sequence": 150,
+          "volume_changed": true
+        }
+      ]
+    },
+    {
+      "first_observation_at_or_after_label_ms": 10825,
+      "first_seen_at": "2026-09-08T02:45:07.293585Z",
+      "first_seen_minus_label_ms": -292706,
+      "label": "2026-09-08T10:50:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 93,
+      "revisions": [
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:45:37.647656Z",
+          "sequence": 151,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:46:08.021220Z",
+          "sequence": 152,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:46:38.441328Z",
+          "sequence": 153,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:47:08.771112Z",
+          "sequence": 154,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:47:39.153966Z",
+          "sequence": 155,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:48:09.556638Z",
+          "sequence": 156,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:48:39.916482Z",
+          "sequence": 157,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:49:10.229283Z",
+          "sequence": 158,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:49:40.547949Z",
+          "sequence": 159,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T02:50:10.825410Z",
+          "sequence": 160,
+          "volume_changed": true
+        }
+      ]
+    },
+    {
+      "first_observation_at_or_after_label_ms": 14836,
+      "first_seen_at": "2026-09-08T02:50:10.825410Z",
+      "first_seen_minus_label_ms": -289174,
+      "label": "2026-09-08T10:55:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 83,
+      "revisions": [
+        {
+          "changed_fields": [
+            "low"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:50:41.222988Z",
+          "sequence": 161,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:51:11.622070Z",
+          "sequence": 162,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:51:42.033599Z",
+          "sequence": 163,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:52:12.433785Z",
+          "sequence": 164,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:52:42.850260Z",
+          "sequence": 165,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:53:13.182204Z",
+          "sequence": 166,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:53:43.585536Z",
+          "sequence": 167,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:54:13.961278Z",
+          "sequence": 168,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:54:44.305069Z",
+          "sequence": 169,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T02:55:14.836416Z",
+          "sequence": 170,
+          "volume_changed": true
+        }
+      ]
+    },
+    {
+      "first_observation_at_or_after_label_ms": 18927,
+      "first_seen_at": "2026-09-08T02:55:14.836416Z",
+      "first_seen_minus_label_ms": -285163,
+      "label": "2026-09-08T11:00:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 73,
+      "revisions": [
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:55:45.175910Z",
+          "sequence": 171,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:56:15.598046Z",
+          "sequence": 172,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:56:45.975598Z",
+          "sequence": 173,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:57:16.392976Z",
+          "sequence": 174,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:57:46.731223Z",
+          "sequence": 175,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:58:17.212326Z",
+          "sequence": 176,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:58:47.614857Z",
+          "sequence": 177,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:59:17.992524Z",
+          "sequence": 178,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T02:59:48.360410Z",
+          "sequence": 179,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T03:00:18.927436Z",
+          "sequence": 180,
+          "volume_changed": true
+        }
+      ]
+    },
+    {
+      "first_observation_at_or_after_label_ms": 22697,
+      "first_seen_at": "2026-09-08T03:00:18.927436Z",
+      "first_seen_minus_label_ms": -281072,
+      "label": "2026-09-08T11:05:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 63,
+      "revisions": [
+        {
+          "changed_fields": [
+            "low"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:00:49.332245Z",
+          "sequence": 181,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:01:19.712292Z",
+          "sequence": 182,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:01:50.097862Z",
+          "sequence": 183,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "high",
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:02:20.513460Z",
+          "sequence": 184,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:02:50.882875Z",
+          "sequence": 185,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:03:21.437505Z",
+          "sequence": 186,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:03:51.772443Z",
+          "sequence": 187,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:04:22.146760Z",
+          "sequence": 188,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:04:52.396180Z",
+          "sequence": 189,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T03:05:22.697770Z",
+          "sequence": 190,
+          "volume_changed": true
+        }
+      ]
+    },
+    {
+      "first_observation_at_or_after_label_ms": 26573,
+      "first_seen_at": "2026-09-08T03:05:22.697770Z",
+      "first_seen_minus_label_ms": -277302,
+      "label": "2026-09-08T11:10:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 53,
+      "revisions": [
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:06:23.432598Z",
+          "sequence": 192,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:06:53.885219Z",
+          "sequence": 193,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:07:24.302078Z",
+          "sequence": 194,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:07:54.658275Z",
+          "sequence": 195,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:08:25.038612Z",
+          "sequence": 196,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:08:55.417601Z",
+          "sequence": 197,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:09:25.887800Z",
+          "sequence": 198,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:09:56.232084Z",
+          "sequence": 199,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T03:10:26.573066Z",
+          "sequence": 200,
+          "volume_changed": true
+        }
+      ]
+    },
+    {
+      "first_observation_at_or_after_label_ms": 348,
+      "first_seen_at": "2026-09-08T03:10:26.573066Z",
+      "first_seen_minus_label_ms": -273426,
+      "label": "2026-09-08T11:15:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 43,
+      "revisions": [
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:10:56.972536Z",
+          "sequence": 201,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:11:27.499928Z",
+          "sequence": 202,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:11:57.896585Z",
+          "sequence": 203,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:12:28.301852Z",
+          "sequence": 204,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:12:58.718032Z",
+          "sequence": 205,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:13:29.127442Z",
+          "sequence": 206,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:13:59.508148Z",
+          "sequence": 207,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:14:29.997164Z",
+          "sequence": 208,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T03:15:00.348818Z",
+          "sequence": 209,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T03:15:30.721826Z",
+          "sequence": 210,
+          "volume_changed": true
+        }
+      ]
+    },
+    {
+      "first_observation_at_or_after_label_ms": 4306,
+      "first_seen_at": "2026-09-08T03:15:30.721826Z",
+      "first_seen_minus_label_ms": -269278,
+      "label": "2026-09-08T11:20:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 33,
+      "revisions": [
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:16:01.120416Z",
+          "sequence": 211,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:16:31.480591Z",
+          "sequence": 212,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:17:01.932317Z",
+          "sequence": 213,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:17:32.313605Z",
+          "sequence": 214,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:18:02.804538Z",
+          "sequence": 215,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:18:33.121562Z",
+          "sequence": 216,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:19:03.496369Z",
+          "sequence": 217,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:19:33.875680Z",
+          "sequence": 218,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T03:20:04.306445Z",
+          "sequence": 219,
+          "volume_changed": true
+        }
+      ]
+    },
+    {
+      "first_observation_at_or_after_label_ms": 7943,
+      "first_seen_at": "2026-09-08T03:20:04.306445Z",
+      "first_seen_minus_label_ms": -295693,
+      "label": "2026-09-08T11:25:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 24,
+      "revisions": [
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:20:34.589735Z",
+          "sequence": 220,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:21:04.894723Z",
+          "sequence": 221,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:21:35.199043Z",
+          "sequence": 222,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:22:05.587855Z",
+          "sequence": 223,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:22:36.004224Z",
+          "sequence": 224,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:23:06.381482Z",
+          "sequence": 225,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:23:36.780936Z",
+          "sequence": 226,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:24:07.150192Z",
+          "sequence": 227,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:24:37.539890Z",
+          "sequence": 228,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T03:25:07.943507Z",
+          "sequence": 229,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T03:25:38.301342Z",
+          "sequence": 230,
+          "volume_changed": true
+        }
+      ]
+    },
+    {
+      "first_observation_at_or_after_label_ms": 12020,
+      "first_seen_at": "2026-09-08T03:25:38.301342Z",
+      "first_seen_minus_label_ms": -261698,
+      "label": "2026-09-08T11:30:00",
+      "last_seen_at": "2026-09-08T03:31:43.206183Z",
+      "observations": 13,
+      "revisions": [
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:26:08.700067Z",
+          "sequence": 231,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:26:39.121233Z",
+          "sequence": 232,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:27:09.530525Z",
+          "sequence": 233,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:27:39.966801Z",
+          "sequence": 234,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [
+            "close"
+          ],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:28:10.386347Z",
+          "sequence": 235,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:28:40.808488Z",
+          "sequence": 236,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:29:11.203882Z",
+          "sequence": 237,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": false,
+          "received_at": "2026-09-08T03:29:41.594284Z",
+          "sequence": 238,
+          "volume_changed": true
+        },
+        {
+          "changed_fields": [],
+          "observed_after_label_end": true,
+          "received_at": "2026-09-08T03:30:12.020051Z",
+          "sequence": 239,
+          "volume_changed": true
+        }
+      ]
+    }
+  ],
+  "claim": "OBSERVED_BEHAVIOR_ONLY_NOT_FINALITY_OR_TRADING_ACCEPTANCE",
+  "date": "2026-09-08",
+  "disappearing_label_observations": [],
+  "failures": [],
+  "first_request_at": "2026-09-08T01:29:10.210876Z",
+  "fixture": false,
+  "identity_sha256": "a5c7acf8cad765ed56083097b3d7d500474492d3cedc1d786afc1e709b9b7845",
+  "kind": "UNREVIEWED_SOURCE_RESEARCH_NOT_TRADING_EVIDENCE",
+  "last_receipt_at": "2026-09-08T03:31:43.206183Z",
+  "limitations": [
+    "No symbol echo, amount or source finality flag",
+    "A stable response does not certify completeness",
+    "Post-label revisions describe observation timing, not exchange correction timing",
+    "Requested date is an analysis filter, not an authenticated trading calendar"
+  ],
+  "maximum_receipt_gap_ms": 31392,
+  "missing_session_labels_not_necessarily_due_yet": [
+    "2026-09-08T13:05:00",
+    "2026-09-08T13:10:00",
+    "2026-09-08T13:15:00",
+    "2026-09-08T13:20:00",
+    "2026-09-08T13:25:00",
+    "2026-09-08T13:30:00",
+    "2026-09-08T13:35:00",
+    "2026-09-08T13:40:00",
+    "2026-09-08T13:45:00",
+    "2026-09-08T13:50:00",
+    "2026-09-08T13:55:00",
+    "2026-09-08T14:00:00",
+    "2026-09-08T14:05:00",
+    "2026-09-08T14:10:00",
+    "2026-09-08T14:15:00",
+    "2026-09-08T14:20:00",
+    "2026-09-08T14:25:00",
+    "2026-09-08T14:30:00",
+    "2026-09-08T14:35:00",
+    "2026-09-08T14:40:00",
+    "2026-09-08T14:45:00",
+    "2026-09-08T14:50:00",
+    "2026-09-08T14:55:00",
+    "2026-09-08T15:00:00"
+  ],
+  "ordered_receipts_sha256": "fafc9ba8ff000e5b65497eafd1311000b81387b59e6b8057a8e69443d2942b4f",
+  "receipt_count": 243,
+  "source_completeness_proven": false,
+  "unexpected_session_labels": [],
+  "url": "https://money.finance.sina.com.cn/quotes_service/api/jsonp_v2.php/var%20gridedge_probe=/CN_MarketData.getKLineData?symbol=sz002256&scale=5&ma=no&datalen=1023"
+}

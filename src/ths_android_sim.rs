@@ -312,12 +312,19 @@ impl<E: AdbExecutor> AndroidThsSimulationUiDriver<E> {
         let mut last_error = None;
         for attempt in 0..10 {
             let result = (|| {
-                self.adb(&[
+                let dump_receipt = self.adb(&[
                     "shell",
                     "uiautomator",
                     "dump",
                     "/sdcard/gridedge-ths-window.xml",
                 ])?;
+                // uiautomator may exit zero on an idle-state failure and leave
+                // the previous XML untouched. Never admit that retained file
+                // as current identity/control evidence without a fresh receipt.
+                if dump_receipt.trim() != "UI hierchary dumped to: /sdcard/gridedge-ths-window.xml"
+                {
+                    bail!("Android UI dump did not confirm a fresh snapshot");
+                }
                 let xml = self.adb(&["exec-out", "cat", "/sdcard/gridedge-ths-window.xml"])?;
                 UiSnapshot::parse(&xml)
             })();

@@ -1,0 +1,88 @@
+{
+  "schema": "gridedge.delivery-closeout.v1",
+  "reported_at": "2026-09-08T18:14:53.313+08:00",
+  "heartbeat": {
+    "automation_id": "gridedge",
+    "last_run_at": 1788862281924,
+    "last_run_at_asia_shanghai": "2026-09-08T18:11:21.924+08:00",
+    "next_run_at": 1788865907000,
+    "next_run_at_asia_shanghai": "2026-09-08T19:11:47+08:00",
+    "status": "ACTIVE",
+    "target_thread_id": "01a07fe5-075b-70a1-a22f-7072aa3131ba"
+  },
+  "automation_ownership": {
+    "watchdog_exit_code": 0,
+    "automation_2_status": "ACTIVE",
+    "goal_status": "PAUSED",
+    "goal_next_run_at": null,
+    "repair_needed": false
+  },
+  "stale_prompt_regression": {
+    "red_assertion": "delivery owner must carry the current post-close delivery baseline",
+    "old_prompt_sha256": "075c68b93478589cecedd5000afdd13e3945de678af737111d881cea0b2e8ed3",
+    "new_prompt_sha256": "cecb85ad8cbf673c3c5a8f4060da9768ebf1208d138f461d9814c1ee5ba86b6e",
+    "current_closeout_baseline_count": 1,
+    "stale_recorder_instruction_count": 0,
+    "stale_analysis_handoff_count": 0,
+    "post_update_watchdog_exit_code": 0,
+    "scheduler_boundary_cases_passed": 5,
+    "schedule_changed": false,
+    "target_changed": false,
+    "status_changed": false
+  },
+  "formal_runtime": {
+    "at": "2026-09-08T18:12:47.187790+08:00",
+    "supervisor_pid": 95789,
+    "manifest_sha256": "d6386e00060b7c7e0120aa6453441b592385ecc64acbbc430ae08bd7c4e43387",
+    "window": "CLOSED",
+    "action": "OBSERVE_CLOSED",
+    "guard_count": 0,
+    "worker_count": 0,
+    "chrome": true,
+    "mqtt": true,
+    "reviewed_device": true,
+    "breaker_open": false,
+    "source_provider": "eastmoney-time-sales-dom-v6",
+    "last_proven_collector_version": "0.6.51",
+    "source_sequence": 36657,
+    "source_observed_at_asia_shanghai": "2026-09-07T13:55:16.179+08:00",
+    "source_fresh": false,
+    "postgresql_exact_committed_ack": true,
+    "ledger_head": 1958,
+    "outbox_cursor": 1958,
+    "mode": "READ_ONLY",
+    "latest_completed_bar": "2026-09-07 13:50:00",
+    "latest_bar_strategy_evaluated": false,
+    "paper_cash_available": "103418.530",
+    "paper_cash_frozen": "0",
+    "paper_observed_minimum_cash": "103418.530",
+    "position_total": 27500,
+    "position_sellable": 27500,
+    "open_order_ids": [],
+    "unresolved_orders": 0,
+    "effective_artifact_sha256": "149ca55f6ae239695f22e132d56b6cfcfd14514f230b4fe349e3fc9bb50e8422",
+    "binding_revision": 15
+  },
+  "reviewed_market_page": {
+    "checked_after": "2026-09-08T18:11:21+08:00",
+    "url": "https://quote.eastmoney.com/f1.html?newcode=0.002256",
+    "instrument_header_available": false,
+    "captcha_slider_visible": true,
+    "retained_for_handoff": true,
+    "control_operated": false
+  },
+  "daily_result": {
+    "september_8_operational_success": false,
+    "current_day_market_bar_processed": 0,
+    "current_day_order_intent_created": 0,
+    "strategy_evaluated_current_day": false,
+    "minimum_implementation_milestone_at_risk": true,
+    "production_restored": false,
+    "blocking_conditions": [
+      "User-presence slider and normal reviewed collector activation remain incomplete",
+      "No authorized source with reviewed identity, bucketing, completion/finality and revision semantics is available"
+    ],
+    "next_session_execution_owner": "Installed app-independent supervisor with 2026-09-09 09:00 PREFLIGHT and 09:30 TRADING mapping",
+    "historical_order_replay_or_test_order": false
+  }
+}

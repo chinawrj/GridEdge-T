@@ -1,0 +1,77 @@
+{
+  "at": "2026-09-10T18:17:58+08:00",
+  "scope": "READ_ONLY_POSTCLOSE_ACCOUNT_OBSERVATION_NOT_RELEASE_CERTIFICATION",
+  "day_result": "FAILED_ZERO_CURRENT_DAY_STRATEGY_EVALUATIONS",
+  "ownership": "Persisted owner check PASS; operations task idle. Both absent maintenance directories acquired and released by this owner. Final supervisor maintenance=false.",
+  "recovery": {
+    "started_at": "2026-09-10T18:13+08:00",
+    "path": "Exact installed supervisor script c5e8fea5c5d904fde70dd6983f42a3afff1ceb124f50b612adde1fb3f1f73c42, load_manifest with reviewed d6386e00060b7c7e0120aa6453441b592385ecc64acbbc430ae08bd7c4e43387 trust anchor and all file checks, snapshot identity/unlocked/zero owners checks, apply START_EMULATOR only.",
+    "initial_orchestration_error": "snapshot returns a tuple; first diagnostic asserted using dict indexing and stopped before launch. Corrected destructuring, then performed exactly one launch.",
+    "emulator_pid": 98146,
+    "avd": "THSP_API_32",
+    "snapshots_load_save_disabled": true,
+    "userdata_preserved": true,
+    "first_probe": "18:14:12 refused because THS was not resumed; resolved installed package launch activity and started it once.",
+    "worker_started": false,
+    "money_actions_enabled": false,
+    "breaker_unchanged": true
+  },
+  "probe_sha256": "beeaa7a4a9022c12a09c64bb12876237a183b55cbc9a3fb9b5ac501bc855ab2c",
+  "checks": [
+    {"at": "18:15:32.802885", "check": "probe", "exit_code": 0, "stdout_sha256": "fac2388ee76ffb39c9cb1406a5cbf19d3d40c4cc9a2f26f1d2d83ee90e46ee4c"},
+    {"at": "18:15:38.202196", "check": "orders", "exit_code": 0, "rows": 0, "stdout_sha256": "7132bb9b606cd7da4892d41533143896c76969d1080b1f799b24fdaabb2d0e59"},
+    {"at": "18:15:49.094910", "check": "fills", "exit_code": 0, "rows": 0, "stdout_sha256": "cbd316e7e0de5746ffd8a00dfef071b71955c244c9f27efabb471ed8475b4c68"},
+    {"at": "18:15:54.117166", "check": "cancellable", "exit_code": 0, "count": 0, "stdout_sha256": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"}
+  ],
+  "identity": {
+    "version": "10.94.09",
+    "package": "com.hexin.plat.android.supremacy",
+    "page_title": "模拟炒股",
+    "masked_account_sha256": "2a503f82bc86e7c2da0163ce29912e502f26d9f1c86eb2934320c7e26e08ddef"
+  },
+  "holdings": {
+    "two_identical_xml_sha256": "8d34182cb81fefc694a605d9863f83167ee999473188ff967241995f33ff5a04",
+    "second_read_at": "2026-09-10T18:17:50.675142+08:00",
+    "symbol_name": "兆新股份",
+    "position": 27500,
+    "sellable": 27500,
+    "cash": "107216.32",
+    "observed_minimum_cash_this_read_window": "107216.32",
+    "market_value": "93225.00",
+    "total_assets": "200441.32",
+    "decimal_sum_matches": true,
+    "paper_cash": "103418.530",
+    "difference": "3797.790",
+    "fees_and_cashflow_history_observed": false,
+    "limits": "Current UI observation, not independently proven server-side freshness or all-day minimum. Existing GOAL shadow conservative-price/fee semantics remain unchanged; no writeback or invented fee receipt."
+  },
+  "browser": {
+    "old_tab_1034335341": "Absent in current full browser inventory; closure cause unproven despite prior handoff mark.",
+    "new_tab": "1034335345",
+    "url": "https://quote.eastmoney.com/f1.html?newcode=0.002256",
+    "creation": "One request timed out; inventory proved it created the tab, so no duplicate request was issued.",
+    "mark": "markDeliverable succeeded for explicitly required persistent production page",
+    "state": "Manual slider visible, symbol summary unavailable, trade table headers only; no challenge interaction."
+  },
+  "formal_final": {
+    "supervisor_pid": 95789,
+    "action": "OBSERVE_CLOSED",
+    "identity": true,
+    "maintenance": false,
+    "reviewed_device": true,
+    "workers": 0,
+    "guards": 0,
+    "source_sequence": 36657,
+    "source_observed_at": "2026-09-07T13:55:16.179+08:00",
+    "committed_ack": "EXACT_BUT_STALE",
+    "latest_bar": "2026-09-07 13:50:00",
+    "mode": "READ_ONLY",
+    "ledger_head": 1958,
+    "outbox_cursor": 1958,
+    "unresolved": 0,
+    "effective_sha256": "149ca55f6ae239695f22e132d56b6cfcfd14514f230b4fe349e3fc9bb50e8422",
+    "binding_revision": 15
+  },
+  "release": "NONE; reused approved read-only probe and installed supervisor. No code change or full-gate rerun.",
+  "remaining": "Qualified live OHLC/continuity/finality including quiet and final buckets, real activation and session acceptance. Full fee/cashflow audit remains unproven, not a new shadow-mode hard gate. Independent supervisor and emulator remain live; no candidate observer or worker recovery in flight. September 11 17:10 deadline unchanged, two-full-day criterion already impossible."
+}

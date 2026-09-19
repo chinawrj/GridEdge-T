@@ -1,5 +1,11 @@
 # GridEdge-T
 
+> **FROZEN / NOT DELIVERED — 2026-09-19.** The owner ended active development
+> and unattended operation. This repository is an archival snapshot, not a
+> production-approved release. Do not restart collectors, supervisors, workers,
+> scheduled repairs or paper trading without a new explicit request.
+> See [the freeze record](docs/plans/2026-09-19-project-freeze.md).
+
 GridEdge-T is a Rust platform for one-symbol A-share grid-strategy research. Its core abstraction is the auditable right granted at each grid crossing: an algorithm chooses exact `Exercise(q)` and `Defer(q)` quantities, while platform risk controls can independently block an intended order. Append-only accounting, deterministic replay and crash recovery take priority over prediction sophistication.
 
 The mechanical unit is a fixed share quantity: `1份 = standard_quantity 股`. Market price changes settlement cash, fees and P&L, but never changes how many shares one authorization unit contains. Historical budget-denominated ledgers remain replayable and are not valid formats for new writes.
@@ -61,9 +67,14 @@ The reviewed `configs/ths_002256_sim.yaml` deployment preserves at least CNY 100
 CNY 200,000 simulated cash. Its `max_position` and resource target are the numeric envelope, not a
 business position cap; profits above the cash floor can fund additional later positions. The market
 score must still pass before cash can authorize a BUY, so this budget does not create a high-price
-buy signal. The launch-agent template is `deploy/com.gridedge.ths-sim.plist`; it starts the release
-worker at 09:00 on weekdays so its committed-market subscription precedes collection; a successful 15:05 exit is not restarted. The Mac must stay logged
+buy signal. The launch-agent template is a trigger-free identity-only deployment artifact whose
+loaded label is verified absent during installation. At 09:00 the
+reviewed app-independent trusted-session guard starts the exact installed runner and owns bounded
+restart; launchd never competes with it. A successful 15:05 exit is not restarted. The Mac must stay logged
 in and unlocked because Accessibility actions deliberately fail closed at the lock screen.
+Deployment and guard startup share one reviewed coordination lock; use
+`deploy/start_ths_trusted_session.sh` only after platform activation and append-only execution-identity
+binding have succeeded.
 
 The independent outbox can already bind to one immutable GridEdge database/run and stage only
 orders that have both durable `ORDER_INTENT_CREATED` and `ORDER_SUBMITTED` facts. Its initial

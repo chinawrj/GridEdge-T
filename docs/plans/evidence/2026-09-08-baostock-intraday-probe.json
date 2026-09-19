@@ -1,0 +1,32 @@
+{
+  "kind": "RESEARCH_ONLY_NOT_TRADING_EVIDENCE",
+  "admitted": false,
+  "source_completeness_proven": false,
+  "binary_sha256": "0614ae0d875aa1229a3fdf7a25b579880e6f80579c0bfbe123a5551b156f477f",
+  "symbol": "002256.SZ",
+  "frequency_minutes": 5,
+  "adjustment": "none",
+  "retries": 0,
+  "subprocess_timeout_seconds": 55,
+  "intraday": {
+    "requested_date": "2026-09-08",
+    "started_at": "2026-09-08T02:16:26.251007+00:00",
+    "completed_at": "2026-09-08T02:16:26.417939+00:00",
+    "exit_code": 1,
+    "stderr": "error: failed BaoStock segment 2026-09-08 through 2026-09-08: invalid BaoStock record JSON: EOF while parsing a value at line 1 column 0",
+    "interpretation": "No usable current-session bars were obtained; parsing failure is not proof of zero bars or zero trades."
+  },
+  "previous_day_control": {
+    "requested_date": "2026-09-07",
+    "started_at": "2026-09-08T02:16:44.968577+00:00",
+    "completed_at": "2026-09-08T02:16:45.035899+00:00",
+    "exit_code": 0,
+    "rows": 48,
+    "first_label": "2026-09-07T09:35:00",
+    "last_label": "2026-09-07T15:00:00",
+    "raw_sha256": "356fd463557b3e3441fc6cdb642793bff0fe2cd565cfd3e4453afc677a2d6d2f",
+    "processed_sha256": "48780321439615cd665f9c6f0b5b4655ced0dd8563aba160f5edce38d07085ca",
+    "original_quality_sha256": "a070d4b4efd4bc3240f796318c561982bec16ab206b952b891a2d110f701ccd3",
+    "saved_quality_sha256_with_trailing_newline": "8107a3f76c82168f7c8d5f7573b97b6212bd023735b25910873d2037c1bbb0a6"
+  }
+}

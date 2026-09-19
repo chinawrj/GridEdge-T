@@ -1,0 +1,21 @@
+{
+  "reviewed_at": "2026-09-10T13:27:49+08:00",
+  "scope": "research recorder amount precision only",
+  "supersedes_precision_claim": "2026-09-10-research-decimal-fix.json",
+  "reviewer": "/root/decimal_review",
+  "initial_review": "FAIL P2: Decimal checked_add silently rounds maximum integer plus 0.01, falsely reporting totals reconcile",
+  "independent_counterexample": {
+    "receipt": "/tmp/gridedge-review.USMZu8/capture/receipt-00000.json",
+    "raw_sha256": "f41733fbdec1575e21edb628e7539acf87e3535e97ea31266cd5099b8bd02a24"
+  },
+  "fix": "Convert exact Decimal mantissa/scale to u128 cents, reject sub-cent amounts, checked integer addition, format cents without Decimal conversion",
+  "source_sha256": "e400b9904ee9ab71db1cb658a9f532379e650a9a9fe1a614e67e1c8d00f04e90",
+  "final_review": "PASS limited scope; independent 10 focused tests passed; P2 closed; input range and whole-cent constraints reject rather than round",
+  "fmt": "PASS",
+  "strict_clippy": "PASS",
+  "full_test_suite": "PASS exit0:506 passed,0 failed,2 money-action smokes ignored; completed before13:32:08",
+  "replay": {"directory": "/tmp/gridedge-cents-replay.oCQXke", "event_count": 233, "duplicates": 0, "open_orders": 0, "mode": "STOPPED"},
+  "production_certified": false,
+  "admitted": false,
+  "formal_deployment": false
+}

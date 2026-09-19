@@ -1,0 +1,31 @@
+{
+  "recorded_at": "2026-09-10T13:06:58+08:00",
+  "scope": "isolated research recorder only; no production deployment",
+  "source_sha256": "e3f1e9956fa0f89b70f444acb308d01372e09b64f316daf9667ea369d40ca7d6",
+  "red": "raw_amount_preserves_high_precision_and_one_cent_difference failed: 9007199254740991.01 became 9007199254740991.0",
+  "fix": "Typed source envelope and RawValue money tokens; Decimal::from_str_exact; checked amount addition; duplicate typed fields rejected. serde_json raw_value feature enabled, not arbitrary_precision; no changed formal codec behavior intended.",
+  "gates": {
+    "fmt": "PASS",
+    "strict_clippy_all_targets_all_features": "PASS",
+    "all_targets_all_features_tests": {"passed": 505, "failed": 0, "money_action_smokes_ignored": 2},
+    "focused_recorder_tests": {"passed": 9, "failed": 0},
+    "config": "PASS",
+    "isolated_replay": {"events": 233, "duplicates": 0, "open_orders": 0, "mode": "STOPPED"},
+    "diff_check": "PASS"
+  },
+  "isolated_replay_directory": "/tmp/gridedge-decimal-replay.wCxU4I",
+  "raw_fixture_reinspection": {
+    "directory": "/tmp/gridedge-decimal-replay.wCxU4I/raw-reinspection",
+    "raw_sha256": "1626c5a528b6366cb3073b086dfa09272d54547d579d473259c3418894b8bb3f",
+    "regular_amount": "32474324.00",
+    "aggregate_amount": "32460550.0",
+    "regular_volume_lots": 96916,
+    "aggregate_volume_lots": 96875,
+    "reconciles": false,
+    "admitted": false
+  },
+  "independent_review": "NOT_PERFORMED; not certified for production release",
+  "formal_changes": false,
+  "new_live_research_process": false,
+  "runtime_final_observation": "13:06:42 TRADING/BLOCKED_UNLOCKED, worker/guard/device0, head/cursor1958, source36657 from Sep7;13:05 afternoon first-bar deadline missed"
+}

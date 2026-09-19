@@ -1,0 +1,37 @@
+{
+  "schema": "gridedge.szse-next-session-observer.v1",
+  "established_at": "2026-09-08T18:47:18.856038+08:00",
+  "purpose": "App-independent, isolated observation of the new official SZSE public minute candidate during the next live morning window.",
+  "owner": {
+    "tmux_socket": "gridedge_codex",
+    "tmux_session": "source_szse_20260909",
+    "pid": 38883,
+    "pane_dead": false,
+    "phase_at_readback": "WAITING_FOR_RESEARCH_WINDOW",
+    "status_at": "2026-09-08T18:47:33.894928+08:00"
+  },
+  "window": {
+    "start_utc": "2026-09-09T01:29:00Z",
+    "start_asia_shanghai": "2026-09-09T09:29:00+08:00",
+    "stop_utc": "2026-09-09T03:32:00Z",
+    "stop_asia_shanghai": "2026-09-09T11:32:00+08:00",
+    "interval_seconds": 30
+  },
+  "identity": {
+    "program": "/Users/rjwang/Documents/ChatGPT/GridEdge-T/target/debug/gridedge_szse_source_observation_probe",
+    "binary_sha256": "96c5ce56264e9abac36c180d9ecd1e60ec66a510cde8c7e9c82fea863947d5fe",
+    "identity_file": "/Users/rjwang/Library/Application Support/GridEdge-T/runtime/source-probes/20260909-szse-public-live/identity.json",
+    "identity_sha256": "ac3398ddf338eeeff9f4d0b269a417e73c2b6037eb7f09529dae1022b59cfe07",
+    "output_directory": "/Users/rjwang/Library/Application Support/GridEdge-T/runtime/source-probes/20260909-szse-public-live"
+  },
+  "isolation": {
+    "formal_publication": false,
+    "admitted": false,
+    "mqtt_access": false,
+    "postgresql_access": false,
+    "ledger_access": false,
+    "account_or_order_access": false,
+    "formal_subscriber_topic_match_possible": false
+  },
+  "acceptance_boundary": "The observer records revision/timeliness behavior only. It cannot admit the source, reconstruct OHLC from minute last prices or prove completion/finality."
+}

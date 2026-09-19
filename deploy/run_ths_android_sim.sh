@@ -11,6 +11,9 @@ package=com.hexin.plat.android.supremacy
 activity=com.hexin.plat.android.Hexin
 emulator_log="$deployment_root/logs/android-emulator.log"
 failure_state="$deployment_root/runtime/android-runner-failures"
+startup_handshake=$(mktemp "$deployment_root/runtime/.android-preflight-handshake.XXXXXX")
+rm -f "$startup_handshake"
+worker_pid=0
 today=$(/bin/date +%Y-%m-%d)
 failure_count=0
 if [ -f "$failure_state" ]; then
@@ -28,12 +31,28 @@ if [ "$failure_count" -ge 3 ]; then
 fi
 record_failure() {
   code=$?
-  if [ "$code" -ne 0 ]; then
+  handshake_ok=0
+  if [ -f "$startup_handshake" ] && [ ! -L "$startup_handshake" ]; then
+    handshake_marker=
+    handshake_pid=
+    handshake_extra=
+    expected_handshake="GRIDEDGE_ANDROID_PREFLIGHT_OK_V1 $worker_pid"
+    expected_handshake_bytes=$((${#expected_handshake} + 1))
+    actual_handshake_bytes=$(wc -c <"$startup_handshake" | tr -d ' ')
+    read -r handshake_marker handshake_pid handshake_extra <"$startup_handshake" || true
+    if [ "$handshake_marker" = GRIDEDGE_ANDROID_PREFLIGHT_OK_V1 ] &&
+       [ "$handshake_pid" = "$worker_pid" ] && [ -z "$handshake_extra" ] &&
+       [ "$actual_handshake_bytes" = "$expected_handshake_bytes" ]; then
+      handshake_ok=1
+    fi
+  fi
+  if [ "$code" -ne 0 ] && [ "$handshake_ok" -ne 1 ]; then
     next=$((failure_count + 1))
     temporary="$failure_state.$$"
     printf '%s %s\n' "$today" "$next" >"$temporary"
     mv -f "$temporary" "$failure_state"
   fi
+  rm -f "$startup_handshake"
   exit "$code"
 }
 trap record_failure EXIT
@@ -82,6 +101,17 @@ $adb -s "$serial" shell settings put global animator_duration_scale 0
 $adb -s "$serial" shell am start -n "$package/$activity" >/dev/null
 sleep 2
 
-"$deployment_root/bin/gridedge_ths_live" "$@"
-printf '%s 0\n' "$today" >"$failure_state"
+"$deployment_root/bin/gridedge_ths_live" \
+  --android-preflight-handshake-file "$startup_handshake" \
+  "$@" &
+worker_pid=$!
+if wait "$worker_pid"; then
+  worker_status=0
+else
+  worker_status=$?
+fi
+if [ "$worker_status" -ne 0 ]; then
+  exit "$worker_status"
+fi
+rm -f "$startup_handshake"
 trap - EXIT

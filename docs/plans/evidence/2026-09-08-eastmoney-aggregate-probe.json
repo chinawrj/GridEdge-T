@@ -1,0 +1,64 @@
+{
+  "recorded_at": "2026-09-08T15:41:07+08:00",
+  "kind": "EASTMONEY_SAME_SOURCE_AGGREGATE_COMPLETENESS_PROBE",
+  "scope": "Read-only public endpoint and already-loaded reviewed-page script inspection; no browser control, MQTT, PostgreSQL, ledger, outbox, Android or order action",
+  "instrument": {
+    "market": 0,
+    "code": "002256",
+    "name": "兆新股份"
+  },
+  "snapshot": {
+    "source_path": "/api/qt/stock/get",
+    "raw_response_sha256": "604f295eb14861ab81f90caed8110c9de2880dbb3da090a413bf0be82f68d485",
+    "fields": {
+      "f43": 339,
+      "f44": 340,
+      "f45": 333,
+      "f46": 336,
+      "f47": 371092,
+      "f48": "125421833.19",
+      "f57": "002256",
+      "f58": "兆新股份",
+      "f60": 334,
+      "f86": 1788852840,
+      "f152": 2
+    },
+    "f86_asia_shanghai": "2026-09-08T15:34:00+08:00"
+  },
+  "reviewed_page_script": {
+    "script": "https://quote.eastmoney.com/newstatic/build/vendor.js",
+    "stock_snapshot_fields_include": [
+      "f47",
+      "f48",
+      "f57",
+      "f58",
+      "f86"
+    ],
+    "time_sales_page_fields": [
+      "f51",
+      "f52",
+      "f53",
+      "f54",
+      "f55"
+    ],
+    "rendered_time_sales_values": [
+      "time",
+      "price",
+      "quantity",
+      "direction"
+    ],
+    "per_row_exact_amount_present": false,
+    "source_native_complete_or_revision_marker_present": false
+  },
+  "assessment": {
+    "aggregate_identity_and_values_observed": true,
+    "exact_complete_history_volume_reconciliation_proven": false,
+    "exact_complete_history_amount_reconciliation_proven": false,
+    "quiet_tape_completion_proven": false,
+    "last_bucket_finality_proven": false,
+    "admitted": false,
+    "formal_publication": false,
+    "reason": "The current time-sales capture has no exact per-row amount or source-native completion/revision contract. The aggregate snapshot therefore cannot satisfy the incident requirement for exact volume-and-amount reconciliation over the complete relevant history, and elapsed source time remains insufficient."
+  },
+  "next_action": "Do not add an aggregate-watermark production path from this evidence. A future same-source candidate must first supply documented bucketing/completion/revision semantics and exact amount-bearing history, then pass isolated capture/ACK/replay and independent source review."
+}

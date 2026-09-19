@@ -52,6 +52,24 @@ test("Eastmoney adapter canonicalizes descending DOM rows into chronological sou
   );
 });
 
+test("Eastmoney adapter excludes pre-auction display rows before durable live identity is formed", () => {
+  const mixed = snapshotPage(1, 1, [
+    ["09:30:03", "3.35", "20"],
+    ["09:25:00", "3.34", "10"],
+    ["09:24:57", "3.33", "30"],
+  ]);
+  mixed.rowOrder = "LATEST_FIRST";
+
+  const capture = eastmoney.parseSnapshot(mixed);
+
+  assert.deepEqual(
+    capture.rows.map((row) => row.source_trade_time),
+    ["09:25:00", "09:30:03"],
+  );
+  assert.equal(capture.completeness.row_count, 2);
+  assert.equal(capture.rows.some((row) => row.source_trade_time === "09:24:57"), false);
+});
+
 test("Eastmoney adapter preserves reviewed DOM order among same-second trades", () => {
   const descending = snapshotPage(1, 1, [
     ["09:35:00", "3.36", "20"],
@@ -79,6 +97,126 @@ test("Eastmoney adapter reads the live pagination token when it is adjacent to �
 
   assert.equal(capture.completeness.page_index, 1);
   assert.equal(capture.completeness.page_count, 10);
+});
+
+test("Eastmoney adapter extracts exactly one reviewed source-page clock", () => {
+  const live = structuredClone(fixture);
+  live.bodyText = `${live.bodyText} （2026-08-27 星期四 10:31:24）`;
+  assert.equal(
+    eastmoney.sourcePageObservedAtUs(live),
+    core.eventTimeUs("2026-08-27", "10:31:24"),
+  );
+  assert.throws(
+    () => eastmoney.sourcePageObservedAtUs({ ...live, bodyText: live.bodyText.replace("10:31:24", "") }),
+    /unique reviewed source clock/,
+  );
+  assert.throws(
+    () => eastmoney.sourcePageObservedAtUs({ ...live, bodyText: `${live.bodyText} 2026-08-27 星期四 10:31:27` }),
+    /unique reviewed source clock/,
+  );
+});
+
+test("Eastmoney adapter obtains one reviewed HTTPS Date clock without trade-row liveness", async () => {
+  const calls = [];
+  const url = "https://quote.eastmoney.com/f1.html?newcode=0.002256";
+  const observed = await eastmoney.sourceServerObservedAtUs(url, async (requested, options) => {
+    calls.push({ requested, options });
+    return {
+      ok: true,
+      status: 200,
+      redirected: false,
+      url,
+      headers: { get: (name) => name.toLowerCase() === "date"
+        ? "Thu, 27 Aug 2026 02:46:35 GMT"
+        : null },
+    };
+  });
+  assert.equal(observed, core.eventTimeUs("2026-08-27", "10:46:35"));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].requested, url);
+  assert.deepEqual(
+    { ...calls[0].options, signal: undefined },
+    {
+      method: "HEAD",
+      cache: "no-store",
+      credentials: "omit",
+      redirect: "error",
+      signal: undefined,
+    },
+  );
+  assert.equal(calls[0].options.signal instanceof AbortSignal, true);
+  await assert.rejects(
+    eastmoney.sourceServerObservedAtUs(url, async () => ({
+      ok: true,
+      status: 200,
+      redirected: false,
+      url,
+      headers: { get: () => null },
+    })),
+    /Date header/,
+  );
+  await assert.rejects(
+    eastmoney.sourceServerObservedAtUs(url, async (_requested, options) =>
+      await new Promise((_resolve, reject) => {
+        options.signal.addEventListener("abort", () => reject(new Error("bounded abort")), {
+          once: true,
+        });
+      }), 1),
+    /bounded abort/,
+  );
+  for (const response of [
+    { ok: false, status: 503, redirected: false, url },
+    { ok: true, status: 200, redirected: true, url },
+    { ok: true, status: 200, redirected: false, url: `${url}&extra=1` },
+  ]) {
+    await assert.rejects(
+      eastmoney.sourceServerObservedAtUs(url, async () => ({
+        ...response,
+        headers: { get: () => "Thu, 27 Aug 2026 02:46:35 GMT" },
+      })),
+      /HTTPS identity/,
+    );
+  }
+});
+
+test("clock-bound observation timing rejects stale future wrong-session and wrong-order proof", () => {
+  const capture = eastmoney.parseSnapshot(fixture);
+  capture.captured_at_us = core.eventTimeUs("2026-08-27", "10:31:30");
+  capture.session_date = "2026-08-27";
+  capture.source_row_order = "LATEST_FIRST";
+  capture.source_page_observed_at_us = core.eventTimeUs("2026-08-27", "10:31:24");
+  assert.equal(
+    core.validateClockBoundSourceObservationTiming(capture, capture.captured_at_us),
+    capture,
+  );
+  assert.throws(
+    () => core.validateClockBoundSourceObservationTiming({
+      ...capture,
+      source_page_observed_at_us: core.eventTimeUs("2026-08-27", "10:31:14"),
+    }, capture.captured_at_us),
+    /source page clock is stale/,
+  );
+  assert.throws(
+    () => core.validateClockBoundSourceObservationTiming({
+      ...capture,
+      source_page_observed_at_us: core.eventTimeUs("2026-08-27", "10:31:31"),
+    }, capture.captured_at_us),
+    /source page clock is in the future/,
+  );
+  assert.throws(
+    () => core.validateClockBoundSourceObservationTiming({
+      ...capture,
+      source_page_observed_at_us: core.eventTimeUs("2026-08-26", "10:31:24"),
+    }, capture.captured_at_us),
+    /source page clock is stale|session date disagrees/,
+  );
+  assert.throws(
+    () => core.validateClockBoundSourceObservationTiming({
+      ...capture,
+      source_row_order: "EARLIEST_FIRST",
+    }, capture.captured_at_us),
+    /page clock or order proof/,
+  );
 });
 
 test("Eastmoney adapter rejects conflicting pagination tokens from one DOM snapshot", () => {

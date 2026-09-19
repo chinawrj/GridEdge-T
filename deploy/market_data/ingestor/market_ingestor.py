@@ -35,10 +35,19 @@ HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 TOKEN = re.compile(r"^[A-Z0-9._-]{1,32}$")
 MAX_U64 = 18_446_744_073_709_551_615
+E2E_TOPIC_NAMESPACE = re.compile(
+    r"^gridedge-e2e/e2e-0629-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
 
 
 class RejectedEvent(ValueError):
     pass
+
+
+def validate_topic_namespace(value: str) -> str:
+    if value == "gridedge" or E2E_TOPIC_NAMESPACE.fullmatch(value):
+        return value
+    raise ValueError("MQTT topic namespace is outside production and isolated E2E policy")
 
 
 @dataclass(frozen=True)
@@ -86,7 +95,8 @@ def canonical_event_identity(document: dict[str, Any]) -> bytes:
     return hashlib.sha256(canonical_json(identity)).digest()
 
 
-def validate_document(raw: bytes, topic: str) -> ValidatedEvent:
+def validate_document(raw: bytes, topic: str, topic_namespace: str = "gridedge") -> ValidatedEvent:
+    namespace = validate_topic_namespace(topic_namespace)
     try:
         document = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -154,14 +164,16 @@ def validate_document(raw: bytes, topic: str) -> ValidatedEvent:
     ):
         raise RejectedEvent("recv_us must be u64")
 
+    prefix_parts = namespace.split("/") + ["market", "v1"]
     parts = topic.split("/")
-    if len(parts) < 6 or parts[:3] != ["gridedge", "market", "v1"]:
+    if len(parts) < len(prefix_parts) + 3 or parts[: len(prefix_parts)] != prefix_parts:
         raise RejectedEvent("MQTT topic is outside the market v1 namespace")
-    if parts[3] != venue or parts[4] != symbol or parts[5] != stream:
+    suffix = parts[len(prefix_parts):]
+    if suffix[0] != venue or suffix[1] != symbol or suffix[2] != stream:
         raise RejectedEvent("MQTT topic disagrees with market event identity")
-    if event_type == "BAR" and len(parts) != 7:
+    if event_type == "BAR" and len(suffix) != 4:
         raise RejectedEvent("BAR topic must include one interval component")
-    if event_type != "BAR" and len(parts) != 6:
+    if event_type != "BAR" and len(suffix) != 3:
         raise RejectedEvent("non-BAR topic has unexpected path components")
 
     return ValidatedEvent(
@@ -185,7 +197,10 @@ def validate_document(raw: bytes, topic: str) -> ValidatedEvent:
     )
 
 
-def application_ack(event: ValidatedEvent, result: str) -> tuple[str, bytes]:
+def application_ack(
+    event: ValidatedEvent, result: str, topic_namespace: str = "gridedge"
+) -> tuple[str, bytes]:
+    namespace = validate_topic_namespace(topic_namespace)
     if result not in {"inserted", "duplicate"}:
         raise ValueError("application ACK requires one committed or duplicate event")
     event_id = event.event_id.hex()
@@ -198,18 +213,22 @@ def application_ack(event: ValidatedEvent, result: str) -> tuple[str, bytes]:
         "source_sequence": event.source_sequence,
         "spec": "gridedge.market.ack",
     }
-    return f"gridedge/market-ack/v1/{event_id}", canonical_json(receipt)
+    return f"{namespace}/market-ack/v1/{event_id}", canonical_json(receipt)
 
 
 def committed_market_event(
-    event: ValidatedEvent, original_topic: str, raw: bytes
+    event: ValidatedEvent,
+    original_topic: str,
+    raw: bytes,
+    topic_namespace: str = "gridedge",
 ) -> tuple[str, bytes]:
     del event
-    prefix = "gridedge/market/v1/"
+    namespace = validate_topic_namespace(topic_namespace)
+    prefix = f"{namespace}/market/v1/"
     if not original_topic.startswith(prefix):
         raise ValueError("committed market event requires the reviewed original topic")
     return (
-        f"gridedge/market-committed/v1/{original_topic[len(prefix):]}",
+        f"{namespace}/market-committed/v1/{original_topic[len(prefix):]}",
         raw,
     )
 
@@ -364,6 +383,7 @@ def process_market_message(
     publish_committed_market: Any,
     publish_application_ack: Any,
     acknowledge_delivery: Any,
+    topic_namespace: str = "gridedge",
 ) -> str:
     """Process one MQTT delivery without hiding the commit/ACK ordering.
 
@@ -376,16 +396,16 @@ def process_market_message(
     try:
         content_type = getattr(message.properties, "ContentType", None)
         validate_delivery(content_type, message.qos, message.retain)
-        event = validate_document(raw, message.topic)
+        event = validate_document(raw, message.topic, topic_namespace)
         result = store.ingest(event, message.topic, message.qos, message.dup)
         if result == "conflict":
             acknowledge_delivery(message.mid, message.qos)
             return result
         committed_topic, committed_payload = committed_market_event(
-            event, message.topic, raw
+            event, message.topic, raw, topic_namespace
         )
         publish_committed_market(committed_topic, committed_payload)
-        ack_topic, ack_payload = application_ack(event, result)
+        ack_topic, ack_payload = application_ack(event, result, topic_namespace)
         publish_application_ack(ack_topic, ack_payload)
         acknowledge_delivery(message.mid, message.qos)
         return result
@@ -398,6 +418,10 @@ def process_market_message(
 def main() -> int:
     if mqtt is None or psycopg is None or Jsonb is None:
         raise RuntimeError("paho-mqtt and psycopg are required to run the market ingestor")
+    topic_namespace = validate_topic_namespace(os.environ.get("MQTT_TOPIC_NAMESPACE", "gridedge"))
+    expected_subscription = f"{topic_namespace}/market/v1/#"
+    if os.environ["MQTT_TOPIC"] != expected_subscription:
+        raise RuntimeError("MQTT subscription is not bound to the configured topic namespace")
     postgres_password = read_secret(os.environ["POSTGRES_PASSWORD_FILE"])
     mqtt_password = read_secret(os.environ["MQTT_PASSWORD_FILE"])
     connection_info = (
@@ -444,6 +468,7 @@ def main() -> int:
                 publish_committed_fact,
                 publish_committed_fact,
                 client.ack,
+                topic_namespace,
             )
             if result == "conflict":
                 print(f"market identity conflict: {message.topic}", file=sys.stderr, flush=True)

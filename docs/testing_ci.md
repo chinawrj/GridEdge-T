@@ -267,7 +267,7 @@ BUY 成交价高于保守均价、SELL 成交价低于保守均价都阻断；�
 在今日委托表中缺席，permit 仍由源账 Paper fills 与持久成交明细独立重算；同一合同若今日出现则仍须
 逐字段匹配。SUBMITTED/CANCELLING/AMBIGUOUS、删除事实、篡改证据、未知开放合同都必须 fail closed，
 且审计前后源账 head 与 staged intent 不变、资金 UI 动作次数为零。
-launchd 合同固定工作日 09:00 先建立 committed 行情持久订阅、release binary、60 秒 stale、失败退出重启和成功日终不重启；新 outbox
+identity-only LaunchAgent 必须无任何启动触发器，且安装发布时验证其 launchd label 不存在；工作日 09:00 由受审的 app-independent trusted-session guard 建立 committed 行情持久订阅，绑定 release binary、runner、plist 与 guard SHA，执行 60 秒 stale、失败后有界重启和成功日终不重启；新 outbox
 才使用显式 sequence 0，已有绑定必须沿持久 cursor 续作并证明零重扫、零 UI 二次动作。
 `prepare-form` 的 fake executor 必须证明写入脚本不包含点击“确定买入/卖出”，且第二次 probe 对
 代码、Decimal 价格和数量逐字段回读；任一字段被客户端改写时立即失败，不能继续到后续阶段。
@@ -498,8 +498,13 @@ revision 由该版本管理并使用 GitHub Actions cache；Linux 系统依赖�
 
 发布必须先运行 `deploy/stage_ths_sim.sh`：它从当前静止源码构建 release，在独立临时文件上仅签名
 一次，校验 Identifier/TeamIdentifier 后按完整文件 SHA-256 生成不可变、内容寻址的 staging 文件。
+同一次 locked release build 还必须生成配置验证 CLI；该 CLI 必须复制为独立的只读、内容寻址
+`gridedge-validator-<sha256>` 文件。安装器在创建任何发布目标或停止旧 owner 之前，必须验证该文件
+是非 symlink 的单一普通可执行文件且 SHA-256 与 stage 输出完全一致；配置只能由这份冻结 CLI 验证，
+不得依赖可缺失或在 stage 到 install 之间漂移的 `target/release/gridedge`。
 认证报告和 `authorize-platform-upgrade` 必须绑定该精确 staging 字节。随后安装只能通过
-`deploy/install_ths_sim.sh`，并显式传入 `GRIDEDGE_SIGNED_BINARY` 与 `GRIDEDGE_SIGNED_SHA256`；安装阶段
+`deploy/install_ths_sim.sh`，并显式传入 `GRIDEDGE_SIGNED_BINARY`、`GRIDEDGE_SIGNED_SHA256`、
+`GRIDEDGE_VALIDATOR_BINARY` 与 `GRIDEDGE_VALIDATOR_SHA256`；安装阶段
 禁止构建或重新签名，只能在 SHA、codesign 身份验证后把冻结字节复制到 Application Support，
 且不得直接覆盖正式路径：必须先复制到目标目录临时文件，对该临时文件重新验证 SHA、签名、
 Identifier、TeamIdentifier 与安全字符串，再原子替换正式文件，并再次断言正式文件 SHA 等于授权

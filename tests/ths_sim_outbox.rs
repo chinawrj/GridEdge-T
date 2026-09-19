@@ -20,6 +20,7 @@ fn android_identity(platform: char, serial: &str) -> String {
         "platform_sha256": platform.to_string().repeat(64),
         "runner_sha256": "1".repeat(64),
         "launch_plist_sha256": "2".repeat(64),
+        "guard_sha256": "6".repeat(64),
         "adb_sha256": "3".repeat(64),
         "serial": serial,
         "avd_name_marker": "THSP_API_32",
@@ -32,6 +33,16 @@ fn android_identity(platform: char, serial: &str) -> String {
         "money_actions_enabled": true,
     })
     .to_string()
+}
+
+fn legacy_android_identity_without_guard(platform: char, serial: &str) -> String {
+    let mut value: serde_json::Value =
+        serde_json::from_str(&android_identity(platform, serial)).expect("reviewed test identity");
+    value
+        .as_object_mut()
+        .expect("identity object")
+        .remove("guard_sha256");
+    value.to_string()
 }
 
 #[test]
@@ -133,6 +144,25 @@ fn execution_identity_platform_upgrade_is_append_only_chained_idempotent_and_sta
             [],
         )
         .is_err());
+    Ok(())
+}
+
+#[test]
+fn legacy_identity_must_be_upgraded_to_bind_the_exact_trusted_guard() -> Result<()> {
+    let directory = tempdir()?;
+    let path = directory.path().join("ths-guard-identity-upgrade.db");
+    let mut outbox = ThsSimOutbox::open(&path)?;
+    outbox.bind_or_verify(SOURCE_A, "run-a", Some(0))?;
+    let legacy = legacy_android_identity_without_guard('a', "emulator-5554");
+    let guarded = android_identity('a', "emulator-5554");
+    let different_guard = guarded.replace(&"6".repeat(64), &"7".repeat(64));
+
+    outbox.bind_execution_identity_once(&legacy)?;
+    assert!(outbox.verify_execution_identity(&guarded).is_err());
+    let guarded_sha = outbox.upgrade_execution_identity(&guarded)?;
+    assert_eq!(outbox.verify_execution_identity(&guarded)?, guarded_sha);
+    assert!(outbox.verify_execution_identity(&legacy).is_err());
+    assert!(outbox.verify_execution_identity(&different_guard).is_err());
     Ok(())
 }
 
